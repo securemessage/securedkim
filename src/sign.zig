@@ -6,7 +6,7 @@ const securemilter = @import("securemilter");
 const crypto = securemilter.crypto;
 
 const dkim = @import("dkim.zig");
-const canon = @import("canon.zig");
+const canon = securemilter.canon;
 
 /// Signing parameters provided by config/keytable.
 pub const SigningParams = struct {

@@ -7,7 +7,7 @@ const dns_mod = securemilter.dns;
 const crypto = securemilter.crypto;
 
 const dkim = @import("dkim.zig");
-const canon = @import("canon.zig");
+const canon = securemilter.canon;
 
 /// DKIM verification result per RFC 6376 §6.1.
 pub const Result = enum {

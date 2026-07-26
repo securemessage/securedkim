@@ -2,7 +2,8 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
-const canon = @import("canon.zig");
+const securemilter = @import("securemilter");
+const canon = securemilter.canon;
 
 /// DKIM signing algorithm (RFC 6376 §3.3, RFC 8463).
 pub const Algorithm = enum {

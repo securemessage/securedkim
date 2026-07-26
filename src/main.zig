@@ -18,7 +18,7 @@ const dns_mod = securemilter.dns;
 const crypto = securemilter.crypto;
 const zmq = securemilter.zmq;
 
-pub const canon = @import("canon.zig");
+pub const canon = securemilter.canon;
 pub const dkim = @import("dkim.zig");
 pub const verify = @import("verify.zig");
 pub const sign_mod = @import("sign.zig");
