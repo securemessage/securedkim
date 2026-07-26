@@ -237,6 +237,9 @@ pub fn main() !void {
     };
     defer daemon_mod.removePidFile(dkim_cfg.pid_file);
 
+    // Raise fd limit before dropping privileges (requires root)
+    daemon_mod.raiseFileLimit();
+
     // Drop privileges after PID file is written, before workers spawn
     if (dkim_cfg.user) |user| {
         daemon_mod.dropPrivileges(user) catch |err| {
