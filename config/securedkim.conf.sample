@@ -1,0 +1,46 @@
+# SecureDKIM Configuration
+# See securedkim(8) for details.
+
+[global]
+# Identifier used in Authentication-Results headers.
+AuthservID      = mail.example.com
+
+# Number of worker threads. 0 = auto-detect CPU count.
+WorkerThreads   = 0
+
+# PID file location.
+PidFile         = /var/run/securedkim/securedkim.pid
+
+# Run in foreground (do not daemonize). Useful for debugging.
+# Foreground    = no
+
+# DNS resolver settings.
+DnsNameserver   = 127.0.0.1
+DnsTimeout      = 5
+DnsRetries      = 2
+
+# Headers to include in DKIM signature.
+SignedHeaders   = from:to:subject:date:message-id
+
+# ZMQ event publishing endpoint (optional).
+# ZmqEndpoint   = tcp://events.internal:5555
+
+# --- Verify inbound DKIM signatures ---
+[listener:verify-inbound]
+Socket          = inet:8891@0.0.0.0
+Mode            = verify
+
+# --- Sign outbound mail (multi-domain via SigningTable/KeyTable) ---
+# [listener:sign-outbound]
+# Socket          = inet:8892@0.0.0.0
+# Mode            = sign
+# SigningTable    = /usr/local/etc/securedkim/signing-table
+# KeyTable        = /usr/local/etc/securedkim/key-table
+
+# --- Sign outbound mail (single domain shorthand) ---
+# [listener:sign-outbound]
+# Socket          = inet:8892@0.0.0.0
+# Mode            = sign
+# Domain          = example.com
+# Selector        = dkim2026
+# KeyFile         = /usr/local/etc/securedkim/keys/example.com.key
