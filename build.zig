@@ -32,6 +32,21 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // securedkim-genkey CLI tool (only needs securemilter_crypto)
+    const genkey_mod = b.createModule(.{
+        .root_source_file = b.path("src/genkey.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "securemilter_crypto", .module = crypto_mod },
+        },
+    });
+    const genkey_exe = b.addExecutable(.{
+        .name = "securedkim-genkey",
+        .root_module = genkey_mod,
+    });
+    b.installArtifact(genkey_exe);
+
     const test_step = b.step("test", "Run unit tests");
 
     const test_mod = b.createModule(.{
