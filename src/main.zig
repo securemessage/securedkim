@@ -55,12 +55,17 @@ pub const DkimConfig = struct {
     zmq_topic: []const u8,
 };
 
+const reload_mod = securemilter.reload;
+
 // Module-level config set before worker spawn, read-only during runtime.
 var g_authserv_id: []const u8 = "localhost";
 var g_dns_config: dns_mod.ResolverConfig = .{};
 var g_mode: Mode = .verify_only;
 var g_zmq_endpoint: ?[]const u8 = null;
 var g_zmq_topic: []const u8 = "dkim";
+var g_allocator: Allocator = undefined;
+var g_config_path: []const u8 = "/usr/local/etc/securedkim/securedkim.conf";
+var g_config_gen: reload_mod.ConfigGeneration = reload_mod.ConfigGeneration.init();
 
 // Thread-local ZMQ publisher (one socket per worker thread — ZMQ thread-safety)
 threadlocal var tl_publisher: ?zmq.Publisher = null;
@@ -157,10 +162,12 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    g_allocator = allocator;
 
     var args = std.process.args();
     _ = args.next();
     const config_path = args.next() orelse "/usr/local/etc/securedkim/securedkim.conf";
+    g_config_path = config_path;
 
     var cfg = config_mod.parseFile(allocator, config_path) catch |err| {
         std.log.err("failed to load config {s}: {}", .{ config_path, err });
@@ -255,6 +262,7 @@ pub fn main() !void {
         .on_eoh = onEoh,
         .on_body = onBody,
         .on_eom = onEom,
+        .on_reload = onWorkerReload,
         .required_actions = required_actions,
     };
 
@@ -263,16 +271,17 @@ pub fn main() !void {
 
     daemon_mod.ManagedSignals.blockForKqueue();
 
-    var threads = try worker_mod.spawnPool(
+    var threads = try worker_mod.spawnPoolWithReload(
         allocator,
         dkim_cfg.worker_threads,
         dkim_cfg.listen_addresses,
         callbacks,
         shutdown_pipe[0],
+        &g_config_gen,
     );
     defer threads.deinit(allocator);
 
-    daemon_mod.ManagedSignals.waitForShutdown(shutdown_pipe[1]);
+    daemon_mod.ManagedSignals.signalLoop(shutdown_pipe[1], reloadConfig);
     for (threads.items) |t| t.join();
 }
 
@@ -550,6 +559,79 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
 fn toLower(c: u8) u8 {
     if (c >= 'A' and c <= 'Z') return c + 32;
     return c;
+}
+
+// =============================================================================
+// Reload
+// =============================================================================
+
+/// Main-thread reload callback: re-reads SigningTable, KeyTable, and signing key.
+/// Increments config generation so workers flush any future LRU key caches.
+fn reloadConfig() void {
+    // Re-read SigningTable
+    if (g_signing_table) |*old_st| {
+        _ = old_st; // future: free old table entries
+    }
+    // Try re-reading from config (re-parse to get current paths)
+    var cfg = config_mod.parseFile(g_allocator, g_config_path) catch {
+        std.log.warn("reload: failed to re-read config file, keeping previous", .{});
+        g_config_gen.increment();
+        return;
+    };
+    defer cfg.deinit();
+
+    const dkim_cfg = parseDkimConfig(g_allocator, &cfg) catch {
+        std.log.warn("reload: failed to parse config, keeping previous", .{});
+        g_config_gen.increment();
+        return;
+    };
+
+    // Reload SigningTable
+    if (dkim_cfg.signing_table_path) |path| {
+        if (std.fs.cwd().readFileAlloc(g_allocator, path, 1024 * 1024)) |content| {
+            if (keytable.parseSigningTable(g_allocator, content)) |new_st| {
+                g_signing_table = new_st;
+                std.log.info("SigningTable reloaded from {s}", .{path});
+            } else |_| {
+                std.log.warn("reload: failed to parse SigningTable", .{});
+            }
+        } else |_| {
+            std.log.warn("reload: failed to read SigningTable {s}", .{path});
+        }
+    }
+
+    // Reload KeyTable
+    if (dkim_cfg.key_table_path) |path| {
+        if (std.fs.cwd().readFileAlloc(g_allocator, path, 1024 * 1024)) |content| {
+            if (keytable.parseKeyTable(g_allocator, content)) |new_kt| {
+                g_key_table = new_kt;
+                std.log.info("KeyTable reloaded from {s}", .{path});
+            } else |_| {
+                std.log.warn("reload: failed to parse KeyTable", .{});
+            }
+        } else |_| {
+            std.log.warn("reload: failed to read KeyTable {s}", .{path});
+        }
+    }
+
+    // Reload signing key (single-domain shorthand)
+    if (dkim_cfg.sign_key_file) |key_path| {
+        if (crypto.loadRsaKeyFile(key_path)) |new_key| {
+            g_sign_key = new_key;
+            std.log.info("signing key reloaded from {s}", .{key_path});
+        } else |_| {
+            std.log.warn("reload: failed to reload signing key {s}", .{key_path});
+        }
+    }
+
+    g_config_gen.increment();
+    std.log.info("config generation advanced to {d}", .{g_config_gen.load()});
+}
+
+/// Per-worker reload callback: flush thread-local state.
+/// Future: flush LRU key cache when implemented.
+fn onWorkerReload() void {
+    std.log.debug("worker: config reload acknowledged", .{});
 }
 
 // =============================================================================
