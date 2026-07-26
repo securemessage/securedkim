@@ -16,6 +16,7 @@ const responses = securemilter.milter.responses;
 const negotiate = securemilter.milter.negotiate;
 const dns_mod = securemilter.dns;
 const crypto = securemilter.crypto;
+const zmq = securemilter.zmq;
 
 pub const canon = @import("canon.zig");
 pub const dkim = @import("dkim.zig");
@@ -48,12 +49,26 @@ pub const DkimConfig = struct {
     sign_selector: ?[]const u8,
     sign_key_file: ?[]const u8,
     signed_headers: []const u8,
+    zmq_endpoint: ?[]const u8,
+    zmq_topic: []const u8,
 };
 
 // Module-level config set before worker spawn, read-only during runtime.
 var g_authserv_id: []const u8 = "localhost";
 var g_dns_config: dns_mod.ResolverConfig = .{};
 var g_mode: Mode = .verify_only;
+var g_zmq_endpoint: ?[]const u8 = null;
+var g_zmq_topic: []const u8 = "dkim";
+
+// Thread-local ZMQ publisher (one socket per worker thread — ZMQ thread-safety)
+threadlocal var tl_publisher: ?zmq.Publisher = null;
+
+fn getPublisher() *zmq.Publisher {
+    if (tl_publisher == null) {
+        tl_publisher = zmq.Publisher.init(g_zmq_endpoint, g_zmq_topic);
+    }
+    return &tl_publisher.?;
+}
 var g_signing_table: ?keytable.SigningTable = null;
 var g_key_table: ?keytable.KeyTable = null;
 var g_sign_domain: ?[]const u8 = null;
@@ -109,6 +124,10 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
     const dns_retries = global.getInt("DnsRetries", u8, 2);
     const signed_headers = global.getOrDefault("SignedHeaders", "from:to:subject:date:message-id");
 
+    // ZMQ event publishing
+    const zmq_endpoint = global.get("ZmqEndpoint");
+    const zmq_topic = global.getOrDefault("ZmqTopic", "dkim");
+
     return .{
         .authserv_id = authserv_id,
         .listen_addresses = try addrs.toOwnedSlice(allocator),
@@ -125,6 +144,8 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
         .sign_selector = sign_selector,
         .sign_key_file = sign_key_file,
         .signed_headers = signed_headers,
+        .zmq_endpoint = zmq_endpoint,
+        .zmq_topic = zmq_topic,
     };
 }
 
@@ -157,6 +178,8 @@ pub fn main() !void {
     };
     g_mode = dkim_cfg.mode;
     g_signed_headers = dkim_cfg.signed_headers;
+    g_zmq_endpoint = dkim_cfg.zmq_endpoint;
+    g_zmq_topic = dkim_cfg.zmq_topic;
 
     // Load signing config
     if (dkim_cfg.signing_table_path) |path| {
@@ -321,10 +344,12 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
         );
 
         _ = addArHeader(conn, "dkim", result.result.toString(), result.domain, result.selector);
+        publishEvent(conn.allocator, "verify", result.result.toString(), result.domain, result.selector);
     }
 
     if (!found_any) {
         _ = addArHeader(conn, "dkim", "none", "", "");
+        publishEvent(conn.allocator, "verify", "none", "", "");
     }
 
     return @intFromEnum(responses.Code.@"continue");
@@ -377,7 +402,25 @@ fn doSign(conn: *connection_mod.Connection) u8 {
     defer conn.allocator.free(hdr_payload);
 
     codec.writePacket(conn.fd, hdr_payload) catch {};
+
+    publishEvent(conn.allocator, "sign", "pass", sign_params.domain, sign_params.selector);
+
     return @intFromEnum(responses.Code.accept);
+}
+
+fn publishEvent(
+    allocator: Allocator,
+    action: []const u8,
+    result_str: []const u8,
+    domain: []const u8,
+    selector: []const u8,
+) void {
+    const json = std.fmt.allocPrint(allocator,
+        \\{{"action":"{s}","result":"{s}","domain":"{s}","selector":"{s}"}}
+    , .{ action, result_str, domain, selector }) catch return;
+    defer allocator.free(json);
+
+    getPublisher().publish(json);
 }
 
 fn resolveSigningParams(domain: []const u8, sender: []const u8) ?sign_mod.SigningParams {
