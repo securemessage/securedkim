@@ -39,6 +39,7 @@ pub const DkimConfig = struct {
     worker_threads: u32,
     pid_file: []const u8,
     foreground: bool,
+    user: ?[]const u8,
     dns_nameserver: []const u8,
     dns_timeout_ms: u32,
     dns_retries: u8,
@@ -84,6 +85,7 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
     const workers = global.getInt("WorkerThreads", u32, 0);
     const pid_file = global.getOrDefault("PidFile", "/var/run/securedkim/securedkim.pid");
     const foreground_val = global.getBool("Foreground", false);
+    const user = global.get("User");
 
     var addrs: std.ArrayListUnmanaged(listener_mod.ListenAddress) = .{};
     errdefer addrs.deinit(allocator);
@@ -135,6 +137,7 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
         .worker_threads = workers,
         .pid_file = pid_file,
         .foreground = foreground_val,
+        .user = user,
         .dns_nameserver = dns_ns,
         .dns_timeout_ms = dns_timeout,
         .dns_retries = dns_retries,
@@ -226,6 +229,14 @@ pub fn main() !void {
         std.log.err("pid file write failed: {}", .{err});
     };
     defer daemon_mod.removePidFile(dkim_cfg.pid_file);
+
+    // Drop privileges after PID file is written, before workers spawn
+    if (dkim_cfg.user) |user| {
+        daemon_mod.dropPrivileges(user) catch |err| {
+            std.log.err("privilege drop to '{s}' failed: {}", .{ user, err });
+            return err;
+        };
+    }
 
     std.log.info("SecureDKIM starting, AuthservID={s}, mode={s}, listeners={d}", .{
         dkim_cfg.authserv_id,
