@@ -15,10 +15,11 @@ const codec = securemilter.milter.codec;
 const responses = securemilter.milter.responses;
 const negotiate = securemilter.milter.negotiate;
 const dns_mod = securemilter.dns;
-const crypto = securemilter.crypto;
+const securemilter_crypto = @import("securemilter_crypto");
+const crypto = securemilter_crypto.crypto;
 const zmq = securemilter.zmq;
 
-pub const canon = securemilter.canon;
+pub const canon = securemilter_crypto.canon;
 pub const dkim = @import("dkim.zig");
 pub const verify = @import("verify.zig");
 pub const sign_mod = @import("sign.zig");

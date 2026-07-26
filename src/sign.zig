@@ -2,11 +2,11 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
-const securemilter = @import("securemilter");
-const crypto = securemilter.crypto;
+const securemilter_crypto = @import("securemilter_crypto");
+const crypto = securemilter_crypto.crypto;
+const canon = securemilter_crypto.canon;
 
 const dkim = @import("dkim.zig");
-const canon = securemilter.canon;
 
 /// Signing parameters provided by config/keytable.
 pub const SigningParams = struct {

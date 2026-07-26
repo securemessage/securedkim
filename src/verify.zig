@@ -4,10 +4,12 @@ const Allocator = mem.Allocator;
 
 const securemilter = @import("securemilter");
 const dns_mod = securemilter.dns;
-const crypto = securemilter.crypto;
+
+const securemilter_crypto = @import("securemilter_crypto");
+const crypto = securemilter_crypto.crypto;
+const canon = securemilter_crypto.canon;
 
 const dkim = @import("dkim.zig");
-const canon = securemilter.canon;
 
 /// DKIM verification result per RFC 6376 §6.1.
 pub const Result = enum {
