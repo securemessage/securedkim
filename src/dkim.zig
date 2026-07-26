@@ -183,7 +183,7 @@ pub fn generateHeaderValue(allocator: Allocator, sig: *const Signature) ![]u8 {
     try appendTag(&buf, allocator, "bh", sig.body_hash);
 
     // b= tag always last (empty for initial signing pass)
-    try buf.appendSlice(allocator, " b=");
+    try buf.appendSlice(allocator, "; b=");
 
     return buf.toOwnedSlice(allocator);
 }
