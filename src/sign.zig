@@ -194,7 +194,7 @@ fn computeSignature(
 ) ![]u8 {
     switch (algorithm) {
         .rsa_sha256 => {
-            const sig_bytes = try crypto.rsaSign(allocator, key.evp_pkey.?, data);
+            const sig_bytes = try crypto.rsaSign(allocator, key.rsa_pkey.?, data);
             defer allocator.free(sig_bytes);
             return crypto.base64Encode(allocator, sig_bytes);
         },

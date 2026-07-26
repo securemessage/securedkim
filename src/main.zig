@@ -1,20 +1,513 @@
 const std = @import("std");
+const posix = std.posix;
+const mem = std.mem;
+const Allocator = mem.Allocator;
+
+const securemilter = @import("securemilter");
+const config_mod = securemilter.config;
+const listener_mod = securemilter.listener;
+const connection_mod = securemilter.connection;
+const worker_mod = securemilter.worker;
+const daemon_mod = securemilter.daemon;
+const auth_results = securemilter.auth_results;
+const commands = securemilter.milter.commands;
+const codec = securemilter.milter.codec;
+const responses = securemilter.milter.responses;
+const negotiate = securemilter.milter.negotiate;
+const dns_mod = securemilter.dns;
+const crypto = securemilter.crypto;
 
 pub const canon = @import("canon.zig");
 pub const dkim = @import("dkim.zig");
 pub const verify = @import("verify.zig");
-pub const sign = @import("sign.zig");
+pub const sign_mod = @import("sign.zig");
 pub const keytable = @import("keytable.zig");
 
-pub fn main() !void {
-    std.log.info("SecureDKIM - not yet implemented", .{});
+/// Listener mode for DKIM processing.
+pub const Mode = enum {
+    sign_only,
+    verify_only,
+    both,
+};
+
+/// SecureDKIM runtime configuration.
+pub const DkimConfig = struct {
+    authserv_id: []const u8,
+    listen_addresses: []const listener_mod.ListenAddress,
+    worker_threads: u32,
+    pid_file: []const u8,
+    foreground: bool,
+    dns_nameserver: []const u8,
+    dns_timeout_ms: u32,
+    dns_retries: u8,
+    mode: Mode,
+    signing_table_path: ?[]const u8,
+    key_table_path: ?[]const u8,
+    // Single-domain shorthand
+    sign_domain: ?[]const u8,
+    sign_selector: ?[]const u8,
+    sign_key_file: ?[]const u8,
+    signed_headers: []const u8,
+};
+
+// Module-level config set before worker spawn, read-only during runtime.
+var g_authserv_id: []const u8 = "localhost";
+var g_dns_config: dns_mod.ResolverConfig = .{};
+var g_mode: Mode = .verify_only;
+var g_signing_table: ?keytable.SigningTable = null;
+var g_key_table: ?keytable.KeyTable = null;
+var g_sign_domain: ?[]const u8 = null;
+var g_sign_selector: ?[]const u8 = null;
+var g_sign_key: ?crypto.SigningKey = null;
+var g_signed_headers: []const u8 = "from:to:subject:date:message-id";
+
+pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !DkimConfig {
+    const global = cfg.getSection("global") orelse return error.MissingGlobalSection;
+
+    const authserv_id = global.get("AuthservID") orelse "localhost";
+    const workers = global.getInt("WorkerThreads", u32, 0);
+    const pid_file = global.getOrDefault("PidFile", "/var/run/securedkim/securedkim.pid");
+    const foreground_val = global.getBool("Foreground", false);
+
+    var addrs: std.ArrayListUnmanaged(listener_mod.ListenAddress) = .{};
+    errdefer addrs.deinit(allocator);
+
+    var mode: Mode = .verify_only;
+    var signing_table_path: ?[]const u8 = null;
+    var key_table_path: ?[]const u8 = null;
+    var sign_domain: ?[]const u8 = null;
+    var sign_selector: ?[]const u8 = null;
+    var sign_key_file: ?[]const u8 = null;
+
+    for (cfg.section_order.items) |section_name| {
+        if (mem.startsWith(u8, section_name, "listener:")) {
+            const section = cfg.getSection(section_name) orelse continue;
+            const socket_str = section.get("Socket") orelse continue;
+            const addr = listener_mod.ListenAddress.parse(socket_str) catch continue;
+            try addrs.append(allocator, addr);
+
+            // Parse mode from listener section
+            if (section.get("Mode")) |mode_str| {
+                if (mem.eql(u8, mode_str, "sign")) mode = .sign_only else if (mem.eql(u8, mode_str, "verify")) mode = .verify_only else if (mem.eql(u8, mode_str, "both")) mode = .both;
+            }
+
+            // Per-listener signing config
+            signing_table_path = section.get("SigningTable") orelse signing_table_path;
+            key_table_path = section.get("KeyTable") orelse key_table_path;
+            sign_domain = section.get("Domain") orelse sign_domain;
+            sign_selector = section.get("Selector") orelse sign_selector;
+            sign_key_file = section.get("KeyFile") orelse sign_key_file;
+        }
+    }
+
+    if (addrs.items.len == 0) {
+        try addrs.append(allocator, .{ .tcp = .{ .host = "0.0.0.0", .port = 8891 } });
+    }
+
+    const dns_ns = global.getOrDefault("DnsNameserver", "127.0.0.1");
+    const dns_timeout = global.getInt("DnsTimeout", u32, 5) * 1000;
+    const dns_retries = global.getInt("DnsRetries", u8, 2);
+    const signed_headers = global.getOrDefault("SignedHeaders", "from:to:subject:date:message-id");
+
+    return .{
+        .authserv_id = authserv_id,
+        .listen_addresses = try addrs.toOwnedSlice(allocator),
+        .worker_threads = workers,
+        .pid_file = pid_file,
+        .foreground = foreground_val,
+        .dns_nameserver = dns_ns,
+        .dns_timeout_ms = dns_timeout,
+        .dns_retries = dns_retries,
+        .mode = mode,
+        .signing_table_path = signing_table_path,
+        .key_table_path = key_table_path,
+        .sign_domain = sign_domain,
+        .sign_selector = sign_selector,
+        .sign_key_file = sign_key_file,
+        .signed_headers = signed_headers,
+    };
 }
 
-// Pull in all module tests
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var args = std.process.args();
+    _ = args.next();
+    const config_path = args.next() orelse "/usr/local/etc/securedkim/securedkim.conf";
+
+    var cfg = config_mod.parseFile(allocator, config_path) catch |err| {
+        std.log.err("failed to load config {s}: {}", .{ config_path, err });
+        return err;
+    };
+    defer cfg.deinit();
+
+    const dkim_cfg = parseDkimConfig(allocator, &cfg) catch |err| {
+        std.log.err("config parse error: {}", .{err});
+        return err;
+    };
+
+    // Set module-level globals
+    g_authserv_id = dkim_cfg.authserv_id;
+    g_dns_config = .{
+        .nameserver = dkim_cfg.dns_nameserver,
+        .timeout_ms = dkim_cfg.dns_timeout_ms,
+        .retries = dkim_cfg.dns_retries,
+    };
+    g_mode = dkim_cfg.mode;
+    g_signed_headers = dkim_cfg.signed_headers;
+
+    // Load signing config
+    if (dkim_cfg.signing_table_path) |path| {
+        const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
+            std.log.err("failed to load SigningTable {s}: {}", .{ path, err });
+            return err;
+        };
+        g_signing_table = keytable.parseSigningTable(allocator, content) catch |err| {
+            std.log.err("failed to parse SigningTable: {}", .{err});
+            return err;
+        };
+    }
+    if (dkim_cfg.key_table_path) |path| {
+        const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
+            std.log.err("failed to load KeyTable {s}: {}", .{ path, err });
+            return err;
+        };
+        g_key_table = keytable.parseKeyTable(allocator, content) catch |err| {
+            std.log.err("failed to parse KeyTable: {}", .{err});
+            return err;
+        };
+    }
+
+    // Single-domain shorthand
+    g_sign_domain = dkim_cfg.sign_domain;
+    g_sign_selector = dkim_cfg.sign_selector;
+    if (dkim_cfg.sign_key_file) |key_path| {
+        g_sign_key = crypto.loadRsaKeyFile(key_path) catch |err| {
+            std.log.err("failed to load signing key {s}: {}", .{ key_path, err });
+            return err;
+        };
+    }
+
+    // Daemonize
+    if (!dkim_cfg.foreground) {
+        daemon_mod.daemonize() catch |err| {
+            std.log.err("daemonize failed: {}", .{err});
+            return err;
+        };
+    }
+
+    daemon_mod.writePidFile(dkim_cfg.pid_file) catch |err| {
+        std.log.err("pid file write failed: {}", .{err});
+    };
+    defer daemon_mod.removePidFile(dkim_cfg.pid_file);
+
+    std.log.info("SecureDKIM starting, AuthservID={s}, mode={s}, listeners={d}", .{
+        dkim_cfg.authserv_id,
+        @tagName(dkim_cfg.mode),
+        dkim_cfg.listen_addresses.len,
+    });
+
+    // Required protocol flags: always need to add headers (A-R for verify, DKIM-Sig for sign)
+    const required_actions = negotiate.ActionFlags{ .add_headers = true };
+
+    const callbacks = worker_mod.Callbacks{
+        .on_connect = onConnect,
+        .on_helo = onHelo,
+        .on_mail_from = onMailFrom,
+        .on_header = onHeader,
+        .on_eoh = onEoh,
+        .on_body = onBody,
+        .on_eom = onEom,
+        .required_actions = required_actions,
+    };
+
+    var threads = try worker_mod.spawnPool(
+        allocator,
+        dkim_cfg.worker_threads,
+        dkim_cfg.listen_addresses,
+        callbacks,
+    );
+    defer threads.deinit(allocator);
+
+    for (threads.items) |t| t.join();
+}
+
+// =============================================================================
+// Milter Callbacks
+// =============================================================================
+
+fn onConnect(conn: *connection_mod.Connection, _: commands.ConnectInfo) u8 {
+    _ = conn;
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+fn onHelo(conn: *connection_mod.Connection, _: []const u8) u8 {
+    _ = conn;
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+fn onMailFrom(conn: *connection_mod.Connection, _: []const u8) u8 {
+    _ = conn;
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+fn onHeader(conn: *connection_mod.Connection, _: []const u8, _: []const u8) u8 {
+    // Headers are already accumulated by Connection.addHeader() in the worker
+    _ = conn;
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+fn onEoh(conn: *connection_mod.Connection) u8 {
+    _ = conn;
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+fn onBody(conn: *connection_mod.Connection, data: []const u8) u8 {
+    // Accumulate body chunks in connection's body buffer
+    conn.appendBody(data) catch {};
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+fn onEom(conn: *connection_mod.Connection) u8 {
+    switch (g_mode) {
+        .verify_only => return doVerify(conn),
+        .sign_only => return doSign(conn),
+        .both => {
+            _ = doVerify(conn);
+            return doSign(conn);
+        },
+    }
+}
+
+fn doVerify(conn: *connection_mod.Connection) u8 {
+    // Compute body hash using the body accumulated on the connection
+    const body_data = conn.getBody();
+    const body_hash = sign_mod.computeBodyHash(conn.allocator, body_data, .simple) catch
+        return @intFromEnum(responses.Code.@"continue");
+
+    // Build header list from accumulated headers
+    var header_strings: std.ArrayList([]const u8) = .{};
+    defer header_strings.deinit(conn.allocator);
+
+    for (conn.headers.items) |hdr| {
+        const full = std.fmt.allocPrint(conn.allocator, "{s}: {s}", .{ hdr.name, hdr.value }) catch continue;
+        header_strings.append(conn.allocator, full) catch continue;
+    }
+    defer {
+        for (header_strings.items) |s| conn.allocator.free(s);
+    }
+
+    // Find DKIM-Signature headers and verify each
+    var found_any = false;
+    for (conn.headers.items) |hdr| {
+        if (!eqlIgnoreCase(hdr.name, "DKIM-Signature")) continue;
+        found_any = true;
+
+        const sig_header_raw = std.fmt.allocPrint(conn.allocator, "DKIM-Signature: {s}", .{hdr.value}) catch continue;
+        defer conn.allocator.free(sig_header_raw);
+
+        var resolver = dns_mod.Resolver.init(conn.allocator, g_dns_config);
+        defer resolver.deinit();
+
+        const result = verify.verifySignature(
+            conn.allocator,
+            &resolver,
+            hdr.value,
+            sig_header_raw,
+            header_strings.items,
+            body_hash,
+        );
+
+        _ = addArHeader(conn, "dkim", result.result.toString(), result.domain, result.selector);
+    }
+
+    if (!found_any) {
+        _ = addArHeader(conn, "dkim", "none", "", "");
+    }
+
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+fn doSign(conn: *connection_mod.Connection) u8 {
+    // Determine signing domain from sender
+    const mail_from = stripAngleBrackets(conn.mail_from_raw orelse return @intFromEnum(responses.Code.@"continue"));
+    const domain = getSendingDomain(mail_from) orelse return @intFromEnum(responses.Code.@"continue");
+
+    // Look up signing parameters
+    const sign_params = resolveSigningParams(domain, mail_from) orelse
+        return @intFromEnum(responses.Code.@"continue");
+    const sign_key = resolveSigningKey(sign_params) orelse
+        return @intFromEnum(responses.Code.@"continue");
+
+    // Build header list
+    var header_strings: std.ArrayList([]const u8) = .{};
+    defer header_strings.deinit(conn.allocator);
+
+    for (conn.headers.items) |hdr| {
+        const full = std.fmt.allocPrint(conn.allocator, "{s}: {s}", .{ hdr.name, hdr.value }) catch continue;
+        header_strings.append(conn.allocator, full) catch continue;
+    }
+    defer {
+        for (header_strings.items) |s| conn.allocator.free(s);
+    }
+
+    // Compute body hash
+    const body_data = conn.getBody();
+    const body_hash = sign_mod.computeBodyHash(conn.allocator, body_data, sign_params.canonicalization.body) catch
+        return @intFromEnum(responses.Code.@"continue");
+
+    // Sign the message
+    var sign_result = sign_mod.signMessage(
+        conn.allocator,
+        &sign_params,
+        sign_key,
+        header_strings.items,
+        body_hash,
+    ) catch return @intFromEnum(responses.Code.@"continue");
+    defer sign_result.deinit();
+
+    // Prepend DKIM-Signature header via milter protocol
+    const hdr_payload = responses.addHeader(
+        conn.allocator,
+        "DKIM-Signature",
+        sign_result.header["DKIM-Signature:".len..],
+    ) catch return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(hdr_payload);
+
+    codec.writePacket(conn.fd, hdr_payload) catch {};
+    return @intFromEnum(responses.Code.accept);
+}
+
+fn resolveSigningParams(domain: []const u8, sender: []const u8) ?sign_mod.SigningParams {
+    // Single-domain shorthand
+    if (g_sign_domain) |d| {
+        if (eqlIgnoreCase(d, domain)) {
+            return .{
+                .domain = d,
+                .selector = g_sign_selector orelse "default",
+                .signed_headers = g_signed_headers,
+            };
+        }
+    }
+
+    // SigningTable + KeyTable lookup
+    if (g_signing_table) |*st| {
+        const entry_name = st.lookup(sender) orelse return null;
+        if (g_key_table) |*kt| {
+            const entries = kt.lookup(entry_name);
+            if (entries.len > 0) {
+                return .{
+                    .domain = entries[0].domain,
+                    .selector = entries[0].selector,
+                    .signed_headers = g_signed_headers,
+                };
+            }
+        }
+    }
+
+    return null;
+}
+
+fn resolveSigningKey(params: sign_mod.SigningParams) ?*const crypto.SigningKey {
+    _ = params;
+    // Single-domain shorthand key
+    if (g_sign_key) |*k| return k;
+    // KeyTable-based key loading (lazy-load, future LRU cache)
+    // For v1, only single-domain shorthand is wired end-to-end
+    return null;
+}
+
+fn addArHeader(
+    conn: *connection_mod.Connection,
+    method: []const u8,
+    result_str: []const u8,
+    domain: []const u8,
+    selector: []const u8,
+) u8 {
+    var properties: [2]auth_results.MethodResult.Property = undefined;
+    var prop_count: usize = 0;
+
+    if (domain.len > 0) {
+        properties[prop_count] = .{ .ptype = "header", .property = "d", .value = domain };
+        prop_count += 1;
+    }
+    if (selector.len > 0) {
+        properties[prop_count] = .{ .ptype = "header", .property = "s", .value = selector };
+        prop_count += 1;
+    }
+
+    const ar_value = auth_results.build(conn.allocator, g_authserv_id, &.{
+        .{
+            .method = method,
+            .result = result_str,
+            .reason = null,
+            .properties = properties[0..prop_count],
+        },
+    }) catch return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(ar_value);
+
+    const hdr_payload = responses.addHeader(
+        conn.allocator,
+        "Authentication-Results",
+        ar_value,
+    ) catch return @intFromEnum(responses.Code.@"continue");
+    defer conn.allocator.free(hdr_payload);
+
+    codec.writePacket(conn.fd, hdr_payload) catch {};
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+// =============================================================================
+// Utilities
+// =============================================================================
+
+fn stripAngleBrackets(addr: []const u8) []const u8 {
+    var s = addr;
+    if (s.len > 0 and s[0] == '<') s = s[1..];
+    if (s.len > 0 and s[s.len - 1] == '>') s = s[0 .. s.len - 1];
+    return s;
+}
+
+fn getSendingDomain(sender: []const u8) ?[]const u8 {
+    if (mem.lastIndexOfScalar(u8, sender, '@')) |at| {
+        return sender[at + 1 ..];
+    }
+    return null;
+}
+
+fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (toLower(ca) != toLower(cb)) return false;
+    }
+    return true;
+}
+
+fn toLower(c: u8) u8 {
+    if (c >= 'A' and c <= 'Z') return c + 32;
+    return c;
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
 test {
     _ = canon;
     _ = dkim;
     _ = verify;
-    _ = sign;
+    _ = sign_mod;
     _ = keytable;
+}
+
+test "strip angle brackets" {
+    try std.testing.expectEqualStrings("user@example.com", stripAngleBrackets("<user@example.com>"));
+    try std.testing.expectEqualStrings("", stripAngleBrackets("<>"));
+}
+
+test "get sending domain" {
+    try std.testing.expectEqualStrings("example.com", getSendingDomain("user@example.com").?);
+    try std.testing.expect(getSendingDomain("postmaster") == null);
 }

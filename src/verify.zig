@@ -261,7 +261,7 @@ fn verifyWithKey(
             defer allocator.free(pub_key_der);
 
             const evp_pkey = crypto.loadRsaPublicKeyDer(pub_key_der) catch return error.InvalidPublicKey;
-            defer std.crypto.openssl.c.EVP_PKEY_free(evp_pkey);
+            defer crypto.freePublicKey(evp_pkey);
 
             return crypto.rsaVerify(evp_pkey, signed_data, signature_bytes);
         },
