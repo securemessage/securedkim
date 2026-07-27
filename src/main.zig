@@ -18,6 +18,7 @@ const dns_mod = securemilter.dns;
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
 const zmq = securemilter.zmq;
+const log = securemilter.log;
 
 pub const canon = securemilter_crypto.canon;
 pub const dkim = @import("dkim.zig");
@@ -173,7 +174,7 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
 }
 
 fn usageError() error{InvalidArgument} {
-    std.log.err("usage: securedkim -c <config-file>", .{});
+    log.err("usage: securedkim -c <config-file>", .{});
     return error.InvalidArgument;
 }
 
@@ -192,15 +193,20 @@ pub fn main() !void {
     g_config_path = config_path;
 
     var cfg = config_mod.parseFile(allocator, config_path) catch |err| {
-        std.log.err("failed to load config {s}: {}", .{ config_path, err });
+        log.err("failed to load config {s}: {}", .{ config_path, err });
         return err;
     };
     defer cfg.deinit();
 
     const dkim_cfg = parseDkimConfig(allocator, &cfg) catch |err| {
-        std.log.err("config parse error: {}", .{err});
+        log.err("config parse error: {}", .{err});
         return err;
     };
+
+    // Initialize logging from config
+    const log_cfg = if (cfg.global()) |g| log.LogConfig.fromSection(g, "securedkim") else log.LogConfig.init(true, .mail, .info, "securedkim");
+    log.initGlobal(&log_cfg);
+    log.initThread();
 
     // Set module-level globals
     g_authserv_id = dkim_cfg.authserv_id;
@@ -220,21 +226,21 @@ pub fn main() !void {
     // Load signing config
     if (dkim_cfg.signing_table_path) |path| {
         const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
-            std.log.err("failed to load SigningTable {s}: {}", .{ path, err });
+            log.err("failed to load SigningTable {s}: {}", .{ path, err });
             return err;
         };
         g_signing_table = keytable.parseSigningTable(allocator, content) catch |err| {
-            std.log.err("failed to parse SigningTable: {}", .{err});
+            log.err("failed to parse SigningTable: {}", .{err});
             return err;
         };
     }
     if (dkim_cfg.key_table_path) |path| {
         const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
-            std.log.err("failed to load KeyTable {s}: {}", .{ path, err });
+            log.err("failed to load KeyTable {s}: {}", .{ path, err });
             return err;
         };
         g_key_table = keytable.parseKeyTable(allocator, content) catch |err| {
-            std.log.err("failed to parse KeyTable: {}", .{err});
+            log.err("failed to parse KeyTable: {}", .{err});
             return err;
         };
     }
@@ -244,7 +250,7 @@ pub fn main() !void {
     g_sign_selector = dkim_cfg.sign_selector;
     if (dkim_cfg.sign_key_file) |key_path| {
         g_sign_key = crypto.loadRsaKeyFile(key_path) catch |err| {
-            std.log.err("failed to load signing key {s}: {}", .{ key_path, err });
+            log.err("failed to load signing key {s}: {}", .{ key_path, err });
             return err;
         };
     }
@@ -252,23 +258,24 @@ pub fn main() !void {
     // Daemonize — MUST happen before spawning any threads (fork only preserves calling thread)
     if (!dkim_cfg.foreground) {
         daemon_mod.daemonize() catch |err| {
-            std.log.err("daemonize failed: {}", .{err});
+            log.err("daemonize failed: {}", .{err});
             return err;
         };
+        log.initThread(); // re-init after fork (PID changed)
     }
 
     // Start proactive DNS health monitor AFTER daemonize
     if (dns_mod.HealthMonitor.init(allocator, dkim_cfg.dns_nameservers, 53, 5, 2000)) |monitor| {
         monitor.start() catch |err| {
-            std.log.warn("DNS health monitor thread failed: {}", .{err});
+            log.warn("DNS health monitor thread failed: {}", .{err});
         };
         g_health_monitor = monitor;
     } else |err| {
-        std.log.warn("DNS health monitor init failed: {}, falling back to reactive", .{err});
+        log.warn("DNS health monitor init failed: {}, falling back to reactive", .{err});
     }
 
     daemon_mod.writePidFile(dkim_cfg.pid_file) catch |err| {
-        std.log.err("pid file write failed: {}", .{err});
+        log.err("pid file write failed: {}", .{err});
     };
     defer daemon_mod.removePidFile(dkim_cfg.pid_file);
 
@@ -280,12 +287,12 @@ pub fn main() !void {
     // Drop privileges after PID file is written, before workers spawn
     if (dkim_cfg.user) |user| {
         daemon_mod.dropPrivileges(user) catch |err| {
-            std.log.err("privilege drop to '{s}' failed: {}", .{ user, err });
+            log.err("privilege drop to '{s}' failed: {}", .{ user, err });
             return err;
         };
     }
 
-    std.log.info("SecureDKIM starting, AuthservID={s}, mode={s}, listeners={d}", .{
+    log.info("SecureDKIM starting, AuthservID={s}, mode={s}, listeners={d}", .{
         dkim_cfg.authserv_id,
         @tagName(dkim_cfg.mode),
         dkim_cfg.listen_addresses.len,
@@ -616,14 +623,14 @@ fn reloadConfig() void {
     }
     // Try re-reading from config (re-parse to get current paths)
     var cfg = config_mod.parseFile(g_allocator, g_config_path) catch {
-        std.log.warn("reload: failed to re-read config file, keeping previous", .{});
+        log.warn("reload: failed to re-read config file, keeping previous", .{});
         g_config_gen.increment();
         return;
     };
     defer cfg.deinit();
 
     const dkim_cfg = parseDkimConfig(g_allocator, &cfg) catch {
-        std.log.warn("reload: failed to parse config, keeping previous", .{});
+        log.warn("reload: failed to parse config, keeping previous", .{});
         g_config_gen.increment();
         return;
     };
@@ -633,12 +640,12 @@ fn reloadConfig() void {
         if (std.fs.cwd().readFileAlloc(g_allocator, path, 1024 * 1024)) |content| {
             if (keytable.parseSigningTable(g_allocator, content)) |new_st| {
                 g_signing_table = new_st;
-                std.log.info("SigningTable reloaded from {s}", .{path});
+                log.info("SigningTable reloaded from {s}", .{path});
             } else |_| {
-                std.log.warn("reload: failed to parse SigningTable", .{});
+                log.warn("reload: failed to parse SigningTable", .{});
             }
         } else |_| {
-            std.log.warn("reload: failed to read SigningTable {s}", .{path});
+            log.warn("reload: failed to read SigningTable {s}", .{path});
         }
     }
 
@@ -647,12 +654,12 @@ fn reloadConfig() void {
         if (std.fs.cwd().readFileAlloc(g_allocator, path, 1024 * 1024)) |content| {
             if (keytable.parseKeyTable(g_allocator, content)) |new_kt| {
                 g_key_table = new_kt;
-                std.log.info("KeyTable reloaded from {s}", .{path});
+                log.info("KeyTable reloaded from {s}", .{path});
             } else |_| {
-                std.log.warn("reload: failed to parse KeyTable", .{});
+                log.warn("reload: failed to parse KeyTable", .{});
             }
         } else |_| {
-            std.log.warn("reload: failed to read KeyTable {s}", .{path});
+            log.warn("reload: failed to read KeyTable {s}", .{path});
         }
     }
 
@@ -660,20 +667,20 @@ fn reloadConfig() void {
     if (dkim_cfg.sign_key_file) |key_path| {
         if (crypto.loadRsaKeyFile(key_path)) |new_key| {
             g_sign_key = new_key;
-            std.log.info("signing key reloaded from {s}", .{key_path});
+            log.info("signing key reloaded from {s}", .{key_path});
         } else |_| {
-            std.log.warn("reload: failed to reload signing key {s}", .{key_path});
+            log.warn("reload: failed to reload signing key {s}", .{key_path});
         }
     }
 
     g_config_gen.increment();
-    std.log.info("config generation advanced to {d}", .{g_config_gen.load()});
+    log.info("config generation advanced to {d}", .{g_config_gen.load()});
 }
 
 /// Per-worker reload callback: flush thread-local state.
 /// Future: flush LRU key cache when implemented.
 fn onWorkerReload() void {
-    std.log.debug("worker: config reload acknowledged", .{});
+    log.debug("worker: config reload acknowledged", .{});
 }
 
 // =============================================================================
