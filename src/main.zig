@@ -384,12 +384,13 @@ fn onEom(conn: *connection_mod.Connection) u8 {
     const queue_id = conn.macros.queue_id orelse "-";
     const client_addr = conn.macros.client_addr orelse "unknown";
     const mail_from = stripAngleBrackets(conn.mail_from_raw orelse "<>");
+    const peer = conn.getPeerDisplay();
     const mode_str: []const u8 = switch (g_mode) {
         .verify_only => "verify",
         .sign_only => "sign",
         .both => "both",
     };
-    log.info("id={s} client={s} from={s} mode={s} elapsed={d}ms", .{ queue_id, client_addr, mail_from, mode_str, elapsed_ms });
+    log.info("id={s} peer={s}[{s}] client={s} from={s} mode={s} elapsed={d}ms", .{ queue_id, peer.name, peer.ip, client_addr, mail_from, mode_str, elapsed_ms });
     return result;
 }
 
