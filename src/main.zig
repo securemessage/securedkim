@@ -43,6 +43,8 @@ pub const DkimConfig = struct {
     dns_nameservers: []const []const u8,
     dns_timeout_ms: u32,
     dns_retries: u8,
+    dns_cache_size: u32,
+    dns_negative_ttl: u32,
     mode: Mode,
     signing_table_path: ?[]const u8,
     key_table_path: ?[]const u8,
@@ -138,6 +140,8 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
     const dns_nameservers = try ns_list.toOwnedSlice(allocator);
     const dns_timeout = global.getInt("DnsTimeout", u32, 5) * 1000;
     const dns_retries = global.getInt("DnsRetries", u8, 2);
+    const dns_cache_size = global.getInt("DnsCacheSize", u32, 1000);
+    const dns_negative_ttl = global.getInt("DnsNegativeTTL", u32, 60);
     const signed_headers = global.getOrDefault("SignedHeaders", "from:to:subject:date:message-id");
 
     // ZMQ event publishing
@@ -154,6 +158,8 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
         .dns_nameservers = dns_nameservers,
         .dns_timeout_ms = dns_timeout,
         .dns_retries = dns_retries,
+        .dns_cache_size = dns_cache_size,
+        .dns_negative_ttl = dns_negative_ttl,
         .mode = mode,
         .signing_table_path = signing_table_path,
         .key_table_path = key_table_path,
@@ -202,6 +208,8 @@ pub fn main() !void {
         .nameservers = dkim_cfg.dns_nameservers,
         .timeout_ms = dkim_cfg.dns_timeout_ms,
         .retries = dkim_cfg.dns_retries,
+        .cache_size = dkim_cfg.dns_cache_size,
+        .negative_ttl = dkim_cfg.dns_negative_ttl,
     };
 
     g_mode = dkim_cfg.mode;
