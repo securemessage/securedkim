@@ -204,15 +204,6 @@ pub fn main() !void {
         .retries = dkim_cfg.dns_retries,
     };
 
-    // Start proactive DNS health monitor
-    if (dns_mod.HealthMonitor.init(allocator, dkim_cfg.dns_nameservers, 53, 5, 2000)) |monitor| {
-        monitor.start() catch |err| {
-            std.log.warn("DNS health monitor thread failed: {}", .{err});
-        };
-        g_health_monitor = monitor;
-    } else |err| {
-        std.log.warn("DNS health monitor init failed: {}, falling back to reactive", .{err});
-    }
     g_mode = dkim_cfg.mode;
     g_signed_headers = dkim_cfg.signed_headers;
     g_zmq_endpoint = dkim_cfg.zmq_endpoint;
@@ -250,12 +241,22 @@ pub fn main() !void {
         };
     }
 
-    // Daemonize
+    // Daemonize — MUST happen before spawning any threads (fork only preserves calling thread)
     if (!dkim_cfg.foreground) {
         daemon_mod.daemonize() catch |err| {
             std.log.err("daemonize failed: {}", .{err});
             return err;
         };
+    }
+
+    // Start proactive DNS health monitor AFTER daemonize
+    if (dns_mod.HealthMonitor.init(allocator, dkim_cfg.dns_nameservers, 53, 5, 2000)) |monitor| {
+        monitor.start() catch |err| {
+            std.log.warn("DNS health monitor thread failed: {}", .{err});
+        };
+        g_health_monitor = monitor;
+    } else |err| {
+        std.log.warn("DNS health monitor init failed: {}, falling back to reactive", .{err});
     }
 
     daemon_mod.writePidFile(dkim_cfg.pid_file) catch |err| {
