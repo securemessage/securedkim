@@ -164,9 +164,23 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     g_allocator = allocator;
 
+    // Parse command-line: securedkim -c /path/to/config
     var args = std.process.args();
     _ = args.next();
-    const config_path = args.next() orelse "/usr/local/etc/securedkim/securedkim.conf";
+    const config_path = blk: {
+        const flag = args.next() orelse {
+            std.log.err("usage: securedkim -c <config-file>", .{});
+            return error.InvalidArgument;
+        };
+        if (!std.mem.eql(u8, flag, "-c")) {
+            std.log.err("usage: securedkim -c <config-file>", .{});
+            return error.InvalidArgument;
+        }
+        break :blk args.next() orelse {
+            std.log.err("usage: securedkim -c <config-file>", .{});
+            return error.InvalidArgument;
+        };
+    };
     g_config_path = config_path;
 
     var cfg = config_mod.parseFile(allocator, config_path) catch |err| {
