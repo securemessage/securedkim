@@ -65,6 +65,7 @@ var g_zmq_endpoint: ?[]const u8 = null;
 var g_zmq_topic: []const u8 = "dkim";
 var g_allocator: Allocator = undefined;
 var g_config_path: []const u8 = "/usr/local/etc/securedkim/securedkim.conf";
+var g_health_monitor: ?*dns_mod.HealthMonitor = null;
 var g_config_gen: reload_mod.ConfigGeneration = reload_mod.ConfigGeneration.init();
 
 // Thread-local ZMQ publisher (one socket per worker thread — ZMQ thread-safety)
@@ -202,6 +203,16 @@ pub fn main() !void {
         .timeout_ms = dkim_cfg.dns_timeout_ms,
         .retries = dkim_cfg.dns_retries,
     };
+
+    // Start proactive DNS health monitor
+    if (dns_mod.HealthMonitor.init(allocator, dkim_cfg.dns_nameservers, 53, 5, 2000)) |monitor| {
+        monitor.start() catch |err| {
+            std.log.warn("DNS health monitor thread failed: {}", .{err});
+        };
+        g_health_monitor = monitor;
+    } else |err| {
+        std.log.warn("DNS health monitor init failed: {}, falling back to reactive", .{err});
+    }
     g_mode = dkim_cfg.mode;
     g_signed_headers = dkim_cfg.signed_headers;
     g_zmq_endpoint = dkim_cfg.zmq_endpoint;
@@ -304,6 +315,7 @@ pub fn main() !void {
 
     daemon_mod.ManagedSignals.signalLoop(shutdown_pipe[1], reloadConfig);
     for (threads.items) |t| t.join();
+    if (g_health_monitor) |monitor| monitor.deinit();
 }
 
 // =============================================================================
@@ -380,7 +392,7 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
         const sig_header_raw = std.fmt.allocPrint(conn.allocator, "DKIM-Signature: {s}", .{hdr.value}) catch continue;
         defer conn.allocator.free(sig_header_raw);
 
-        var resolver = dns_mod.Resolver.init(conn.allocator, g_dns_config);
+        var resolver = dns_mod.Resolver.initWithMonitor(conn.allocator, g_dns_config, g_health_monitor);
         defer resolver.deinit();
 
         const result = verify.verifySignature(
