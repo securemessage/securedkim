@@ -1,0 +1,185 @@
+.\" Copyright (c) 2026 Daniel Morante
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd July 27, 2026
+.Dt SECUREDKIM 8
+.Os
+.Sh NAME
+.Nm securedkim
+.Nd DKIM signing and verification milter for Postfix
+.Sh SYNOPSIS
+.Nm
+.Fl c Ar config-file
+.Sh DESCRIPTION
+.Nm
+is a high-performance DomainKeys Identified Mail (DKIM) milter implementing
+RFC 6376 and RFC 8463 (Ed25519-SHA256).
+It integrates with Postfix via the Sendmail milter protocol version 6,
+verifying DKIM signatures on incoming mail and optionally signing outgoing
+mail.
+.Pp
+.Nm
+supports RSA-SHA256 and Ed25519-SHA256 algorithms, multi-listener
+configurations with independent modes per listener, and SigningTable/KeyTable
+for multi-domain signing.
+.Sh OPTIONS
+.Bl -tag -width indent
+.It Fl c Ar config-file
+Path to the INI-style configuration file.
+Required.
+.El
+.Sh CONFIGURATION
+The configuration file uses INI format with a
+.Ql [global]
+section and one or more
+.Ql [listener:name]
+sections.
+.Ss Global Section
+.Bl -tag -width "SyslogFacility" -compact
+.It Cm AuthservID
+Identifier for Authentication-Results headers.
+Default:
+.Dq localhost .
+.It Cm WorkerThreads
+Number of worker threads.
+0 means auto-detect CPU count.
+Default: 0.
+.It Cm PidFile
+Path to the PID file.
+Default:
+.Pa /var/run/securedkim/securedkim.pid .
+.It Cm Foreground
+Run in foreground without daemonizing.
+Default: no.
+.It Cm User
+Drop privileges to this user after binding sockets.
+.It Cm Syslog
+Enable syslog output.
+Default: yes.
+.It Cm SyslogFacility
+Syslog facility.
+Default: mail.
+.It Cm LogLevel
+Logging verbosity: err, warn, info, debug.
+Default: info.
+.It Cm DnsNameserver
+Comma-separated DNS nameserver IPs.
+Default:
+.Dq 127.0.0.1 .
+.It Cm DnsTimeout
+DNS query timeout in seconds.
+Default: 5.
+.It Cm DnsRetries
+Number of DNS query retries.
+Default: 2.
+.It Cm DnsCacheSize
+Maximum DNS cache entries per worker.
+Default: 1000.
+.It Cm DnsNegativeTTL
+Negative cache TTL in seconds.
+Default: 60.
+.It Cm SignedHeaders
+Colon-separated list of headers to include in signatures.
+Default:
+.Dq from:to:subject:date:message-id .
+.It Cm ZmqEndpoint
+ZeroMQ PUB endpoint for event publishing.
+Disabled if not set.
+.It Cm ZmqTopic
+ZeroMQ topic prefix.
+Default:
+.Dq dkim .
+.El
+.Ss Listener Sections
+Each
+.Ql [listener:name]
+section defines a socket and its operating mode.
+.Bl -tag -width "SigningTable" -compact
+.It Cm Socket
+Listen address.
+Format:
+.Dq inet:port@host
+or
+.Dq unix:/path .
+.It Cm Mode
+Operating mode:
+.Dq sign ,
+.Dq verify ,
+or
+.Dq both .
+Default: verify.
+.It Cm SigningTable
+Path to signing table file mapping sender patterns to signing identities.
+Required for sign mode with multi-domain support.
+.It Cm KeyTable
+Path to key table file mapping signing identities to key files.
+Required for sign mode with multi-domain support.
+.It Cm Domain
+Single-domain signing shorthand: domain name.
+.It Cm Selector
+Single-domain signing shorthand: DKIM selector.
+.It Cm KeyFile
+Single-domain signing shorthand: path to private key file.
+.El
+.Pp
+If no listener sections are defined, the default is
+.Dq inet:8891@0.0.0.0
+in verify mode.
+.Ss Signing Table Format
+One entry per line:
+.Bd -literal -offset indent
+*@example.com    signing-identity-name
+.Ed
+.Ss Key Table Format
+One entry per line:
+.Bd -literal -offset indent
+signing-identity-name    domain:selector:/path/to/key.pem
+.Ed
+.Sh SIGNALS
+.Bl -tag -width "SIGTERM" -compact
+.It Dv SIGHUP
+Reload configuration (including key tables).
+.It Dv SIGTERM
+Graceful shutdown with 30 second drain timeout.
+.El
+.Sh POSTFIX INTEGRATION
+Typical setup with separate verify and sign instances:
+.Bd -literal -offset indent
+# Inbound verification
+smtpd_milters = inet:127.0.0.1:8891
+
+# Outbound signing (in submission or transport)
+smtp_milters = inet:127.0.0.1:8892
+
+milter_connect_macros = j {daemon_name} v {client_addr}
+milter_default_action = accept
+.Ed
+.Sh LOG FORMAT
+.Bd -literal -offset indent
+securedkim[pid]: id=QUEUEID peer=HOST[IP] client=IP from=ADDR mode=verify|sign elapsed=Nms
+.Ed
+.Sh EXIT STATUS
+.Ex -std
+.Sh FILES
+.Bl -tag -width "/usr/local/etc/securedkim/securedkim.conf"
+.It Pa /usr/local/etc/securedkim/securedkim.conf
+Default configuration file.
+.It Pa /var/run/securedkim/securedkim.pid
+Default PID file.
+.El
+.Sh SEE ALSO
+.Xr securedkim-genkey 8 ,
+.Xr securedkim-testkey 8 ,
+.Xr securespf 8 ,
+.Xr securedmarc 8 ,
+.Xr securearc 8
+.Sh STANDARDS
+.Rs
+.%T DomainKeys Identified Mail (DKIM) Signatures
+.%R RFC 6376
+.Re
+.Rs
+.%T Use of RSA-SHA-256 and Ed25519-SHA-256 in DKIM
+.%R RFC 8463
+.Re
+.Sh AUTHORS
+.An Daniel Morante

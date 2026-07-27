@@ -1,0 +1,81 @@
+.\" Copyright (c) 2026 Daniel Morante
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd July 27, 2026
+.Dt SECUREDKIM-GENKEY 8
+.Os
+.Sh NAME
+.Nm securedkim-genkey
+.Nd generate DKIM keypair and DNS record
+.Sh SYNOPSIS
+.Nm
+.Fl s Ar selector
+.Fl d Ar domain
+.Fl o Ar keyfile
+.Op Fl a Ar algorithm
+.Op Fl b Ar bits
+.Sh DESCRIPTION
+.Nm
+generates a DKIM private key and prints the corresponding DNS TXT record
+to standard output.
+The private key is written to the specified output file.
+.Pp
+The generated DNS TXT record is ready to be added to the domain's DNS zone
+at
+.Ar selector Ns ._domainkey. Ns Ar domain .
+.Sh OPTIONS
+.Bl -tag -width indent
+.It Fl s Ar selector
+DKIM selector name.
+Required.
+This becomes part of the DNS lookup key.
+.It Fl d Ar domain
+Domain name the key is generated for.
+Required.
+.It Fl o Ar keyfile
+Output path for the private key file.
+Required.
+The file is created with mode 0600.
+.It Fl a Ar algorithm
+Key algorithm:
+.Dq rsa
+(default) or
+.Dq ed25519 .
+.It Fl b Ar bits
+RSA key size in bits: 2048 (default) or 4096.
+Ignored for Ed25519.
+.It Fl h
+Display usage information.
+.El
+.Sh EXAMPLES
+Generate a 2048-bit RSA key:
+.Bd -literal -offset indent
+securedkim-genkey -s 2026 -d example.com -o /usr/local/etc/securedkim/example.key
+.Ed
+.Pp
+Generate an Ed25519 key:
+.Bd -literal -offset indent
+securedkim-genkey -a ed25519 -s ed2026 -d example.com -o /usr/local/etc/securedkim/example-ed.key
+.Ed
+.Pp
+Generate a 4096-bit RSA key:
+.Bd -literal -offset indent
+securedkim-genkey -b 4096 -s strong2026 -d example.com -o /path/to/key.pem
+.Ed
+.Sh OUTPUT
+The DNS TXT record is printed to stdout in a format suitable for direct
+inclusion in a zone file:
+.Bd -literal -offset indent
+selector._domainkey.example.com. IN TXT "v=DKIM1; k=rsa; p=MIIBIj..."
+.Ed
+.Sh EXIT STATUS
+.Ex -std
+.Sh SEE ALSO
+.Xr securedkim 8 ,
+.Xr securedkim-testkey 8
+.Sh STANDARDS
+.Rs
+.%T DomainKeys Identified Mail (DKIM) Signatures
+.%R RFC 6376
+.Re
+.Sh AUTHORS
+.An Daniel Morante

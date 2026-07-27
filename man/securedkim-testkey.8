@@ -1,0 +1,60 @@
+.\" Copyright (c) 2026 Daniel Morante
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd July 27, 2026
+.Dt SECUREDKIM-TESTKEY 8
+.Os
+.Sh NAME
+.Nm securedkim-testkey
+.Nd verify DKIM DNS key record matches local private key
+.Sh SYNOPSIS
+.Nm
+.Fl s Ar selector
+.Fl d Ar domain
+.Fl k Ar keyfile
+.Op Fl n Ar nameserver
+.Sh DESCRIPTION
+.Nm
+fetches the DKIM public key from DNS and verifies that it matches the
+specified local private key file.
+This is used to confirm that DNS records are correctly published before
+enabling DKIM signing.
+.Pp
+The tool queries
+.Ar selector Ns ._domainkey. Ns Ar domain
+for a TXT record, parses the DKIM key record, extracts the public key,
+and compares it against the public key derived from the local private key.
+.Sh OPTIONS
+.Bl -tag -width indent
+.It Fl s Ar selector
+DKIM selector name.
+Required.
+.It Fl d Ar domain
+Domain name.
+Required.
+.It Fl k Ar keyfile
+Path to the private key file to compare against.
+Required.
+.It Fl n Ar nameserver
+DNS nameserver IP address for the lookup.
+Default:
+.Dq 127.0.0.1 .
+.It Fl h
+Display usage information.
+.El
+.Sh EXIT STATUS
+.Bl -tag -width indent -compact
+.It 0
+Key matches \(em DNS public key corresponds to the local private key.
+.It 1
+Key mismatch or DNS lookup failure.
+.El
+.Sh EXAMPLES
+.Bd -literal -offset indent
+securedkim-testkey -s 2026 -d example.com -k /usr/local/etc/securedkim/example.key
+securedkim-testkey -s 2026 -d example.com -k /path/to/key.pem -n 8.8.8.8
+.Ed
+.Sh SEE ALSO
+.Xr securedkim 8 ,
+.Xr securedkim-genkey 8
+.Sh AUTHORS
+.An Daniel Morante

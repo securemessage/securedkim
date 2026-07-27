@@ -106,7 +106,7 @@ fn generateRsa(
     if (c.EVP_PKEY_keygen(ctx, &pkey) != 1) return error.KeygenFailed;
     defer c.EVP_PKEY_free(pkey);
 
-    // Write private key to file
+    // Write private key to file with restrictive permissions (0600)
     var path_buf: [4096]u8 = undefined;
     @memcpy(path_buf[0..output_path.len], output_path);
     path_buf[output_path.len] = 0;
@@ -115,6 +115,10 @@ fn generateRsa(
     defer _ = c.BIO_free(bio_file);
     if (c.PEM_write_bio_PrivateKey(bio_file, pkey, null, null, 0, null, null) != 1)
         return error.KeyWriteFailed;
+
+    // Restrict permissions: private key must not be world/group-readable
+    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+    _ = std.c.chmod(path_z, 0o600);
 
     // Extract public key in DER format for DNS record
     var der_len: c_int = 0;
@@ -169,7 +173,7 @@ fn generateEd25519(
     const pem_begin = "-----BEGIN " ++ pem_type ++ "-----\n";
     const pem_end = "\n-----END " ++ pem_type ++ "-----\n";
 
-    var file = try fs.cwd().createFile(output_path, .{});
+    var file = try fs.cwd().createFile(output_path, .{ .mode = 0o600 });
     defer file.close();
     _ = try file.write(pem_begin);
     _ = try file.write(seed_b64);
