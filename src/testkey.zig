@@ -143,10 +143,23 @@ fn extractPublicKey(allocator: std.mem.Allocator, path: []const u8, key_type: []
 }
 
 fn extractRsaPublicKey(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const key = try crypto.loadRsaKeyFile(path);
+    // 0, not the RFC floor: this tool exists to tell an operator what is in a
+    // key file, and refusing to load a weak key would leave them with an error
+    // and no diagnosis. It warns instead, which is the more useful answer.
+    const key = try crypto.loadRsaKeyFile(path, 0);
     defer {
         var k = key;
         k.deinit();
+    }
+
+    const bits = crypto.signingKeyBits(&key);
+    if (bits < crypto.RFC8301_MIN_RSA_BITS) {
+        std.debug.print(
+            "warning: this key is {d} bits. RFC 8301 §3.2 requires at least {d}, and\n" ++
+                "         verifiers that follow it will treat signatures made with this key as\n" ++
+                "         permanently failed. Generate a 2048-bit key instead.\n",
+            .{ bits, crypto.RFC8301_MIN_RSA_BITS },
+        );
     }
 
     const c = @cImport({

@@ -59,6 +59,7 @@ pub const DkimConfig = struct {
     zmq_endpoint: ?[]const u8,
     zmq_topic: []const u8,
     limits: connection_mod.Limits,
+    min_key_bits: crypto.MinRsaBits,
 };
 
 const reload_mod = securemilter.reload;
@@ -138,7 +139,25 @@ fn buildSigningAssets(allocator: Allocator, cfg: *const DkimConfig) !*SigningAss
 
     if (cfg.signing_table_path) |path| assets.signing_table = try loadSigningTable(allocator, path);
     if (cfg.key_table_path) |path| assets.key_table = try loadKeyTable(allocator, path);
-    if (cfg.sign_key_file) |path| assets.sign_key = try crypto.loadRsaKeyFile(path);
+    // The signing key is held to the RFC 8301 floor, not to the operator's
+    // MinimumKeyBits. That option is a policy about keys *other people* publish;
+    // coupling our own key to it would mean tightening the verify policy could
+    // stop the daemon starting, which is a surprise nobody asked for. The floor
+    // itself is not optional: RFC 8301 §3.2 says signers MUST use at least 1024
+    // bits, and mail signed below it fails DKIM at every conformant verifier.
+    if (cfg.sign_key_file) |path| {
+        var key = crypto.loadRsaKeyFile(path, crypto.RFC8301_MIN_RSA_BITS) catch |err| {
+            if (err == error.RsaKeyTooSmall) {
+                log.err(
+                    "signing key {s} is below the RFC 8301 minimum of {d} bits: refusing to sign with it",
+                    .{ path, crypto.RFC8301_MIN_RSA_BITS },
+                );
+            }
+            return err;
+        };
+        log.info("loaded {d}-bit signing key from {s}", .{ crypto.signingKeyBits(&key), path });
+        assets.sign_key = key;
+    }
 
     return assets;
 }
@@ -147,6 +166,13 @@ var g_sign_domain: ?[]const u8 = null;
 var g_sign_selector: ?[]const u8 = null;
 var g_signed_headers: []const u8 = "from:to:subject:date:message-id";
 var g_strip_policy: header_scrub.StripPolicy = .{ .own_methods = &.{"dkim"} };
+
+/// Smallest RSA modulus accepted from a signer's DNS key record.
+///
+/// Set once at startup and read by every worker thereafter. Deliberately not a
+/// field on `connection.Limits`: that struct is shared by all four daemons, and
+/// only the two that verify signatures have any use for this.
+var g_min_key_bits: u32 = crypto.RFC8301_MIN_RSA_BITS;
 
 pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !DkimConfig {
     const global = cfg.getSection("global") orelse return error.MissingGlobalSection;
@@ -213,6 +239,13 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
     // Caps on attacker-controlled message content (audit X-4, D-4).
     const limits = connection_mod.Limits.fromSection(global);
 
+    // Smallest RSA key we will accept from a signer (audit C-3). The floor is
+    // the RFC's, not ours, so a configured value below it is raised rather than
+    // honoured.
+    const min_key_bits = crypto.resolveMinRsaBits(
+        global.getInt(crypto.MIN_KEY_BITS_OPTION, u32, crypto.RFC8301_MIN_RSA_BITS),
+    );
+
     // ZMQ event publishing
     const zmq_endpoint = global.get("ZmqEndpoint");
     const zmq_topic = global.getOrDefault("ZmqTopic", "dkim");
@@ -240,6 +273,7 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
         .zmq_endpoint = zmq_endpoint,
         .zmq_topic = zmq_topic,
         .limits = limits,
+        .min_key_bits = min_key_bits,
     };
 }
 
@@ -293,6 +327,17 @@ pub fn main() !void {
     g_zmq_endpoint = dkim_cfg.zmq_endpoint;
     g_zmq_topic = dkim_cfg.zmq_topic;
     g_strip_policy = .{ .own_methods = &.{"dkim"}, .strip_all = dkim_cfg.strip_auth_results };
+    g_min_key_bits = dkim_cfg.min_key_bits.bits;
+
+    // Say so rather than silently disagreeing with the config file. An operator
+    // who wrote a smaller number is trying to accept keys the RFC forbids, and
+    // should learn that from the log and not from a support ticket.
+    if (dkim_cfg.min_key_bits.raised) {
+        log.warn(
+            "{s} below the RFC 8301 minimum: using {d} bits",
+            .{ crypto.MIN_KEY_BITS_OPTION, dkim_cfg.min_key_bits.bits },
+        );
+    }
 
     // Load signing config as one publishable unit.
     g_signing = SigningRcu.init(allocator, freeSigningAssets);
@@ -348,9 +393,10 @@ pub fn main() !void {
         };
     }
 
-    log.info("SecureDKIM starting, AuthservID={s}, mode={s}, listeners={d}", .{
+    log.info("SecureDKIM starting, AuthservID={s}, mode={s}, MinimumKeyBits={d}, listeners={d}", .{
         dkim_cfg.authserv_id,
         @tagName(dkim_cfg.mode),
+        dkim_cfg.min_key_bits.bits,
         dkim_cfg.listen_addresses.len,
     });
 
@@ -557,7 +603,21 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
             sig_header_raw,
             header_strings.items,
             body_hash,
+            g_min_key_bits,
         );
+
+        // A weak key is a signer-side fault the postmaster on this side cannot
+        // fix, so it is worth a log line: the A-R header records only the
+        // permerror, and without this nobody can tell it apart from a
+        // canonicalization failure without recomputing the signature by hand.
+        if (result.reason) |reason| {
+            if (mem.eql(u8, reason, "key too small")) {
+                log.warn(
+                    "{s}: RSA key below MinimumKeyBits={d}, signature permanently failed (RFC 8301 §3.2)",
+                    .{ result.domain, g_min_key_bits },
+                );
+            }
+        }
 
         _ = addArHeader(conn, "dkim", result.result.toString(), result.domain, result.selector);
         publishEvent(conn.allocator, "verify", result.result.toString(), result.domain, result.selector);

@@ -147,6 +147,46 @@ and
 are read at startup only.
 .Dv SIGHUP
 does not change them.
+.It Cm MinimumKeyBits
+Smallest RSA key, in bits, accepted from a signer's DNS key record.
+Default: 1024.
+.Pp
+Unlike the
+.Cm Max Ns -prefixed
+limits above, 0 does not disable this check.
+RFC 8301 \[sc]3.2 states that verifiers
+.Dq MUST NOT consider signatures using RSA keys of less than 1024 bits as valid signatures ,
+so a configured value below 1024 is raised to 1024 and a warning is logged.
+A 512-bit modulus is factorable for a few hundred dollars of rented compute,
+which would make
+.Cm dkim=pass
+meaningless while DMARC continued to treat it as an authenticated identity.
+.Pp
+A signature whose key is below the limit is reported as
+.Cm dkim=permerror
+with the reason
+.Dq key too small ,
+matching RFC 8301's statement that such signatures
+.Dq have permanently failed evaluation .
+A warning naming the signing domain is logged as well, since the fault is the
+signer's and the reason cannot otherwise be told apart from a canonicalization
+failure.
+.Pp
+Raising this to 2048 matches the RFC's
+.Sy SHOULD
+for signers, at the cost of a
+.Cm permerror
+for any correspondent still publishing a 1024-bit key, which remains legal.
+.Pp
+This option governs only keys published by others.
+The signing key configured with
+.Cm SignKeyFile
+or through
+.Cm KeyTable
+is always held to the 1024-bit floor irrespective of this setting, and the
+daemon refuses to start if it is smaller: RFC 8301 binds signers to the same
+minimum, so mail signed below it fails DKIM at every conformant verifier.
+Read at startup only.
 .It Cm ZmqEndpoint
 ZeroMQ PUB endpoint for event publishing.
 Disabled if not set.

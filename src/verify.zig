@@ -50,6 +50,10 @@ pub const VerifyResult = struct {
 /// 5. Compare body hash with bh= tag value
 /// 6. Reconstruct signed header block (canonicalized headers per h= list)
 /// 7. Verify signature over the header block
+///
+/// `min_key_bits` is the smallest RSA modulus this verifier will accept, already
+/// reconciled with the RFC 8301 floor by `crypto.resolveMinRsaBits`. It is a
+/// parameter rather than a constant so an operator can tighten it past the RFC.
 pub fn verifySignature(
     allocator: Allocator,
     resolver: *dns_mod.Resolver,
@@ -57,6 +61,7 @@ pub fn verifySignature(
     sig_header_raw: []const u8,
     headers: []const []const u8,
     body_hash: [32]u8,
+    min_key_bits: u32,
 ) VerifyResult {
     // Step 1: Parse the DKIM-Signature
     const sig = dkim.parseSignature(sig_header_value) catch
@@ -133,8 +138,21 @@ pub fn verifySignature(
         return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "invalid b= base64" };
     defer allocator.free(sig_decoded);
 
-    const verified = verifyWithKey(allocator, sig.algorithm, key_record, signed_data, sig_decoded) catch
-        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "crypto verify error" };
+    const verified = verifyWithKey(allocator, sig.algorithm, key_record, signed_data, sig_decoded, min_key_bits) catch |err| {
+        // RFC 8301 §3.2: a signature made with an RSA key below the floor "has
+        // permanently failed evaluation", which is PERMFAIL — the same class as
+        // a malformed key record, not a signature mismatch. Reported with its
+        // own reason because "crypto verify error" would send an operator
+        // hunting a canonicalization bug instead of telling the signer to
+        // rotate to a 2048-bit key.
+        const reason: []const u8 = switch (err) {
+            error.RsaKeyTooSmall => "key too small",
+            error.NotRsaPublicKey => "p= is not an RSA key",
+            error.InvalidPublicKey => "unusable public key",
+            else => "crypto verify error",
+        };
+        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = reason };
+    };
 
     if (verified) {
         return .{ .result = .pass, .domain = sig.domain, .selector = sig.selector };
@@ -294,6 +312,7 @@ fn verifyWithKey(
     key_record: dkim.PublicKeyRecord,
     signed_data: []const u8,
     signature_bytes: []const u8,
+    min_key_bits: u32,
 ) !bool {
     switch (algorithm) {
         .rsa_sha256 => {
@@ -301,7 +320,14 @@ fn verifyWithKey(
             const pub_key_der = try crypto.base64Decode(allocator, key_record.public_key);
             defer allocator.free(pub_key_der);
 
-            const evp_pkey = crypto.loadRsaPublicKeyDer(pub_key_der) catch return error.InvalidPublicKey;
+            // The size check lives inside the load so it cannot be skipped. Note
+            // that the errors are deliberately *not* collapsed into one here:
+            // the caller distinguishes an undersized key from an unparseable
+            // one, and squashing them was how the old code lost that.
+            const evp_pkey = crypto.loadRsaPublicKeyDer(pub_key_der, min_key_bits, null) catch |err| switch (err) {
+                error.RsaKeyTooSmall, error.NotRsaPublicKey => return err,
+                else => return error.InvalidPublicKey,
+            };
             defer crypto.freePublicKey(evp_pkey);
 
             return crypto.rsaVerify(evp_pkey, signed_data, signature_bytes);

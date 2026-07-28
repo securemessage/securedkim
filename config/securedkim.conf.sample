@@ -64,6 +64,30 @@ SignedHeaders   = from:to:subject:date:message-id
 # the result is dkim=permerror.
 # MaxSignatures = 20
 
+# --- Minimum signer key size ---
+
+# Smallest RSA key, in bits, accepted from a signer's DNS key record.
+# Default 1024.
+#
+# Note the asymmetry with the MaxNNN limits above: 0 does NOT disable this one.
+# RFC 8301 section 3.2 says verifiers "MUST NOT consider signatures using RSA
+# keys of less than 1024 bits as valid signatures", so a value below 1024 is
+# raised to 1024 and a warning is logged. A 512-bit modulus is factorable for a
+# few hundred dollars, which would make dkim=pass mean nothing while DMARC went
+# on treating it as an authenticated identity.
+#
+# A signature below the limit gets dkim=permerror, which is what RFC 8301 calls
+# for: such signatures "have permanently failed evaluation".
+#
+# Raise this to 2048 to match the RFC's SHOULD for signers. Be aware that doing
+# so will permerror mail from any correspondent still publishing a 1024-bit key,
+# which is legal and still reasonably common.
+#
+# This applies only to keys other people publish. This daemon's own signing key
+# is always held to the 1024-bit floor regardless of what is set here, because
+# mail signed below it fails DKIM at every conformant verifier.
+# MinimumKeyBits = 1024
+
 # ZMQ event publishing endpoint (optional).
 # ZmqEndpoint   = tcp://events.internal:5555
 
