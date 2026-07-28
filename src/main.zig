@@ -58,6 +58,7 @@ pub const DkimConfig = struct {
     strip_auth_results: bool,
     zmq_endpoint: ?[]const u8,
     zmq_topic: []const u8,
+    limits: connection_mod.Limits,
 };
 
 const reload_mod = securemilter.reload;
@@ -209,6 +210,9 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
     // claiming our authserv-id can be genuine on arrival (RFC 8601 §5).
     const strip_auth_results = global.getBool("StripAuthResults", false);
 
+    // Caps on attacker-controlled message content (audit X-4, D-4).
+    const limits = connection_mod.Limits.fromSection(global);
+
     // ZMQ event publishing
     const zmq_endpoint = global.get("ZmqEndpoint");
     const zmq_topic = global.getOrDefault("ZmqTopic", "dkim");
@@ -235,6 +239,7 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
         .strip_auth_results = strip_auth_results,
         .zmq_endpoint = zmq_endpoint,
         .zmq_topic = zmq_topic,
+        .limits = limits,
     };
 }
 
@@ -363,6 +368,7 @@ pub fn main() !void {
         .on_eom = onEom,
         .on_reload = onWorkerReload,
         .required_actions = required_actions,
+        .limits = dkim_cfg.limits,
     };
 
     const shutdown_pipe = try posix.pipe();
@@ -423,8 +429,34 @@ fn onEoh(conn: *connection_mod.Connection) u8 {
 }
 
 fn onBody(conn: *connection_mod.Connection, data: []const u8) u8 {
-    // Accumulate body chunks in connection's body buffer
-    conn.appendBody(data) catch {};
+    // Accumulate the body so it can be hashed at end-of-message.
+    //
+    // A rejection here is not fatal to the SMTP transaction and must not be
+    // silently discarded either: the connection latches the overflow, and
+    // end-of-message declines to verify or sign rather than hashing a body the
+    // MTA is not delivering (audit X-4). Continue so the MTA finishes the
+    // transaction normally; each further chunk is now a cheap no-op.
+    //
+    // Only the chunk that trips the limit is logged. A large message arrives as
+    // thousands of chunks, and one log line each would make an oversized message
+    // a log-flooding tool in its own right.
+    const already_tripped = conn.body_overflow;
+    conn.appendBody(data) catch |e| {
+        if (!already_tripped) {
+            const peer = conn.getPeerDisplay();
+            if (e == error.BodyTooLarge) {
+                log.warn(
+                    "body exceeds MaxBodyBytes={d} from {s}[{s}]: message will not be verified or signed",
+                    .{ conn.limits.max_body_bytes, peer.name, peer.ip },
+                );
+            } else {
+                log.err(
+                    "body accumulation failed for {s}[{s}]: {}",
+                    .{ peer.name, peer.ip, e },
+                );
+            }
+        }
+    };
     return @intFromEnum(responses.Code.@"continue");
 }
 
@@ -459,8 +491,38 @@ fn onEom(conn: *connection_mod.Connection) u8 {
 }
 
 fn doVerify(conn: *connection_mod.Connection) u8 {
-    // Compute body hash using the body accumulated on the connection
-    const body_data = conn.getBody();
+    // A truncated copy cannot be verified. Reporting dkim=fail would be a lie
+    // about the signature and dkim=none a lie about the message, so this is
+    // temperror: the result is unknown for a local, transient reason, which is
+    // exactly what RFC 6376 6.1 reserves TEMPFAIL for.
+    if (conn.contentTruncated()) {
+        _ = addArHeader(conn, "dkim", "temperror", "", "");
+        publishEvent(conn.allocator, "verify", "temperror", "", "");
+        return @intFromEnum(responses.Code.@"continue");
+    }
+
+    // Refuse a signature flood before spending anything on it. Each signature
+    // costs an uncached DNS lookup plus an RSA verify, so the work is the
+    // attack: 300 of them measured 355x the cost of a normal message and
+    // stalled every worker (audit D-4). Counting is O(headers) with no I/O.
+    const max_sigs = conn.limits.max_signatures;
+    if (max_sigs != 0) {
+        const sig_count = conn.countHeadersCapped("DKIM-Signature", max_sigs);
+        if (sig_count > max_sigs) {
+            const peer = conn.getPeerDisplay();
+            log.warn(
+                "more than MaxSignatures={d} DKIM-Signature headers from {s}[{s}]: not verifying",
+                .{ max_sigs, peer.name, peer.ip },
+            );
+            _ = addArHeader(conn, "dkim", "permerror", "", "");
+            publishEvent(conn.allocator, "verify", "permerror", "", "");
+            return @intFromEnum(responses.Code.@"continue");
+        }
+    }
+
+    // Compute body hash using the body accumulated on the connection.
+    // `contentTruncated` above already established the body is whole.
+    const body_data = conn.getBody() orelse return @intFromEnum(responses.Code.@"continue");
     const body_hash = sign_mod.computeBodyHash(conn.allocator, body_data, .simple) catch
         return @intFromEnum(responses.Code.@"continue");
 
@@ -510,6 +572,20 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
 }
 
 fn doSign(conn: *connection_mod.Connection) u8 {
+    // Never sign a message this daemon does not hold in full. A signature is a
+    // claim about specific bytes; over a truncated copy it is a false claim, and
+    // every recipient would compute dkim=fail on mail we vouched for. Leaving it
+    // unsigned is a deliverability cost, signing it wrongly is a correctness one
+    // paid by everyone downstream (audit X-4).
+    if (conn.contentTruncated()) {
+        const peer = conn.getPeerDisplay();
+        log.warn(
+            "not signing message from {s}[{s}]: accumulated copy is incomplete",
+            .{ peer.name, peer.ip },
+        );
+        return @intFromEnum(responses.Code.@"continue");
+    }
+
     // Determine signing domain from sender
     const mail_from = stripAngleBrackets(conn.mail_from_raw orelse return @intFromEnum(responses.Code.@"continue"));
     const domain = getSendingDomain(mail_from) orelse return @intFromEnum(responses.Code.@"continue");
@@ -537,8 +613,9 @@ fn doSign(conn: *connection_mod.Connection) u8 {
         for (header_strings.items) |s| conn.allocator.free(s);
     }
 
-    // Compute body hash
-    const body_data = conn.getBody();
+    // Compute body hash. The truncation check at the top of doSign already
+    // established the body is whole.
+    const body_data = conn.getBody() orelse return @intFromEnum(responses.Code.@"continue");
     const body_hash = sign_mod.computeBodyHash(conn.allocator, body_data, sign_params.canonicalization.body) catch
         return @intFromEnum(responses.Code.@"continue");
 

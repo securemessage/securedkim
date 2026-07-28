@@ -93,6 +93,60 @@ Default: 60.
 Colon-separated list of headers to include in signatures.
 Default:
 .Dq from:to:subject:date:message-id .
+.It Cm MaxBodyBytes
+Largest message body buffered in order to hash it.
+Accepts an optional
+.Cm K , Cm M
+or
+.Cm G
+suffix.
+Default: 10M.
+0 disables the limit.
+.Pp
+Should be at least the MTA's
+.Va message_size_limit .
+A body over the limit is neither hashed nor silently truncated: verification
+reports
+.Cm dkim=temperror
+and signing is skipped, because a body hash taken over a partial copy would
+describe a message the MTA is not delivering.
+.It Cm MaxHeaders
+Largest number of headers accumulated for one message.
+Default: 500.
+0 disables the limit.
+.It Cm MaxHeaderBytes
+Largest total header size, names plus values, accumulated for one message.
+Accepts a size suffix.
+Default: 1M.
+0 disables the limit.
+.Pp
+A message exceeding either header limit is tempfailed rather than delivered.
+Headers past the limit are never read, and
+.Nm
+can only strip a forged
+.Cm Authentication-Results
+header that it read, so delivering the message would let one hidden beyond the
+limit through uninspected.
+Raise these if legitimate mail crossing many forwarders and mailing lists is
+being deferred.
+.It Cm MaxSignatures
+Largest number of
+.Cm DKIM-Signature
+headers verified in one message.
+Default: 20, matching OpenDKIM's option of the same name.
+0 disables the limit.
+.Pp
+Each signature costs a DNS lookup and an RSA verify, so an unbounded count is
+remote CPU and DNS amplification.
+Past the limit no signature is verified and the result is
+.Cm dkim=permerror .
+.Pp
+.Cm MaxBodyBytes , Cm MaxHeaders , Cm MaxHeaderBytes
+and
+.Cm MaxSignatures
+are read at startup only.
+.Dv SIGHUP
+does not change them.
 .It Cm ZmqEndpoint
 ZeroMQ PUB endpoint for event publishing.
 Disabled if not set.

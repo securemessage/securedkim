@@ -32,6 +32,38 @@ DnsRetries      = 2
 # Headers to include in DKIM signature.
 SignedHeaders   = from:to:subject:date:message-id
 
+# --- Resource limits on attacker-controlled message content ---
+#
+# All four take effect at startup, not on SIGHUP. Setting any of them to 0
+# disables that limit entirely, which restores the unbounded behaviour.
+
+# Largest message body this daemon will buffer in order to hash it.
+# Accepts a K/M/G suffix. Default 10M.
+#
+# Set this at or above Postfix's message_size_limit. A body over the limit is
+# not hashed and not truncated: verification reports dkim=temperror and signing
+# is skipped, because a body hash over a partial copy would describe a message
+# the MTA is not delivering.
+# MaxBodyBytes  = 10M
+
+# Largest number of headers, and largest total header size, this daemon will
+# accumulate. Defaults 500 and 1M.
+#
+# A message whose header block exceeds either is tempfailed rather than
+# delivered: headers past the limit are never seen, so a forged
+# Authentication-Results hidden beyond it could not be stripped. Raise these if
+# legitimate mail crossing many forwarders and mailing lists is being deferred.
+# MaxHeaders    = 500
+# MaxHeaderBytes = 1M
+
+# Largest number of DKIM-Signature headers to verify in one message.
+# Default 20, matching OpenDKIM's MaxSignatures.
+#
+# Each signature costs a DNS lookup and an RSA verify, so an unbounded count is
+# remote CPU and DNS amplification. Past the limit no signature is verified and
+# the result is dkim=permerror.
+# MaxSignatures = 20
+
 # ZMQ event publishing endpoint (optional).
 # ZmqEndpoint   = tcp://events.internal:5555
 
