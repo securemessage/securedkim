@@ -94,8 +94,22 @@ pub fn verifySignature(
         return .{ .result = .temperror, .domain = sig.domain, .selector = sig.selector, .reason = "alloc failure" };
     defer allocator.free(dns_name);
 
-    var dns_result = resolver.resolve(dns_name, .TXT) catch
-        return .{ .result = .temperror, .domain = sig.domain, .selector = sig.selector, .reason = "DNS lookup failed" };
+    // RFC 6376 §6.1.2 splits these two deliberately, and in opposite
+    // directions. Step 3: if the query fails "because the corresponding key
+    // record does not exist", the Verifier "MUST immediately return PERMFAIL
+    // (no key for signature)" — the signature can never verify, so deferring it
+    // means retrying a message that will fail every time. Step 2: a query that
+    // "fails to respond" only MAY return TEMPFAIL, which is the right answer
+    // when the nameserver is merely unreachable.
+    //
+    // Collapsing both into temperror also disagreed with the empty-answer case
+    // immediately below, which already returned permerror.
+    var dns_result = resolver.resolve(dns_name, .TXT) catch |err| {
+        if (dns_mod.isTransientError(err)) {
+            return .{ .result = .temperror, .domain = sig.domain, .selector = sig.selector, .reason = "DNS lookup failed" };
+        }
+        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "no key record for selector" };
+    };
     defer dns_result.deinit();
 
     // Find the key record in TXT results
