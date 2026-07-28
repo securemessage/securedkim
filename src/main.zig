@@ -61,6 +61,7 @@ pub const DkimConfig = struct {
 };
 
 const reload_mod = securemilter.reload;
+const rcu_mod = securemilter.rcu;
 
 // Module-level config set before worker spawn, read-only during runtime.
 var g_authserv_id: []const u8 = "localhost";
@@ -82,11 +83,67 @@ fn getPublisher() *zmq.Publisher {
     }
     return &tl_publisher.?;
 }
-var g_signing_table: ?keytable.SigningTable = null;
-var g_key_table: ?keytable.KeyTable = null;
+/// Everything a message needs in order to sign, published as one unit.
+///
+/// Bundling these is not tidiness. Reloading the table and the key as separate
+/// atomic swaps lets a message resolve a domain out of the new SigningTable
+/// and then sign it with the previous key. One pointer means a message sees
+/// either the whole of the old configuration or the whole of the new one.
+///
+/// Previously these were three module globals replaced by value on SIGHUP
+/// while workers held pointers into them — a torn read, and the old contents
+/// (including the EVP_PKEY) were never freed (audit X-2).
+const SigningAssets = struct {
+    signing_table: ?keytable.SigningTable = null,
+    key_table: ?keytable.KeyTable = null,
+    sign_key: ?crypto.SigningKey = null,
+};
+
+const SigningRcu = rcu_mod.Rcu(SigningAssets);
+var g_signing: SigningRcu = undefined;
+
+fn freeSigningAssets(allocator: Allocator, assets: *SigningAssets) void {
+    if (assets.signing_table) |*st| st.deinit();
+    if (assets.key_table) |*kt| kt.deinit();
+    if (assets.sign_key) |*k| k.deinit();
+    allocator.destroy(assets);
+}
+
+/// Largest SigningTable/KeyTable we will read.
+const MAX_TABLE_BYTES: usize = 1024 * 1024;
+
+fn loadSigningTable(allocator: Allocator, path: []const u8) !keytable.SigningTable {
+    // parseSigningTable copies what it keeps, so the file buffer is ours to
+    // free. It previously was not freed, leaking the whole file on every read.
+    const content = try std.fs.cwd().readFileAlloc(allocator, path, MAX_TABLE_BYTES);
+    defer allocator.free(content);
+    return keytable.parseSigningTable(allocator, content);
+}
+
+fn loadKeyTable(allocator: Allocator, path: []const u8) !keytable.KeyTable {
+    const content = try std.fs.cwd().readFileAlloc(allocator, path, MAX_TABLE_BYTES);
+    defer allocator.free(content);
+    return keytable.parseKeyTable(allocator, content);
+}
+
+/// Build a complete set of signing assets from a parsed config.
+///
+/// All or nothing: if any piece fails to load the caller keeps the previous
+/// set, rather than running on a half-updated mixture.
+fn buildSigningAssets(allocator: Allocator, cfg: *const DkimConfig) !*SigningAssets {
+    const assets = try allocator.create(SigningAssets);
+    assets.* = .{};
+    errdefer freeSigningAssets(allocator, assets);
+
+    if (cfg.signing_table_path) |path| assets.signing_table = try loadSigningTable(allocator, path);
+    if (cfg.key_table_path) |path| assets.key_table = try loadKeyTable(allocator, path);
+    if (cfg.sign_key_file) |path| assets.sign_key = try crypto.loadRsaKeyFile(path);
+
+    return assets;
+}
+
 var g_sign_domain: ?[]const u8 = null;
 var g_sign_selector: ?[]const u8 = null;
-var g_sign_key: ?crypto.SigningKey = null;
 var g_signed_headers: []const u8 = "from:to:subject:date:message-id";
 var g_strip_policy: header_scrub.StripPolicy = .{ .own_methods = &.{"dkim"} };
 
@@ -232,37 +289,22 @@ pub fn main() !void {
     g_zmq_topic = dkim_cfg.zmq_topic;
     g_strip_policy = .{ .own_methods = &.{"dkim"}, .strip_all = dkim_cfg.strip_auth_results };
 
-    // Load signing config
-    if (dkim_cfg.signing_table_path) |path| {
-        const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
-            log.err("failed to load SigningTable {s}: {}", .{ path, err });
-            return err;
-        };
-        g_signing_table = keytable.parseSigningTable(allocator, content) catch |err| {
-            log.err("failed to parse SigningTable: {}", .{err});
-            return err;
-        };
-    }
-    if (dkim_cfg.key_table_path) |path| {
-        const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
-            log.err("failed to load KeyTable {s}: {}", .{ path, err });
-            return err;
-        };
-        g_key_table = keytable.parseKeyTable(allocator, content) catch |err| {
-            log.err("failed to parse KeyTable: {}", .{err});
-            return err;
-        };
-    }
+    // Load signing config as one publishable unit.
+    g_signing = SigningRcu.init(allocator, freeSigningAssets);
+    const initial_assets = buildSigningAssets(allocator, &dkim_cfg) catch |err| {
+        log.err("failed to load signing configuration: {}", .{err});
+        return err;
+    };
+    g_signing.publish(&g_config_gen, initial_assets) catch |err| {
+        freeSigningAssets(allocator, initial_assets);
+        log.err("failed to publish signing configuration: {}", .{err});
+        return err;
+    };
 
-    // Single-domain shorthand
+    // Single-domain shorthand. These point into `cfg`, which lives for the
+    // whole process, and are not reloadable.
     g_sign_domain = dkim_cfg.sign_domain;
     g_sign_selector = dkim_cfg.sign_selector;
-    if (dkim_cfg.sign_key_file) |key_path| {
-        g_sign_key = crypto.loadRsaKeyFile(key_path) catch |err| {
-            log.err("failed to load signing key {s}: {}", .{ key_path, err });
-            return err;
-        };
-    }
 
     // Daemonize — MUST happen before spawning any threads (fork only preserves calling thread)
     if (!dkim_cfg.foreground) {
@@ -341,6 +383,12 @@ pub fn main() !void {
 
     daemon_mod.ManagedSignals.signalLoop(shutdown_pipe[1], reloadConfig);
     for (threads.items) |t| t.join();
+
+    // Workers are joined: nothing can be mid-signature, so the live snapshot
+    // and any retired ones can all go.
+    g_signing.deinit();
+    g_config_gen.deinit(allocator);
+
     if (g_health_monitor) |monitor| monitor.deinit();
 }
 
@@ -466,10 +514,15 @@ fn doSign(conn: *connection_mod.Connection) u8 {
     const mail_from = stripAngleBrackets(conn.mail_from_raw orelse return @intFromEnum(responses.Code.@"continue"));
     const domain = getSendingDomain(mail_from) orelse return @intFromEnum(responses.Code.@"continue");
 
+    // One snapshot of the signing configuration for the whole message: the
+    // table that chose the domain and the key that signs it must agree, even
+    // if a SIGHUP lands midway.
+    const assets = g_signing.get() orelse return @intFromEnum(responses.Code.@"continue");
+
     // Look up signing parameters
-    const sign_params = resolveSigningParams(domain, mail_from) orelse
+    const sign_params = resolveSigningParams(assets, domain, mail_from) orelse
         return @intFromEnum(responses.Code.@"continue");
-    const sign_key = resolveSigningKey(sign_params) orelse
+    const sign_key = resolveSigningKey(assets, sign_params) orelse
         return @intFromEnum(responses.Code.@"continue");
 
     // Build header list
@@ -529,7 +582,16 @@ fn publishEvent(
     getPublisher().publish(json);
 }
 
-fn resolveSigningParams(domain: []const u8, sender: []const u8) ?sign_mod.SigningParams {
+/// Resolve signing parameters against one snapshot of the signing assets.
+///
+/// The snapshot is passed in rather than re-read here so that the table
+/// consulted and the key used later in the same message come from the same
+/// published configuration.
+fn resolveSigningParams(
+    assets: *const SigningAssets,
+    domain: []const u8,
+    sender: []const u8,
+) ?sign_mod.SigningParams {
     // Single-domain shorthand
     if (g_sign_domain) |d| {
         if (eqlIgnoreCase(d, domain)) {
@@ -542,9 +604,9 @@ fn resolveSigningParams(domain: []const u8, sender: []const u8) ?sign_mod.Signin
     }
 
     // SigningTable + KeyTable lookup
-    if (g_signing_table) |*st| {
+    if (assets.signing_table) |*st| {
         const entry_name = st.lookup(sender) orelse return null;
-        if (g_key_table) |*kt| {
+        if (assets.key_table) |*kt| {
             const entries = kt.lookup(entry_name);
             if (entries.len > 0) {
                 return .{
@@ -559,10 +621,12 @@ fn resolveSigningParams(domain: []const u8, sender: []const u8) ?sign_mod.Signin
     return null;
 }
 
-fn resolveSigningKey(params: sign_mod.SigningParams) ?*const crypto.SigningKey {
+/// The returned pointer is borrowed from `assets` and stays valid for the rest
+/// of this message, which is what signing needs (see securemilter rcu.zig).
+fn resolveSigningKey(assets: *const SigningAssets, params: sign_mod.SigningParams) ?*const crypto.SigningKey {
     _ = params;
     // Single-domain shorthand key
-    if (g_sign_key) |*k| return k;
+    if (assets.sign_key) |*k| return k;
     // KeyTable-based key loading (lazy-load, future LRU cache)
     // For v1, only single-domain shorthand is wired end-to-end
     return null;
@@ -643,67 +707,60 @@ fn toLower(c: u8) u8 {
 // Reload
 // =============================================================================
 
-/// Main-thread reload callback: re-reads SigningTable, KeyTable, and signing key.
-/// Increments config generation so workers flush any future LRU key caches.
+/// Main-thread reload callback: re-reads SigningTable, KeyTable and signing
+/// key, and publishes them as a single new snapshot.
+///
+/// All or nothing. The previous code updated each of the three in place as it
+/// managed to read them, so a run where only the KeyTable parsed left the
+/// daemon signing with a new table and an old key. Building the whole set
+/// first means a failure anywhere leaves the running configuration untouched.
+///
+/// The superseded set is retired, not freed: workers may be signing with it
+/// right now. It is reclaimed once every worker has been seen at a quiescent
+/// point past this generation (audit X-2).
 fn reloadConfig() void {
-    // Re-read SigningTable
-    if (g_signing_table) |*old_st| {
-        _ = old_st; // future: free old table entries
-    }
-    // Try re-reading from config (re-parse to get current paths)
     var cfg = config_mod.parseFile(g_allocator, g_config_path) catch {
         log.warn("reload: failed to re-read config file, keeping previous", .{});
-        g_config_gen.increment();
+        _ = g_config_gen.increment();
         return;
     };
     defer cfg.deinit();
 
     const dkim_cfg = parseDkimConfig(g_allocator, &cfg) catch {
         log.warn("reload: failed to parse config, keeping previous", .{});
-        g_config_gen.increment();
+        _ = g_config_gen.increment();
+        return;
+    };
+    // parseDkimConfig allocates these two slices; only the signing paths in it
+    // are used here, so without this they leaked on every SIGHUP.
+    defer {
+        g_allocator.free(dkim_cfg.listen_addresses);
+        g_allocator.free(dkim_cfg.dns_nameservers);
+    }
+
+    const assets = buildSigningAssets(g_allocator, &dkim_cfg) catch |err| {
+        log.warn("reload: failed to load signing configuration ({}), keeping previous", .{err});
+        _ = g_config_gen.increment();
         return;
     };
 
-    // Reload SigningTable
-    if (dkim_cfg.signing_table_path) |path| {
-        if (std.fs.cwd().readFileAlloc(g_allocator, path, 1024 * 1024)) |content| {
-            if (keytable.parseSigningTable(g_allocator, content)) |new_st| {
-                g_signing_table = new_st;
-                log.info("SigningTable reloaded from {s}", .{path});
-            } else |_| {
-                log.warn("reload: failed to parse SigningTable", .{});
-            }
-        } else |_| {
-            log.warn("reload: failed to read SigningTable {s}", .{path});
-        }
-    }
+    g_signing.publish(&g_config_gen, assets) catch |err| {
+        // publish reserves its retire slot before swapping, so on failure the
+        // previous snapshot is still the live one.
+        freeSigningAssets(g_allocator, assets);
+        log.warn("reload: failed to publish signing configuration ({}), keeping previous", .{err});
+        _ = g_config_gen.increment();
+        return;
+    };
 
-    // Reload KeyTable
-    if (dkim_cfg.key_table_path) |path| {
-        if (std.fs.cwd().readFileAlloc(g_allocator, path, 1024 * 1024)) |content| {
-            if (keytable.parseKeyTable(g_allocator, content)) |new_kt| {
-                g_key_table = new_kt;
-                log.info("KeyTable reloaded from {s}", .{path});
-            } else |_| {
-                log.warn("reload: failed to parse KeyTable", .{});
-            }
-        } else |_| {
-            log.warn("reload: failed to read KeyTable {s}", .{path});
-        }
-    }
+    // Wake the workers so they reach a quiescent point and the superseded
+    // snapshot becomes reclaimable rather than accumulating.
+    g_config_gen.wake();
 
-    // Reload signing key (single-domain shorthand)
-    if (dkim_cfg.sign_key_file) |key_path| {
-        if (crypto.loadRsaKeyFile(key_path)) |new_key| {
-            g_sign_key = new_key;
-            log.info("signing key reloaded from {s}", .{key_path});
-        } else |_| {
-            log.warn("reload: failed to reload signing key {s}", .{key_path});
-        }
-    }
-
-    g_config_gen.increment();
-    log.info("config generation advanced to {d}", .{g_config_gen.load()});
+    log.info("signing configuration reloaded (generation {d}, {d} awaiting reclamation)", .{
+        g_config_gen.load(),
+        g_signing.retiredCount(),
+    });
 }
 
 /// Per-worker reload callback: flush thread-local state.
