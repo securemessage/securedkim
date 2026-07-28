@@ -66,6 +66,24 @@ pub fn verifySignature(
     dkim.validateForVerification(&sig) catch
         return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "missing b= or bh=" };
 
+    // RFC 6376 §5.4: the From field MUST be signed, and §6.1.1 requires
+    // PERMFAIL when h= omits it. Otherwise a captured signature keeps
+    // verifying while the From header is rewritten at will — arbitrary
+    // sender spoofing, and a DMARC pass whenever d= aligns.
+    if (!signsFrom(sig.signed_headers))
+        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "from not signed" };
+
+    // RFC 6376 §3.5: x= is an absolute expiry and MUST be greater than t=.
+    // Without this check a captured signed message replays forever.
+    if (sig.expiration) |expiry| {
+        if (sig.timestamp) |signed_at| {
+            if (expiry <= signed_at)
+                return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "expiration precedes timestamp" };
+        }
+        if (isExpired(expiry))
+            return .{ .result = .fail, .domain = sig.domain, .selector = sig.selector, .reason = "signature expired" };
+    }
+
     // Step 2: DNS lookup for public key
     const dns_name = buildKeyDomain(allocator, sig.selector, sig.domain) catch
         return .{ .result = .temperror, .domain = sig.domain, .selector = sig.selector, .reason = "alloc failure" };
@@ -140,6 +158,27 @@ fn buildKeyDomain(allocator: Allocator, selector: []const u8, domain: []const u8
     pos += "._domainkey.".len;
     @memcpy(buf[pos..][0..domain.len], domain);
     return buf;
+}
+
+/// True if the `h=` list covers the From field (RFC 6376 §5.4).
+fn signsFrom(signed_headers: []const u8) bool {
+    var iter = mem.splitScalar(u8, signed_headers, ':');
+    while (iter.next()) |field| {
+        const trimmed = mem.trim(u8, field, " \t\r\n");
+        if (eqlIgnoreCase(trimmed, "from")) return true;
+    }
+    return false;
+}
+
+/// True if the signature's `x=` expiry has passed.
+///
+/// RFC 6376 §3.5 prefers the time the message was first received inside the
+/// verifier's ADMD; the milter runs during that reception, so the current
+/// time is that value. No skew is allowed: the signer chose the deadline.
+fn isExpired(expiry: u64) bool {
+    const now = std.time.timestamp();
+    if (now <= 0) return false; // unusable clock: do not fail on it
+    return @as(u64, @intCast(now)) >= expiry;
 }
 
 /// Check if key type (from DNS record) is compatible with the signature algorithm.
@@ -335,6 +374,24 @@ test "empty b value at end" {
     const result = try emptyBValue(allocator, input);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("v=1; d=x.com; b=", result);
+}
+
+test "signs from" {
+    try std.testing.expect(signsFrom("from:to:subject:date:message-id"));
+    try std.testing.expect(signsFrom("To : From : Subject"));
+    try std.testing.expect(signsFrom("FROM"));
+    // The bypass this guards: a valid signature that never covers From.
+    try std.testing.expect(!signsFrom("to:subject:date:message-id"));
+    try std.testing.expect(!signsFrom(""));
+    // A field merely containing "from" is not the From field.
+    try std.testing.expect(!signsFrom("x-from:resent-from"));
+}
+
+test "is expired" {
+    const now: u64 = @intCast(std.time.timestamp());
+    try std.testing.expect(isExpired(1_000_000_000)); // 2001-09-09
+    try std.testing.expect(isExpired(now));
+    try std.testing.expect(!isExpired(now + 3600));
 }
 
 test "eql ignore case" {
