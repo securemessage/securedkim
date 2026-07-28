@@ -19,6 +19,7 @@ const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
 const zmq = securemilter.zmq;
 const log = securemilter.log;
+const header_scrub = securemilter.header_scrub;
 
 pub const canon = securemilter_crypto.canon;
 pub const dkim = @import("dkim.zig");
@@ -54,6 +55,7 @@ pub const DkimConfig = struct {
     sign_selector: ?[]const u8,
     sign_key_file: ?[]const u8,
     signed_headers: []const u8,
+    strip_auth_results: bool,
     zmq_endpoint: ?[]const u8,
     zmq_topic: []const u8,
 };
@@ -86,6 +88,7 @@ var g_sign_domain: ?[]const u8 = null;
 var g_sign_selector: ?[]const u8 = null;
 var g_sign_key: ?crypto.SigningKey = null;
 var g_signed_headers: []const u8 = "from:to:subject:date:message-id";
+var g_strip_policy: header_scrub.StripPolicy = .{ .own_methods = &.{"dkim"} };
 
 pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !DkimConfig {
     const global = cfg.getSection("global") orelse return error.MissingGlobalSection;
@@ -145,6 +148,10 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
     const dns_negative_ttl = global.getInt("DnsNegativeTTL", u32, 60);
     const signed_headers = global.getOrDefault("SignedHeaders", "from:to:subject:date:message-id");
 
+    // Trust boundary: when this is the first milter in the chain, no A-R header
+    // claiming our authserv-id can be genuine on arrival (RFC 8601 §5).
+    const strip_auth_results = global.getBool("StripAuthResults", false);
+
     // ZMQ event publishing
     const zmq_endpoint = global.get("ZmqEndpoint");
     const zmq_topic = global.getOrDefault("ZmqTopic", "dkim");
@@ -168,6 +175,7 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
         .sign_selector = sign_selector,
         .sign_key_file = sign_key_file,
         .signed_headers = signed_headers,
+        .strip_auth_results = strip_auth_results,
         .zmq_endpoint = zmq_endpoint,
         .zmq_topic = zmq_topic,
     };
@@ -222,6 +230,7 @@ pub fn main() !void {
     g_signed_headers = dkim_cfg.signed_headers;
     g_zmq_endpoint = dkim_cfg.zmq_endpoint;
     g_zmq_topic = dkim_cfg.zmq_topic;
+    g_strip_policy = .{ .own_methods = &.{"dkim"}, .strip_all = dkim_cfg.strip_auth_results };
 
     // Load signing config
     if (dkim_cfg.signing_table_path) |path| {
@@ -298,8 +307,9 @@ pub fn main() !void {
         dkim_cfg.listen_addresses.len,
     });
 
-    // Required protocol flags: always need to add headers (A-R for verify, DKIM-Sig for sign)
-    const required_actions = negotiate.ActionFlags{ .add_headers = true };
+    // Required protocol flags: add headers (A-R for verify, DKIM-Sig for sign)
+    // and change headers (removal of forged Authentication-Results).
+    const required_actions = negotiate.ActionFlags{ .add_headers = true, .change_headers = true };
 
     const callbacks = worker_mod.Callbacks{
         .on_connect = onConnect,
@@ -372,6 +382,12 @@ fn onBody(conn: *connection_mod.Connection, data: []const u8) u8 {
 
 fn onEom(conn: *connection_mod.Connection) u8 {
     const start_ns = std.time.nanoTimestamp();
+
+    // Drop forged results before producing our own, so nothing downstream can
+    // read a dkim= verdict this daemon did not issue. Runs before signing too:
+    // outbound mail must not carry results claiming our own authserv-id.
+    _ = header_scrub.stripAuthResults(conn, g_authserv_id, g_strip_policy);
+
     const result = switch (g_mode) {
         .verify_only => doVerify(conn),
         .sign_only => doSign(conn),

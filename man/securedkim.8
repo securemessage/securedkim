@@ -39,6 +39,18 @@ sections.
 Identifier for Authentication-Results headers.
 Default:
 .Dq localhost .
+.It Cm StripAuthResults
+Remove every pre-existing Authentication-Results header claiming our
+.Cm AuthservID ,
+not just the ones asserting a
+.Li dkim=
+result.
+Enable this only when
+.Nm
+is the first milter in the chain (RFC 8601 Section 5); with
+.Xr securespf 8
+in front of it, set the option there instead.
+Default: no.
 .It Cm WorkerThreads
 Number of worker threads.
 0 means auto-detect CPU count.
