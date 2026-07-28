@@ -10,6 +10,7 @@ const connection_mod = securemilter.connection;
 const worker_mod = securemilter.worker;
 const daemon_mod = securemilter.daemon;
 const auth_results = securemilter.auth_results;
+const auth_stamp = securemilter.auth_stamp;
 const commands = securemilter.milter.commands;
 const codec = securemilter.milter.codec;
 const responses = securemilter.milter.responses;
@@ -626,7 +627,8 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
     // temperror: the result is unknown for a local, transient reason, which is
     // exactly what RFC 6376 6.1 reserves TEMPFAIL for.
     if (conn.contentTruncated()) {
-        _ = addArHeader(conn, "dkim", "temperror", "", "");
+        addArHeader(conn, "dkim", "temperror", "", "") catch |err|
+            return auth_stamp.deferCode(err, "dkim");
         publishEvent(conn.allocator, "verify", "temperror", "", "");
         return @intFromEnum(responses.Code.@"continue");
     }
@@ -644,7 +646,8 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
                 "more than MaxSignatures={d} DKIM-Signature headers from {s}[{s}]: not verifying",
                 .{ max_sigs, peer.name, peer.ip },
             );
-            _ = addArHeader(conn, "dkim", "permerror", "", "");
+            addArHeader(conn, "dkim", "permerror", "", "") catch |err|
+                return auth_stamp.deferCode(err, "dkim");
             publishEvent(conn.allocator, "verify", "permerror", "", "");
             return @intFromEnum(responses.Code.@"continue");
         }
@@ -703,12 +706,14 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
             }
         }
 
-        _ = addArHeader(conn, "dkim", result.result.toString(), result.domain, result.selector);
+        addArHeader(conn, "dkim", result.result.toString(), result.domain, result.selector) catch |err|
+            return auth_stamp.deferCode(err, "dkim");
         publishEvent(conn.allocator, "verify", result.result.toString(), result.domain, result.selector);
     }
 
     if (!found_any) {
-        _ = addArHeader(conn, "dkim", "none", "", "");
+        addArHeader(conn, "dkim", "none", "", "") catch |err|
+            return auth_stamp.deferCode(err, "dkim");
         publishEvent(conn.allocator, "verify", "none", "", "");
     }
 
@@ -745,23 +750,39 @@ fn doSign(conn: *connection_mod.Connection) u8 {
     const sign_key = resolveSigningKey(assets, sign_params) orelse
         return @intFromEnum(responses.Code.@"continue");
 
-    // Build header list
+    // Build the header list that will be signed.
+    //
+    // One defer for both the strings and the list, registered before the loop, so
+    // an early return below cannot leak the strings appended so far. The previous
+    // arrangement put the string-freeing defer *after* the loop, which was safe
+    // only because nothing in the loop returned.
     var header_strings: std.ArrayList([]const u8) = .{};
-    defer header_strings.deinit(conn.allocator);
-
-    for (conn.headers.items) |hdr| {
-        const full = std.fmt.allocPrint(conn.allocator, "{s}: {s}", .{ hdr.name, hdr.value }) catch continue;
-        header_strings.append(conn.allocator, full) catch continue;
-    }
     defer {
         for (header_strings.items) |s| conn.allocator.free(s);
+        header_strings.deinit(conn.allocator);
+    }
+
+    for (conn.headers.items) |hdr| {
+        // `catch continue` here would drop a header from the signing input while
+        // `h=` still names it, because h= is written verbatim from config and the
+        // input is assembled by looking each name up in this list. The result is
+        // a syntactically valid signature over a different header set than it
+        // claims to cover, so every verifier computes a different hash and all
+        // mail signed during the fault fails DKIM at the recipient -- while this
+        // daemon reports success (audit X-10).
+        const full = std.fmt.allocPrint(conn.allocator, "{s}: {s}", .{ hdr.name, hdr.value }) catch
+            return signInternalError("building the header list to sign");
+        header_strings.append(conn.allocator, full) catch {
+            conn.allocator.free(full);
+            return signInternalError("building the header list to sign");
+        };
     }
 
     // Compute body hash. The truncation check at the top of doSign already
     // established the body is whole.
-    const body_data = conn.getBody() orelse return @intFromEnum(responses.Code.@"continue");
+    const body_data = conn.getBody() orelse return signInternalError("the accumulated body is unavailable");
     const body_hash = sign_mod.computeBodyHash(conn.allocator, body_data, sign_params.canonicalization.body) catch
-        return @intFromEnum(responses.Code.@"continue");
+        return signInternalError("computing the body hash");
 
     // Sign the message
     var sign_result = sign_mod.signMessage(
@@ -770,7 +791,7 @@ fn doSign(conn: *connection_mod.Connection) u8 {
         sign_key,
         header_strings.items,
         body_hash,
-    ) catch return @intFromEnum(responses.Code.@"continue");
+    ) catch return signInternalError("signing the message");
     defer sign_result.deinit();
 
     // Prepend DKIM-Signature header via milter protocol
@@ -778,14 +799,31 @@ fn doSign(conn: *connection_mod.Connection) u8 {
         conn.allocator,
         "DKIM-Signature",
         sign_result.header["DKIM-Signature:".len..],
-    ) catch return @intFromEnum(responses.Code.@"continue");
+    ) catch return signInternalError("building the DKIM-Signature header");
     defer conn.allocator.free(hdr_payload);
 
-    codec.writePacket(conn.fd, hdr_payload) catch {};
+    // A swallowed write here delivered the message unsigned and then published
+    // "sign pass" for it, so both the recipient and our own event stream were
+    // misinformed at once (audit X-10).
+    codec.writePacket(conn.fd, hdr_payload) catch
+        return signInternalError("writing the DKIM-Signature header");
 
     publishEvent(conn.allocator, "sign", "pass", sign_params.domain, sign_params.selector);
 
     return @intFromEnum(responses.Code.accept);
+}
+
+/// Defer the message after an internal failure while signing (audit X-10).
+///
+/// Distinct from the deliberate "do not sign this" outcomes above it, which
+/// correctly deliver the message unsigned: no envelope sender, no signing table
+/// entry for the domain, or a body this daemon does not hold in full. Those are
+/// statements about the message. What this covers is a local fault on a message we
+/// were configured to sign and could have signed, where delivering it unsigned
+/// means a `p=reject` domain's mail is rejected by the recipient instead.
+fn signInternalError(what: []const u8) u8 {
+    log.err("not signing: internal error {s}", .{what});
+    return @intFromEnum(responses.Code.tempfail);
 }
 
 fn publishEvent(
@@ -859,7 +897,7 @@ fn addArHeader(
     result_str: []const u8,
     domain: []const u8,
     selector: []const u8,
-) u8 {
+) !void {
     var properties: [2]auth_results.MethodResult.Property = undefined;
     var prop_count: usize = 0;
 
@@ -872,25 +910,14 @@ fn addArHeader(
         prop_count += 1;
     }
 
-    const ar_value = auth_results.build(conn.allocator, g_authserv_id, &.{
+    try auth_stamp.stamp(conn.allocator, conn.fd, g_authserv_id, &.{
         .{
             .method = method,
             .result = result_str,
             .reason = null,
             .properties = properties[0..prop_count],
         },
-    }) catch return @intFromEnum(responses.Code.@"continue");
-    defer conn.allocator.free(ar_value);
-
-    const hdr_payload = responses.addHeader(
-        conn.allocator,
-        "Authentication-Results",
-        ar_value,
-    ) catch return @intFromEnum(responses.Code.@"continue");
-    defer conn.allocator.free(hdr_payload);
-
-    codec.writePacket(conn.fd, hdr_payload) catch {};
-    return @intFromEnum(responses.Code.@"continue");
+    });
 }
 
 // =============================================================================
@@ -1104,6 +1131,27 @@ test "implicit default listener gets a mode" {
     try std.testing.expectEqual(@as(usize, 1), dkim_cfg.listen_addresses.len);
     try std.testing.expectEqual(@as(usize, 1), dkim_cfg.modes.len);
     try std.testing.expectEqual(Mode.verify_only, dkim_cfg.modes[0]);
+}
+
+// X-9: this wrapper must stay fallible.
+//
+// It previously returned `u8` and swallowed all three failure points, and all
+// four call sites discarded the result with `_ =`. A message could be delivered
+// with no `dkim=` field while this daemon reported success, and `securedmarc`
+// then evaluated DMARC without it. Asserting the type is what makes a revert a
+// build failure rather than a silent behaviour change.
+test "the Authentication-Results wrapper cannot swallow failures" {
+    comptime {
+        const ret = @typeInfo(@TypeOf(addArHeader)).@"fn".return_type.?;
+        if (@typeInfo(ret) != .error_union) @compileError(
+            "addArHeader must return an error union. Swallowing a stamping failure " ++
+                "delivers the message with no dkim= field while reporting success, and " ++
+                "securedmarc then evaluates DMARC without it (audit X-9).",
+        );
+        if (@typeInfo(ret).error_union.payload != void) @compileError(
+            "addArHeader should return !void; the caller maps the error to a tempfail.",
+        );
+    }
 }
 
 test "an unrecognised Mode is refused" {
