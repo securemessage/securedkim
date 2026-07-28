@@ -27,12 +27,39 @@ pub const verify = @import("verify.zig");
 pub const sign_mod = @import("sign.zig");
 pub const keytable = @import("keytable.zig");
 
+/// Parse a `Mode` value from a config section.
+///
+/// An unrecognised value is an error rather than a silent fallback: the
+/// previous parser tested three spellings and left the variable untouched on
+/// anything else, so `Mode = signing` ran a signing listener in verify mode
+/// and said nothing.
+pub fn parseMode(raw: []const u8) error{InvalidMode}!Mode {
+    if (mem.eql(u8, raw, "sign")) return .sign_only;
+    if (mem.eql(u8, raw, "verify")) return .verify_only;
+    if (mem.eql(u8, raw, "both")) return .both;
+    return error.InvalidMode;
+}
+
 /// Listener mode for DKIM processing.
 pub const Mode = enum {
     sign_only,
     verify_only,
     both,
 };
+
+/// Config-facing spelling of a mode, for logs.
+///
+/// The enum tags carry an `_only` suffix that appears neither in the config file
+/// nor in the documented log format, and operators grep these lines — the d4
+/// pentest probe greps for `mode=verify` by name. Kept identical to the accepted
+/// `Mode =` values so a log line reads back as the config that produced it.
+fn modeLabel(m: Mode) []const u8 {
+    return switch (m) {
+        .sign_only => "sign",
+        .verify_only => "verify",
+        .both => "both",
+    };
+}
 
 /// SecureDKIM runtime configuration.
 pub const DkimConfig = struct {
@@ -47,7 +74,15 @@ pub const DkimConfig = struct {
     dns_retries: u8,
     dns_cache_size: u32,
     dns_negative_ttl: u32,
-    mode: Mode,
+    /// Mode per listener, index-parallel to `listen_addresses` (audit A-2).
+    ///
+    /// Sharing one value across sockets is worse here than in `securearc`: if
+    /// a `Mode = sign` section is declared last it applied to the inbound
+    /// socket too, and a spoof of our own domain arriving from the internet
+    /// would match the signing table and be handed a valid signature under our
+    /// own key — `dkim=pass` aligned with `From`, hence `dmarc=pass` against
+    /// our own `p=reject`.
+    modes: []const Mode,
     signing_table_path: ?[]const u8,
     key_table_path: ?[]const u8,
     // Single-domain shorthand
@@ -68,7 +103,7 @@ const rcu_mod = securemilter.rcu;
 // Module-level config set before worker spawn, read-only during runtime.
 var g_authserv_id: []const u8 = "localhost";
 var g_dns_config: dns_mod.ResolverConfig = .{};
-var g_mode: Mode = .verify_only;
+var g_modes: []const Mode = &.{};
 var g_zmq_endpoint: ?[]const u8 = null;
 var g_zmq_topic: []const u8 = "dkim";
 var g_allocator: Allocator = undefined;
@@ -185,8 +220,16 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
 
     var addrs: std.ArrayListUnmanaged(listener_mod.ListenAddress) = .{};
     errdefer addrs.deinit(allocator);
+    var modes: std.ArrayListUnmanaged(Mode) = .{};
+    errdefer modes.deinit(allocator);
 
-    var mode: Mode = .verify_only;
+    // A `[global] Mode` supplies the default for any listener that does not
+    // name one, so single-socket configs keep working unchanged.
+    const default_mode: Mode = if (global.get("Mode")) |raw|
+        try parseMode(raw)
+    else
+        .verify_only;
+
     var signing_table_path: ?[]const u8 = null;
     var key_table_path: ?[]const u8 = null;
     var sign_domain: ?[]const u8 = null;
@@ -200,10 +243,13 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
             const addr = listener_mod.ListenAddress.parse(socket_str) catch continue;
             try addrs.append(allocator, addr);
 
-            // Parse mode from listener section
-            if (section.get("Mode")) |mode_str| {
-                if (mem.eql(u8, mode_str, "sign")) mode = .sign_only else if (mem.eql(u8, mode_str, "verify")) mode = .verify_only else if (mem.eql(u8, mode_str, "both")) mode = .both;
-            }
+            // Appended in lockstep with `addrs`, so the index the worker
+            // records on a connection selects this listener's own mode.
+            const listener_mode: Mode = if (section.get("Mode")) |raw|
+                try parseMode(raw)
+            else
+                default_mode;
+            try modes.append(allocator, listener_mode);
 
             // Per-listener signing config
             signing_table_path = section.get("SigningTable") orelse signing_table_path;
@@ -216,7 +262,12 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
 
     if (addrs.items.len == 0) {
         try addrs.append(allocator, .{ .tcp = .{ .host = "0.0.0.0", .port = 8891 } });
+        try modes.append(allocator, default_mode);
     }
+
+    // `modeFor` indexes `modes` with a listener index, so the two lists falling
+    // out of step would silently mis-mode every socket above the shorter one.
+    std.debug.assert(addrs.items.len == modes.items.len);
 
     const dns_ns_raw = global.getOrDefault("DnsNameserver", "127.0.0.1");
     var ns_list: std.ArrayListUnmanaged([]const u8) = .{};
@@ -262,7 +313,7 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
         .dns_retries = dns_retries,
         .dns_cache_size = dns_cache_size,
         .dns_negative_ttl = dns_negative_ttl,
-        .mode = mode,
+        .modes = try modes.toOwnedSlice(allocator),
         .signing_table_path = signing_table_path,
         .key_table_path = key_table_path,
         .sign_domain = sign_domain,
@@ -322,7 +373,7 @@ pub fn main() !void {
         .negative_ttl = dkim_cfg.dns_negative_ttl,
     };
 
-    g_mode = dkim_cfg.mode;
+    g_modes = dkim_cfg.modes;
     g_signed_headers = dkim_cfg.signed_headers;
     g_zmq_endpoint = dkim_cfg.zmq_endpoint;
     g_zmq_topic = dkim_cfg.zmq_topic;
@@ -365,6 +416,13 @@ pub fn main() !void {
         log.initThread(); // re-init after fork (PID changed)
     }
 
+    // Block the managed signals BEFORE spawning any thread, so every thread
+    // inherits the mask and SIGHUP/SIGTERM can only be taken by sigwait in the
+    // main thread. Ordering matters: this used to sit just above the worker
+    // pool, leaving the health monitor thread below with SIGHUP unblocked and
+    // able to take a reload signal and terminate the daemon (audit X-7).
+    daemon_mod.ManagedSignals.blockForKqueue();
+
     // Start proactive DNS health monitor AFTER daemonize
     if (dns_mod.HealthMonitor.init(allocator, dkim_cfg.dns_nameservers, 53, 5, 2000)) |monitor| {
         monitor.start() catch |err| {
@@ -393,12 +451,18 @@ pub fn main() !void {
         };
     }
 
-    log.info("SecureDKIM starting, AuthservID={s}, mode={s}, MinimumKeyBits={d}, listeners={d}", .{
+    log.info("SecureDKIM starting, AuthservID={s}, MinimumKeyBits={d}, listeners={d}", .{
         dkim_cfg.authserv_id,
-        @tagName(dkim_cfg.mode),
         dkim_cfg.min_key_bits.bits,
         dkim_cfg.listen_addresses.len,
     });
+
+    // One line per socket. A single daemon-wide mode used to be logged even
+    // when the config named two different ones, so the log agreed with the
+    // config while the daemon did not (audit A-2).
+    for (dkim_cfg.modes, 0..) |m, i| {
+        log.info("listener[{d}] mode={s}", .{ i, modeLabel(m) });
+    }
 
     // Required protocol flags: add headers (A-R for verify, DKIM-Sig for sign)
     // and change headers (removal of forged Authentication-Results).
@@ -419,8 +483,6 @@ pub fn main() !void {
 
     const shutdown_pipe = try posix.pipe();
     defer posix.close(shutdown_pipe[0]);
-
-    daemon_mod.ManagedSignals.blockForKqueue();
 
     var threads = try worker_mod.spawnPoolWithReload(
         allocator,
@@ -514,7 +576,9 @@ fn onEom(conn: *connection_mod.Connection) u8 {
     // outbound mail must not carry results claiming our own authserv-id.
     _ = header_scrub.stripAuthResults(conn, g_authserv_id, g_strip_policy);
 
-    const result = switch (g_mode) {
+    const mode = modeFor(conn.listener_index);
+
+    const result = switch (mode) {
         .verify_only => doVerify(conn),
         .sign_only => doSign(conn),
         .both => blk: {
@@ -527,13 +591,33 @@ fn onEom(conn: *connection_mod.Connection) u8 {
     const client_addr = conn.macros.client_addr orelse "unknown";
     const mail_from = stripAngleBrackets(conn.mail_from_raw orelse "<>");
     const peer = conn.getPeerDisplay();
-    const mode_str: []const u8 = switch (g_mode) {
-        .verify_only => "verify",
-        .sign_only => "sign",
-        .both => "both",
-    };
-    log.info("id={s} peer={s}[{s}] client={s} from={s} mode={s} elapsed={d}ms", .{ queue_id, peer.name, peer.ip, client_addr, mail_from, mode_str, elapsed_ms });
+    log.info("id={s} peer={s}[{s}] client={s} from={s} listener={d} mode={s} elapsed={d}ms", .{
+        queue_id,
+        peer.name,
+        peer.ip,
+        client_addr,
+        mail_from,
+        conn.listener_index,
+        modeLabel(mode),
+        elapsed_ms,
+    });
     return result;
+}
+
+/// Mode for the socket a connection arrived on (audit A-2).
+///
+/// Every worker binds every configured address, so the index the worker
+/// records on a connection indexes the same list `parseDkimConfig` built and
+/// the lookup is always in range. Bounds-checked rather than asserted anyway:
+/// an out-of-range index is a wiring bug, and the safe fallback is the mode
+/// that only reads. Signing on a guess is how A-2 became a bypass.
+fn modeFor(listener_index: usize) Mode {
+    if (listener_index < g_modes.len) return g_modes[listener_index];
+    log.err(
+        "listener index {d} has no configured mode ({d} known): falling back to verify",
+        .{ listener_index, g_modes.len },
+    );
+    return .verify_only;
 }
 
 fn doVerify(conn: *connection_mod.Connection) u8 {
@@ -868,10 +952,11 @@ fn reloadConfig() void {
         _ = g_config_gen.increment();
         return;
     };
-    // parseDkimConfig allocates these two slices; only the signing paths in it
-    // are used here, so without this they leaked on every SIGHUP.
+    // parseDkimConfig allocates these three slices; only the signing paths in
+    // it are used here, so without this they leaked on every SIGHUP.
     defer {
         g_allocator.free(dkim_cfg.listen_addresses);
+        g_allocator.free(dkim_cfg.modes);
         g_allocator.free(dkim_cfg.dns_nameservers);
     }
 
@@ -926,4 +1011,116 @@ test "strip angle brackets" {
 test "get sending domain" {
     try std.testing.expectEqualStrings("example.com", getSendingDomain("user@example.com").?);
     try std.testing.expect(getSendingDomain("postmaster") == null);
+}
+
+// `parseDkimConfig` had no tests at all, which is why A-2 survived here after
+// being written up against `securearc`.
+fn parseForTest(ini_text: []const u8) !DkimConfig {
+    var cfg = try config_mod.parse(std.testing.allocator, ini_text);
+    defer cfg.deinit();
+    return parseDkimConfig(std.testing.allocator, &cfg);
+}
+
+fn freeTestConfig(dkim_cfg: DkimConfig) void {
+    std.testing.allocator.free(dkim_cfg.listen_addresses);
+    std.testing.allocator.free(dkim_cfg.modes);
+    std.testing.allocator.free(dkim_cfg.dns_nameservers);
+}
+
+// A-2 regression, and the reason this instance is worse than securearc's: with
+// one shared `mode`, declaring the signing listener last put the INBOUND socket
+// into sign mode. A spoof of our own domain arriving from the internet then
+// matched the signing table and was handed a valid signature under our own key.
+test "each listener keeps its own mode" {
+    const dkim_cfg = try parseForTest(
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\
+        \\[listener:verify]
+        \\Socket = inet:8891@0.0.0.0
+        \\Mode = verify
+        \\
+        \\[listener:sign]
+        \\Socket = inet:8892@127.0.0.1
+        \\Mode = sign
+    );
+    defer freeTestConfig(dkim_cfg);
+
+    try std.testing.expectEqual(@as(usize, 2), dkim_cfg.listen_addresses.len);
+    try std.testing.expectEqual(dkim_cfg.listen_addresses.len, dkim_cfg.modes.len);
+    try std.testing.expectEqual(Mode.verify_only, dkim_cfg.modes[0]);
+    try std.testing.expectEqual(Mode.sign_only, dkim_cfg.modes[1]);
+}
+
+// The dangerous ordering specifically: signing declared first, verify second.
+// The old parser left BOTH in verify mode here, so outbound mail went unsigned.
+test "signing listener declared first still signs" {
+    const dkim_cfg = try parseForTest(
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\
+        \\[listener:sign]
+        \\Socket = inet:8892@127.0.0.1
+        \\Mode = sign
+        \\
+        \\[listener:verify]
+        \\Socket = inet:8891@0.0.0.0
+        \\Mode = verify
+    );
+    defer freeTestConfig(dkim_cfg);
+
+    try std.testing.expectEqual(Mode.sign_only, dkim_cfg.modes[0]);
+    try std.testing.expectEqual(Mode.verify_only, dkim_cfg.modes[1]);
+}
+
+test "a listener without Mode inherits the global default" {
+    const dkim_cfg = try parseForTest(
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\Mode = both
+        \\
+        \\[listener:inherits]
+        \\Socket = inet:8891@0.0.0.0
+        \\
+        \\[listener:overrides]
+        \\Socket = inet:8892@127.0.0.1
+        \\Mode = sign
+    );
+    defer freeTestConfig(dkim_cfg);
+
+    try std.testing.expectEqual(Mode.both, dkim_cfg.modes[0]);
+    try std.testing.expectEqual(Mode.sign_only, dkim_cfg.modes[1]);
+}
+
+// The implicit default listener must still get a mode, or `modes` and
+// `listen_addresses` fall out of step and every index lookup is wrong.
+test "implicit default listener gets a mode" {
+    const dkim_cfg = try parseForTest(
+        \\[global]
+        \\AuthservID = mail.test.com
+    );
+    defer freeTestConfig(dkim_cfg);
+
+    try std.testing.expectEqual(@as(usize, 1), dkim_cfg.listen_addresses.len);
+    try std.testing.expectEqual(@as(usize, 1), dkim_cfg.modes.len);
+    try std.testing.expectEqual(Mode.verify_only, dkim_cfg.modes[0]);
+}
+
+test "an unrecognised Mode is refused" {
+    try std.testing.expectEqual(Mode.sign_only, try parseMode("sign"));
+    try std.testing.expectEqual(Mode.verify_only, try parseMode("verify"));
+    try std.testing.expectEqual(Mode.both, try parseMode("both"));
+
+    try std.testing.expectError(error.InvalidMode, parseMode("signing"));
+    try std.testing.expectError(error.InvalidMode, parseMode("Sign"));
+    try std.testing.expectError(error.InvalidMode, parseMode(""));
+
+    try std.testing.expectError(error.InvalidMode, parseForTest(
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\
+        \\[listener:typo]
+        \\Socket = inet:8891@0.0.0.0
+        \\Mode = signing
+    ));
 }

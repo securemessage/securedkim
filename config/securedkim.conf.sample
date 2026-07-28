@@ -91,21 +91,34 @@ SignedHeaders   = from:to:subject:date:message-id
 # ZMQ event publishing endpoint (optional).
 # ZmqEndpoint   = tcp://events.internal:5555
 
+# Each listener has its own Mode: sign, verify, or both. A listener that omits
+# Mode inherits a [global] Mode if one is set, otherwise verify. An unrecognised
+# value is refused at startup rather than silently falling back.
+#
+# Releases before this one kept a single daemon-wide mode that each listener
+# section overwrote in turn, so the last section won for every socket. With a
+# sign section below a verify section — the layout below — the public inbound
+# socket ran in sign mode, and inbound mail whose author domain matched the
+# signing configuration was handed a signature under this host's own key.
+# Confirm the "listener[N] mode=..." lines logged at startup after upgrading.
+
 # --- Verify inbound DKIM signatures ---
 [listener:verify-inbound]
 Socket          = inet:8891@0.0.0.0
 Mode            = verify
 
 # --- Sign outbound mail (multi-domain via SigningTable/KeyTable) ---
+# Bound to loopback deliberately: only the local MTA submits to the signing
+# socket, and anything that can reach it can have mail signed by this host.
 # [listener:sign-outbound]
-# Socket          = inet:8892@0.0.0.0
+# Socket          = inet:8892@127.0.0.1
 # Mode            = sign
 # SigningTable    = /usr/local/etc/securedkim/signing-table
 # KeyTable        = /usr/local/etc/securedkim/key-table
 
 # --- Sign outbound mail (single domain shorthand) ---
 # [listener:sign-outbound]
-# Socket          = inet:8892@0.0.0.0
+# Socket          = inet:8892@127.0.0.1
 # Mode            = sign
 # Domain          = example.com
 # Selector        = dkim2026

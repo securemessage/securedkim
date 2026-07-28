@@ -207,12 +207,40 @@ Format:
 or
 .Dq unix:/path .
 .It Cm Mode
-Operating mode:
+Operating mode for
+.Em this listener :
 .Dq sign ,
 .Dq verify ,
 or
 .Dq both .
-Default: verify.
+A listener that does not set
+.Cm Mode
+inherits
+.Cm Mode
+from the
+.Ql [global]
+section, or
+.Dq verify
+if that is unset.
+Any other value is a configuration error and
+.Nm
+refuses to start.
+.Pp
+Each listener is independent.
+Releases before this one held a single daemon-wide mode that every
+.Ql [listener:...]
+section overwrote in turn, so the last section in the file decided the mode for
+every socket.
+This mattered most when a
+.Dq sign
+section appeared below a
+.Dq verify
+section, as in the sample configuration: the public inbound socket then ran in
+sign mode, and inbound mail whose author domain matched the signing
+configuration was given a signature under this host's own key.
+Check the
+.Ql listener[N] mode=...
+lines logged at startup against the intended configuration after upgrading.
 .It Cm SigningTable
 Path to signing table file mapping sender patterns to signing identities.
 Required for sign mode with multi-domain support.
@@ -261,7 +289,7 @@ milter_default_action = accept
 .Ed
 .Sh LOG FORMAT
 .Bd -literal -offset indent
-securedkim[pid]: id=QUEUEID peer=HOST[IP] client=IP from=ADDR mode=verify|sign elapsed=Nms
+securedkim[pid]: id=QUEUEID peer=HOST[IP] client=IP from=ADDR listener=N mode=verify|sign|both elapsed=Nms
 .Ed
 .Sh EXIT STATUS
 .Ex -std
