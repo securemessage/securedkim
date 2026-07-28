@@ -11,6 +11,7 @@ const worker_mod = securemilter.worker;
 const daemon_mod = securemilter.daemon;
 const auth_results = securemilter.auth_results;
 const auth_stamp = securemilter.auth_stamp;
+const escape = securemilter.escape;
 const commands = securemilter.milter.commands;
 const codec = securemilter.milter.codec;
 const responses = securemilter.milter.responses;
@@ -555,13 +556,13 @@ fn onBody(conn: *connection_mod.Connection, data: []const u8) u8 {
             const peer = conn.getPeerDisplay();
             if (e == error.BodyTooLarge) {
                 log.warn(
-                    "body exceeds MaxBodyBytes={d} from {s}[{s}]: message will not be verified or signed",
-                    .{ conn.limits.max_body_bytes, peer.name, peer.ip },
+                    "body exceeds MaxBodyBytes={d} from {f}[{f}]: message will not be verified or signed",
+                    .{ conn.limits.max_body_bytes, escape.logField(peer.name), escape.logField(peer.ip) },
                 );
             } else {
                 log.err(
-                    "body accumulation failed for {s}[{s}]: {}",
-                    .{ peer.name, peer.ip, e },
+                    "body accumulation failed for {f}[{f}]: {}",
+                    .{ escape.logField(peer.name), escape.logField(peer.ip), e },
                 );
             }
         }
@@ -592,12 +593,17 @@ fn onEom(conn: *connection_mod.Connection) u8 {
     const client_addr = conn.macros.client_addr orelse "unknown";
     const mail_from = stripAngleBrackets(conn.mail_from_raw orelse "<>");
     const peer = conn.getPeerDisplay();
-    log.info("id={s} peer={s}[{s}] client={s} from={s} listener={d} mode={s} elapsed={d}ms", .{
-        queue_id,
-        peer.name,
-        peer.ip,
-        client_addr,
-        mail_from,
+    // The queue id, peer name, client address and envelope sender are all
+    // attacker-influenced -- the peer name comes from rDNS the sender may
+    // control -- so each is rendered as a single bare token. A newline in any of
+    // them would forge a second syslog line; a space would make the following
+    // key appear to hold this value (audit X-5). `mode` and the numbers are ours.
+    log.info("id={f} peer={f}[{f}] client={f} from={f} listener={d} mode={s} elapsed={d}ms", .{
+        escape.logField(queue_id),
+        escape.logField(peer.name),
+        escape.logField(peer.ip),
+        escape.logField(client_addr),
+        escape.logField(mail_from),
         conn.listener_index,
         modeLabel(mode),
         elapsed_ms,
@@ -643,8 +649,8 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
         if (sig_count > max_sigs) {
             const peer = conn.getPeerDisplay();
             log.warn(
-                "more than MaxSignatures={d} DKIM-Signature headers from {s}[{s}]: not verifying",
-                .{ max_sigs, peer.name, peer.ip },
+                "more than MaxSignatures={d} DKIM-Signature headers from {f}[{f}]: not verifying",
+                .{ max_sigs, escape.logField(peer.name), escape.logField(peer.ip) },
             );
             addArHeader(conn, "dkim", "permerror", "", "") catch |err|
                 return auth_stamp.deferCode(err, "dkim");
@@ -699,9 +705,11 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
         // canonicalization failure without recomputing the signature by hand.
         if (result.reason) |reason| {
             if (mem.eql(u8, reason, "key too small")) {
+                // The domain is the signature's own `d=` tag, so it is entirely
+                // sender-chosen (audit X-5).
                 log.warn(
-                    "{s}: RSA key below MinimumKeyBits={d}, signature permanently failed (RFC 8301 §3.2)",
-                    .{ result.domain, g_min_key_bits },
+                    "{f}: RSA key below MinimumKeyBits={d}, signature permanently failed (RFC 8301 3.2)",
+                    .{ escape.logField(result.domain), g_min_key_bits },
                 );
             }
         }
@@ -729,8 +737,8 @@ fn doSign(conn: *connection_mod.Connection) u8 {
     if (conn.contentTruncated()) {
         const peer = conn.getPeerDisplay();
         log.warn(
-            "not signing message from {s}[{s}]: accumulated copy is incomplete",
-            .{ peer.name, peer.ip },
+            "not signing message from {f}[{f}]: accumulated copy is incomplete",
+            .{ escape.logField(peer.name), escape.logField(peer.ip) },
         );
         return @intFromEnum(responses.Code.@"continue");
     }
@@ -833,9 +841,18 @@ fn publishEvent(
     domain: []const u8,
     selector: []const u8,
 ) void {
+    // `domain` and `selector` are the signature's own `d=` and `s=` tags, so both
+    // are sender-chosen. A `"` in `d=` used to end the JSON string early and
+    // leave the remainder of the payload to be reinterpreted, which is exactly
+    // what the x5b probe sends (audit X-5). `action` and `result_str` are ours.
     const json = std.fmt.allocPrint(allocator,
-        \\{{"action":"{s}","result":"{s}","domain":"{s}","selector":"{s}"}}
-    , .{ action, result_str, domain, selector }) catch return;
+        \\{{"action":"{s}","result":"{s}","domain":"{f}","selector":"{f}"}}
+    , .{
+        action,
+        result_str,
+        escape.jsonString(domain),
+        escape.jsonString(selector),
+    }) catch return;
     defer allocator.free(json);
 
     getPublisher().publish(json);
