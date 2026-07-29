@@ -125,10 +125,20 @@ call — but `BodyCanonicalizer`'s own documentation invites streaming, and a la
 bug in a documented API is a live one waiting for its first caller. The new test
 tries **every** split point of a body, not a hand-picked one.
 
-### D-23 — `c=simple` header canonicalization of an empty-valued field (Low, not fixable)
+### D-23 — `c=simple` header canonicalization fabricates the separator (severity under revision)
 
-Reported as **KNOWN**, not as a failure, and it is a genuine production limitation
-rather than a harness artifact.
+Reported as **KNOWN**, not as a failure, and it is a genuine production defect rather
+than a harness artifact.
+
+> **Corrected 2026-07-29.** This was first written up here as *"not fixable — inherent
+> to `c=simple` header canonicalization in any milter"*. **That was wrong.** The
+> milter protocol does expose the original spacing, via `SMFIP_HDR_LEADSPC`, and our
+> own library already models it as `ProtocolFlags.header_leading_space`
+> (`securemilter-lib/src/milter/negotiate.zig:49`). **No daemon negotiates it.** So
+> the information is there for the asking and we decline to ask — a design choice
+> with a consequence, not a property of the API. The correction is kept visible
+> rather than silently edited away, because a confident wrong claim in a test
+> harness is worse than no claim.
 
 A milter never sees a header field's original octets. The MTA hands over a name and
 a value with one leading space already removed, unless the daemon negotiates
@@ -141,10 +151,20 @@ carried `X-Empty:`. Relaxed deletes the trailing WSP and loses nothing — which
 why only the `simple` header cases disagree. Simple hashes the field verbatim and
 the extra octet breaks the signature.
 
-Not fixable in the daemon: both forms arrive as an empty value and are
-indistinguishable at the milter API. Inherent to `c=simple` header canonicalization
-in *any* milter, and narrow — the field must have an empty value, and essentially
-every real signer uses relaxed for headers.
+The fix is real but **cross-cutting**: negotiate the flag and stop fabricating the
+separator at six production sites across two daemons, which changes what every daemon
+believes a header value is. That is a coordinated change, not a patch, so it is
+tracked rather than done here.
+
+**The breadth is not yet established, and the severity depends on it.** Our
+reconstruction strips exactly one leading WSP. If that is what sendmail and Postfix
+do, only the empty-value case breaks and Low is right; if they strip *all* leading
+WSP, then any field with two or more spaces after the colon also fails `c=simple`,
+which is materially wider. That behaviour has not been checked, so no claim is made
+here either way.
+
+Narrow in one respect regardless: essentially every real signer uses relaxed for
+headers.
 
 ## Two traps this suite walked into, both worth remembering
 

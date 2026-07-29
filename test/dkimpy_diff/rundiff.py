@@ -229,16 +229,32 @@ def known_limitation(case):
     lost, which is why only the `simple` header cases disagree. Under simple, which
     hashes the field verbatim, the extra octet breaks the signature.
 
-    This is not fixable inside the daemon: both forms arrive as an empty value and
-    are indistinguishable at the milter API. It is inherent to `c=simple` header
-    canonicalization in any milter, and it is narrow -- essentially every real
-    signer uses relaxed for headers, and the field must also have an empty value.
+    CORRECTED 2026-07-29. This docstring previously claimed the defect was "not
+    fixable" and "inherent to c=simple header canonicalization in any milter". THAT
+    WAS WRONG, and the correction is left visible rather than edited away, because a
+    confident wrong claim inside a test harness is worse than no claim -- it tells
+    the next reader to stop looking.
+
+    The milter protocol DOES expose the original spacing, via SMFIP_HDR_LEADSPC, and
+    securemilter-lib already models it as `ProtocolFlags.header_leading_space`
+    (securemilter-lib/src/milter/negotiate.zig:49). No daemon negotiates it. So the
+    information is available for the asking and we decline to ask; that is a design
+    choice with a consequence, not a limit of the API.
+
+    The fix is cross-cutting -- negotiate the flag and stop fabricating the separator
+    at six production sites across two daemons -- so it is tracked, not done here.
+
+    The BREADTH is also unestablished, and the severity depends on it: this code
+    strips exactly one leading WSP, and whether sendmail and Postfix strip one or all
+    has not been checked. If all, any field with two or more spaces after the colon
+    also fails c=simple. Only the empty-value case is measured, so only it is claimed.
+
     Filed as D-23.
     """
     if case["header"] == "empty_value" and case["canon"].startswith("simple/"):
-        return ("D-23: a milter cannot recover a header's original octets, so an "
-                "empty-valued field reconstructs as 'X-Empty: ' and c=simple "
-                "hashes one octet too many")
+        return ("D-23: no daemon negotiates SMFIP_HDR_LEADSPC, so the separator is "
+                "fabricated -- an empty-valued field reconstructs as 'X-Empty: ' "
+                "and c=simple hashes one octet too many")
     return None
 
 
