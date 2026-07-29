@@ -9,6 +9,7 @@ const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
 const canon = securemilter_crypto.canon;
 const header_select = securemilter_crypto.header_select;
+const sig_header = securemilter_crypto.sig_header;
 
 const dkim = @import("dkim.zig");
 
@@ -248,7 +249,7 @@ fn buildSignedData(
     }
 
     // Append the DKIM-Signature header itself with b= value emptied
-    const dkim_header_cleaned = try emptyBValue(allocator, sig_header_raw);
+    const dkim_header_cleaned = try sig_header.emptyBValue(allocator, sig_header_raw);
     defer allocator.free(dkim_header_cleaned);
     const dkim_canonicalized = try canon.canonicalizeHeader(allocator, sig.canonicalization.header, dkim_header_cleaned);
     defer allocator.free(dkim_canonicalized);
@@ -286,40 +287,6 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
 fn toLower(c: u8) u8 {
     if (c >= 'A' and c <= 'Z') return c + 32;
     return c;
-}
-
-/// Remove the b= value from a DKIM-Signature header, leaving "b=" intact.
-/// This is needed for signature verification: the signed data includes the
-/// DKIM-Signature header with b= tag present but value empty.
-fn emptyBValue(allocator: Allocator, header: []const u8) ![]u8 {
-    // Find "b=" (the tag, not "bh=") and remove everything between = and the next ;
-    var result: std.ArrayList(u8) = .{};
-    errdefer result.deinit(allocator);
-
-    var i: usize = 0;
-    while (i < header.len) {
-        // Look for "b=" that is NOT preceded by another letter (i.e., not "bh=")
-        if (i < header.len - 1 and header[i] == 'b' and header[i + 1] == '=') {
-            // Make sure this isn't "bh=" — check previous non-whitespace char
-            const is_bare_b = if (i == 0) true else blk: {
-                var j = i - 1;
-                while (j > 0 and (header[j] == ' ' or header[j] == '\t')) : (j -= 1) {}
-                break :blk header[j] == ';' or j == 0;
-            };
-            if (is_bare_b) {
-                // Append "b=" and skip the value until ; or end
-                try result.appendSlice(allocator, "b=");
-                i += 2;
-                // Skip value (everything up to next ';')
-                while (i < header.len and header[i] != ';') : (i += 1) {}
-                continue;
-            }
-        }
-        try result.append(allocator, header[i]);
-        i += 1;
-    }
-
-    return result.toOwnedSlice(allocator);
 }
 
 /// Perform the actual cryptographic verification.
@@ -403,20 +370,56 @@ test "find header case insensitive reverse order" {
     try std.testing.expect(findHeader(headers, "Date") == null);
 }
 
-test "empty b value" {
+test "signed data matches an independent implementation, octet for octet" {
+    // Captured from a message signed by dkimpy and delivered through the lab.
+    // Everything about it is ordinary for real-world mail and absent from what
+    // this suite's own signer emits: the signature is folded across six lines,
+    // `h=` puts FWS around its colons, `from` is oversigned, and the header
+    // canonicalization is relaxed rather than simple. The expectation below is
+    // the exact octet string dkimpy hashes, not a string derived from this
+    // implementation, so it checks agreement rather than self-consistency.
     const allocator = std.testing.allocator;
-    const input = "DKIM-Signature: v=1; a=rsa-sha256; bh=abc; b=LONGSIGNATUREDATA; d=example.com";
-    const result = try emptyBValue(allocator, input);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("DKIM-Signature: v=1; a=rsa-sha256; bh=abc; b=; d=example.com", result);
-}
 
-test "empty b value at end" {
-    const allocator = std.testing.allocator;
-    const input = "v=1; d=x.com; b=SIGDATA";
-    const result = try emptyBValue(allocator, input);
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("v=1; d=x.com; b=", result);
+    const sig_value =
+        " v=1; a=rsa-sha256; c=relaxed/simple; d=bambania.com;\r\n" ++
+        " i=@bambania.com; q=dns/txt; s=test2026; t=1785285565; h=from : to :\r\n" ++
+        " subject : date : message-id : from;\r\n" ++
+        " bh=7Ef6s0nbzmxhseHpy+mgQFOhB4d3J6cgEWkp4fKGZEs=;\r\n" ++
+        " b=PjWT1Bg9naGgw2RiJiEJjnmoJEp8ICB2FrKGqlsxqm5GjzFujPZNHBC76YTUZHr6oufLp\r\n" ++
+        " J1Gz8dQl5NXqKP/qLxD3vGpWt8+OK0gfJaGcy236HVZPyU9TE0v0Wqui8o+PXnBLbepb5rN\r\n" ++
+        " 0VvnaGlSL6JrtG4G6Hf4pwj9ruhc+LQZBzJ1qv9wwcRFRzG4MK4WZ+XBu6i07NQtH9hmW1c\r\n" ++
+        " A+tei/JClENqLJuSA+sys2pwDoKpPQWq+0c3FGG2wIjR19Qria4ZHoArSgCLq7DMZryA72B\r\n" ++
+        " TS0DaEJJlvWoLoGKv5/R942NT+nDQH/6dlL6sP5ycfgTWuq4J6+k9Ean5MAQ==";
+
+    const sig = try dkim.parseSignature(sig_value);
+
+    const sig_header_raw = "DKIM-Signature:" ++ sig_value;
+    const headers = [_][]const u8{
+        "From: boss@bambania.com",
+        "To: testuser@example.org",
+        "Subject: probe-relaxed-simple",
+        "Date: Tue, 28 Jul 2026 20:00:00 -0400",
+        "Message-ID: <probe-relaxed-simple@probe.pentest>",
+    };
+
+    const got = try buildSignedData(allocator, sig, sig_header_raw, &headers);
+    defer allocator.free(got);
+
+    // Five header lines, not six: `from` is named twice but the message carries
+    // one From, so the second mention selects nothing (RFC 6376 §3.7). The
+    // signature line is unfolded, its b= emptied, and carries no trailing CRLF.
+    const expected =
+        "from:boss@bambania.com\r\n" ++
+        "to:testuser@example.org\r\n" ++
+        "subject:probe-relaxed-simple\r\n" ++
+        "date:Tue, 28 Jul 2026 20:00:00 -0400\r\n" ++
+        "message-id:<probe-relaxed-simple@probe.pentest>\r\n" ++
+        "dkim-signature:v=1; a=rsa-sha256; c=relaxed/simple; d=bambania.com;" ++
+        " i=@bambania.com; q=dns/txt; s=test2026; t=1785285565;" ++
+        " h=from : to : subject : date : message-id : from;" ++
+        " bh=7Ef6s0nbzmxhseHpy+mgQFOhB4d3J6cgEWkp4fKGZEs=; b=";
+
+    try std.testing.expectEqualStrings(expected, got);
 }
 
 test "signs from" {
