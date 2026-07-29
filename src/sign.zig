@@ -5,6 +5,7 @@ const Allocator = mem.Allocator;
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
 const canon = securemilter_crypto.canon;
+const header_select = securemilter_crypto.header_select;
 
 const dkim = @import("dkim.zig");
 
@@ -138,13 +139,13 @@ fn buildSigningInput(
     var data: std.ArrayList(u8) = .{};
     errdefer data.deinit(allocator);
 
-    // Canonicalize each header from the h= list
-    var iter = mem.splitScalar(u8, params.signed_headers, ':');
-    while (iter.next()) |field_name| {
-        const trimmed = mem.trim(u8, field_name, " \t");
-        if (trimmed.len == 0) continue;
-
-        const header = findHeader(headers, trimmed) orelse continue;
+    // Same selection rule as verification, and it has to be the same code: a
+    // signer that hashes a repeated `h=` name differently from how a compliant
+    // verifier will read it produces a signature nobody else can verify. With
+    // the old per-mention lookup this was latent only because the shipped
+    // default names no field twice (audit D-1).
+    var walk = header_select.lineWalker(params.signed_headers, headers);
+    while (walk.next()) |header| {
         const canonicalized = try canon.canonicalizeHeader(allocator, params.canonicalization.header, header);
         defer allocator.free(canonicalized);
         try data.appendSlice(allocator, canonicalized);
@@ -159,30 +160,19 @@ fn buildSigningInput(
     return data.toOwnedSlice(allocator);
 }
 
-/// Find a header by field name (case-insensitive), bottom-to-top.
+/// Find the bottom-most header with this field name, or null.
+///
+/// Only for callers that look up a single field outside the `h=` walk. Anything
+/// resolving an `h=` entry must go through `header_select` (audit D-1).
 fn findHeader(headers: []const []const u8, field_name: []const u8) ?[]const u8 {
-    var i = headers.len;
-    while (i > 0) {
-        i -= 1;
-        const hdr = headers[i];
-        const colon = mem.indexOfScalar(u8, hdr, ':') orelse continue;
-        const name = mem.trimRight(u8, hdr[0..colon], " \t");
-        if (eqlIgnoreCase(name, field_name)) return hdr;
-    }
-    return null;
-}
-
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (toLower(ca) != toLower(cb)) return false;
-    }
-    return true;
-}
-
-fn toLower(c: u8) u8 {
-    if (c >= 'A' and c <= 'Z') return c + 32;
-    return c;
+    const idx = header_select.selectInstance(
+        []const u8,
+        headers,
+        header_select.nameOfLine,
+        field_name,
+        0,
+    ) orelse return null;
+    return headers[idx];
 }
 
 /// Compute the cryptographic signature and return base64-encoded result.
@@ -258,8 +248,62 @@ test "build signing input produces deterministic output" {
     const result = try buildSigningInput(allocator, &params, headers, dkim_line);
     defer allocator.free(result);
 
-    // Should contain canonicalized from + to + dkim-signature
-    try std.testing.expect(mem.indexOf(u8, result, "from:") != null);
-    try std.testing.expect(mem.indexOf(u8, result, "to:") != null);
-    try std.testing.expect(mem.indexOf(u8, result, "dkim-signature:") != null);
+    // Asserted byte for byte, not by substring presence. What is being signed
+    // is the whole octet string; a test that only asks whether "from:" appears
+    // somewhere cannot see a header hashed twice, which is precisely the defect
+    // D-1 describes.
+    try std.testing.expectEqualStrings(
+        "from:user@example.com\r\n" ++
+            "to:rcpt@other.com\r\n" ++
+            "dkim-signature:v=1; a=rsa-sha256; d=example.com; s=sel; h=from:to; bh=hash; b=",
+        result,
+    );
+}
+
+test "an oversigned h= hashes the field once, not twice (D-1)" {
+    // `h=from:from` over a message with one From. RFC 6376 §5.4.2: the second
+    // mention has no instance left to consume, and §3.7 makes that the null
+    // input -- nothing at all is added to the hash. The old per-mention lookup
+    // returned the same header for both mentions and hashed it twice, so every
+    // message from a signer using OpenDKIM's `OversignHeaders` failed here.
+    const allocator = std.testing.allocator;
+    const params = SigningParams{
+        .domain = "example.com",
+        .selector = "sel",
+        .signed_headers = "from:from",
+    };
+    const headers = &[_][]const u8{
+        "From: user@example.com",
+        "Subject: Hello",
+    };
+
+    const result = try buildSigningInput(allocator, &params, headers, "DKIM-Signature: b=");
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings(
+        "from:user@example.com\r\ndkim-signature:b=",
+        result,
+    );
+}
+
+test "repeated h= mentions hash successive instances, bottom upward (D-1)" {
+    const allocator = std.testing.allocator;
+    const params = SigningParams{
+        .domain = "example.com",
+        .selector = "sel",
+        .signed_headers = "from:from",
+    };
+    const headers = &[_][]const u8{
+        "From: top@example.com",
+        "From: bottom@example.com",
+    };
+
+    const result = try buildSigningInput(allocator, &params, headers, "DKIM-Signature: b=");
+    defer allocator.free(result);
+
+    // Bottom-most first, then the next one up -- not the same header twice.
+    try std.testing.expectEqualStrings(
+        "from:bottom@example.com\r\nfrom:top@example.com\r\ndkim-signature:b=",
+        result,
+    );
 }

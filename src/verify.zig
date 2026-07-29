@@ -8,6 +8,7 @@ const dns_mod = securemilter.dns;
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
 const canon = securemilter_crypto.canon;
+const header_select = securemilter_crypto.header_select;
 
 const dkim = @import("dkim.zig");
 
@@ -232,12 +233,14 @@ fn buildSignedData(
     var data: std.ArrayList(u8) = .{};
     errdefer data.deinit(allocator);
 
-    const header_list = try sig.getSignedHeaderList(allocator);
-    defer allocator.free(header_list);
-
-    // For each header in h= list, find it in the message headers and canonicalize
-    for (header_list) |field_name| {
-        const header = findHeader(headers, field_name) orelse continue;
+    // Each `h=` entry selects one header instance, walking up from the bottom
+    // when a name is repeated, and selecting nothing once the instances run out
+    // (RFC 6376 §5.4.2 and §3.7). This used to resolve every mention to the same
+    // bottom-most header, so an oversigned message -- `h=from:from` over one
+    // `From:`, which is what OpenDKIM's `OversignHeaders` produces -- hashed that
+    // header twice where its signer hashed it once, and failed (audit D-1).
+    var walk = header_select.lineWalker(sig.signed_headers, headers);
+    while (walk.next()) |header| {
         const canonicalized = try canon.canonicalizeHeader(allocator, sig.canonicalization.header, header);
         defer allocator.free(canonicalized);
         try data.appendSlice(allocator, canonicalized);
@@ -255,20 +258,20 @@ fn buildSignedData(
     return data.toOwnedSlice(allocator);
 }
 
-/// Find a header by field name (case-insensitive), searching from bottom to top
-/// (RFC 6376 §5.4: "headers are presented to the algorithm in reverse order").
+/// Find the bottom-most header with this field name, or null.
+///
+/// Only for callers that look up a single field outside the `h=` walk. Anything
+/// resolving an `h=` entry must go through `header_select`, which handles a name
+/// appearing more than once; this cannot (audit D-1).
 fn findHeader(headers: []const []const u8, field_name: []const u8) ?[]const u8 {
-    var i = headers.len;
-    while (i > 0) {
-        i -= 1;
-        const hdr = headers[i];
-        const colon = mem.indexOfScalar(u8, hdr, ':') orelse continue;
-        const name = mem.trimRight(u8, hdr[0..colon], " \t");
-        if (eqlIgnoreCase(name, field_name)) {
-            return hdr;
-        }
-    }
-    return null;
+    const idx = header_select.selectInstance(
+        []const u8,
+        headers,
+        header_select.nameOfLine,
+        field_name,
+        0,
+    ) orelse return null;
+    return headers[idx];
 }
 
 /// Case-insensitive string comparison.
