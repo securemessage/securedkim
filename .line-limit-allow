@@ -1,15 +1,32 @@
-# 2026-07-29, X-13: the implicit listener now binds loopback instead of 0.0.0.0.
-#   main.zig 1237 -> 1305, two tests plus the reasoning. Highest stakes of the four:
-#   a reachable sign-mode port is an unauthenticated signing oracle for the domain.
+# WARNING: `zig build lint -- --update` REWRITES THIS FILE AND DELETES EVERY COMMENT.
+#   It erased the notes below once on 2026-07-29 and they had to be recovered from
+#   git. Re-add rationale by hand after any --update, or edit the numbers directly.
 #
-#   DEFERRED, WITH A PLAN, NOT FORGOTTEN: at 1305 lines this is now the largest file
-#   in the suite and it holds ~190 lines of tests. The securearc precedent is to move
-#   them to <module>_test.zig, and it applies honestly here because parseDkimConfig is
-#   already pub -- no internals would be published to satisfy a line count. The
-#   blockers are the tests using PRIVATE helpers (stripAngleBrackets, getSendingDomain,
-#   extractDomain), which must stay behind. Scope: move the config/listener/mode tests
-#   to main_test.zig, leave the private-helper tests in place. Deliberately NOT bundled
-#   into a security fix to a shipped default.
+# 2026-07-29, X-13: the implicit listener now binds loopback instead of 0.0.0.0.
+#   Highest stakes of the four daemons: a reachable sign-mode port is an
+#   unauthenticated signing oracle for the configured domain.
+#
+# 2026-07-29, test extraction DONE: main.zig 1305 -> 1140. The seven config,
+#   listener and mode tests moved to src/main_test.zig, following the
+#   settings_test.zig / dmarc_test.zig precedent. Honest rather than cosmetic:
+#   parseDkimConfig, parseMode, DkimConfig and Mode were ALREADY pub, so nothing
+#   was exported to satisfy a line count.
+#
+#   STILL HERE ON PURPOSE: the tests using PRIVATE helpers -- stripAngleBrackets,
+#   getSendingDomain, addArHeader. Publishing internals to move a test is the worse
+#   trade. Also the `test {}` block, which is what pulls the submodule and
+#   main_test.zig tests into the build at all.
+#
+#   Verified load-bearing, not assumed: commenting out the `_ = @import` reference
+#   drops the run from 49 to 42 tests. An unreferenced @import is not analyzed, so
+#   its tests are silently absent -- and a test that never runs looks exactly like a
+#   test that passes (audit 11.29, msgfile.zig).
+#
+#   STILL OVER GOAL AT 1140. Tests were never the real cause; main() plus the milter
+#   callbacks are. Reaching 400 needs the config parser extracted into its own
+#   settings.zig the way securearc already has it, which is an architectural change
+#   and not bundled here.
+#
 # Files currently over the 400-line goal, with the ceiling each
 # may not exceed. Ceilings tighten by themselves as files shrink; a
 # file that reaches the goal drops off this list entirely.
@@ -18,5 +35,5 @@
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
 420 src/dkim.zig
-1305 src/main.zig
+1140 src/main.zig
 656 src/verify.zig
