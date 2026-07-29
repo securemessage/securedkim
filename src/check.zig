@@ -63,6 +63,9 @@ const Usage =
     \\  -b <bits>        Minimum RSA key bits accepted (default: RFC 8301 floor)
     \\  --refuse-l       Report `policy` for signatures carrying l= instead of
     \\                   honouring it (RFC 6376 §8.2 sanctions either)
+    \\  --no-normalize   Do not rewrite bare CR/LF in the file to CRLF. Use when
+    \\                   the file is already CRLF-canonical and a bare CR or LF
+    \\                   is body *data* that canonicalization must not touch
     \\  -h               Show this help
     \\
     \\Output keys:
@@ -112,12 +115,12 @@ const Message = struct {
 /// on disk carries bare LF. Converting here rather than tolerating LF further
 /// down keeps the run testing the same byte sequence a real message produces.
 /// **If cases fail with a body-hash mismatch, check this first.**
-fn parseMessage(allocator: Allocator, raw: []const u8) !Message {
+fn parseMessage(allocator: Allocator, raw: []const u8, normalize_eol: bool) !Message {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    const text = try toCrlf(a, raw);
+    const text = if (normalize_eol) try toCrlf(a, raw) else raw;
 
     const sep = mem.indexOf(u8, text, "\r\n\r\n");
     const header_block = if (sep) |s| text[0..s] else text;
@@ -203,6 +206,20 @@ const Args = struct {
     port: u16 = 53,
     min_key_bits: ?u32 = null,
     body_length_policy: verify.BodyLengthPolicy = .honor,
+    /// Rewrite bare CR and bare LF to CRLF while reading the file.
+    ///
+    /// On by default because a `.eml` edited on a Unix host is usually LF-only and
+    /// DKIM is defined over CRLF, so without it the tool would be useless on
+    /// ordinary files. Unlike the header space-stripping in `appendField`, this is
+    /// **not** emulating anything the MTA does: a milter receives body octets
+    /// verbatim over `SMFIC_BODY`, bare CR and LF included.
+    ///
+    /// That makes the default actively wrong for one job -- testing what body
+    /// canonicalization does to a bare CR or LF, which RFC 5234 says are not WSP
+    /// and RFC 6376 therefore leaves as data. The normalization destroys exactly
+    /// those octets before the canonicalizer sees them, so the differential suite
+    /// turns it off and D-22 was invisible through this tool until it could.
+    normalize_eol: bool = true,
 };
 
 fn parseArgs(allocator: Allocator) !Args {
@@ -227,6 +244,8 @@ fn parseArgs(allocator: Allocator) !Args {
             result.min_key_bits = std.fmt.parseInt(u32, raw, 10) catch fatal("invalid bits");
         } else if (mem.eql(u8, arg, "--refuse-l")) {
             result.body_length_policy = .refuse;
+        } else if (mem.eql(u8, arg, "--no-normalize")) {
+            result.normalize_eol = false;
         } else if (arg.len > 0 and arg[0] == '-') {
             fatal("unknown option");
         } else {
@@ -271,7 +290,8 @@ pub fn main() !void {
         fatal("could not read the message file");
     defer allocator.free(raw);
 
-    var msg = parseMessage(allocator, raw) catch fatal("could not parse the message");
+    var msg = parseMessage(allocator, raw, args.normalize_eol) catch
+        fatal("could not parse the message");
     defer msg.deinit();
 
     // Same floor reconciliation the daemon performs, so a conformance run cannot
