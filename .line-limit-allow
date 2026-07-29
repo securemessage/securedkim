@@ -5,6 +5,11 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
+# src/verify.zig 644 -> 656: the D-19 memory-leak fix. The leaking call was
+#   nested as an argument inside base64Decode(), which is exactly why it had no
+#   `defer` and leaked on every signature verified; unnesting it into a named
+#   binding costs four lines of code plus the comment recording why the shape
+#   matters. Compressing it back would restore the shape that caused the defect.
 420 src/dkim.zig
 1237 src/main.zig
-644 src/verify.zig
+656 src/verify.zig

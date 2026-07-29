@@ -1,0 +1,352 @@
+//! `securedkim-check` — verify every DKIM-Signature on a message file and print
+//! the results, so an external conformance suite can drive the shipped verifier.
+//!
+//! Exists for the same reason `securespf-check` and `securearc-check` do: RFC
+//! conformance is a V1 release gate, and a gate is only meaningful if the thing
+//! under test is the code that ships.
+//!
+//! Two oracles need this interface, and they need different things from it:
+//!
+//!  - The **RFC 8463 Appendix A** message carries an Ed25519-SHA256 and an
+//!    RSA-SHA256 signature over the same body, and the RFC states that "either
+//!    signature would be valid if the other were not present". Reporting only an
+//!    overall verdict would let one good signature hide the other's failure, so
+//!    every signature is reported individually, in header order.
+//!  - **Differential testing against `dkimpy`** compares per-signature verdicts
+//!    on messages `dkimpy` signed, where the whole point is which signature
+//!    disagreed and why.
+//!
+//! It deliberately calls the same `verify.verifySignature` the milter calls, with
+//! the same header list shape — `"Name: value"` with folding intact and the
+//! single space after the colon dropped, which is what Postfix delivers to a
+//! milter that has not negotiated `SMFIP_HDR_LEADSPC`, and no daemon here does.
+//! `onEom` is not reused directly only because it needs a live milter
+//! `Connection`.
+
+const std = @import("std");
+const mem = std.mem;
+const posix = std.posix;
+const process = std.process;
+const Allocator = mem.Allocator;
+
+const securemilter = @import("securemilter");
+const dns_mod = securemilter.dns;
+const crypto = @import("securemilter_crypto").crypto;
+
+const verify = @import("verify.zig");
+
+fn writeOut(data: []const u8) void {
+    _ = posix.write(posix.STDOUT_FILENO, data) catch {};
+}
+
+fn writeErr(data: []const u8) void {
+    _ = posix.write(posix.STDERR_FILENO, data) catch {};
+}
+
+fn fatal(msg: []const u8) noreturn {
+    writeErr("securedkim-check: ");
+    writeErr(msg);
+    writeErr("\n");
+    process.exit(2);
+}
+
+const Usage =
+    \\Usage: securedkim-check [options] <message-file>
+    \\
+    \\Verify every DKIM-Signature on an RFC 5322 message and print the result of
+    \\each as key=value lines on stdout.
+    \\
+    \\Options:
+    \\  -f <file>        Message file (may also be given positionally)
+    \\  -n <nameserver>  DNS nameserver (default: 127.0.0.1)
+    \\  -p <port>        DNS nameserver port (default: 53)
+    \\  -b <bits>        Minimum RSA key bits accepted (default: RFC 8301 floor)
+    \\  --refuse-l       Report `policy` for signatures carrying l= instead of
+    \\                   honouring it (RFC 6376 §8.2 sanctions either)
+    \\  -h               Show this help
+    \\
+    \\Output keys:
+    \\  signatures            Count of DKIM-Signature fields found
+    \\  sig.<n>.result        pass, fail, temperror, permerror, neutral, policy
+    \\  sig.<n>.domain        the signature's d= tag
+    \\  sig.<n>.selector      the signature's s= tag
+    \\  sig.<n>.reason        failure detail, when the verifier supplied one
+    \\  sig.<n>.unsigned      octets of body the signature does not cover (l=)
+    \\  result                pass if any signature passed, else the first
+    \\                        signature's result, else none
+    \\
+    \\Exit status is 0 whenever a verdict was reached, including "fail" — the
+    \\verdict goes to stdout. A non-zero status means the tool could not run.
+    \\
+;
+
+/// Largest message accepted. Generous for a conformance suite whose cases are a
+/// few kilobytes, and bounded so a stray argument cannot exhaust memory.
+const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
+
+const Header = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+const Message = struct {
+    headers: []const Header,
+    body: []const u8,
+    arena: std.heap.ArenaAllocator,
+
+    fn deinit(self: *Message) void {
+        self.arena.deinit();
+    }
+};
+
+/// Split an RFC 5322 message into header fields and a body.
+///
+/// Folded values keep their line breaks. That is not a convenience: DKIM
+/// `relaxed` header canonicalization is defined as an operation *on* the folded
+/// form (RFC 6376 §3.4.2, "Unfold all header field continuation lines"), and the
+/// milter receives values from Postfix with folding intact, so unfolding here
+/// would test the canonicalizer against input it never sees in production.
+///
+/// Line endings are normalised to CRLF first. A message arrives over SMTP with
+/// CRLF and both canonicalizations in §3.4 are specified in terms of it; a file
+/// on disk carries bare LF. Converting here rather than tolerating LF further
+/// down keeps the run testing the same byte sequence a real message produces.
+/// **If cases fail with a body-hash mismatch, check this first.**
+fn parseMessage(allocator: Allocator, raw: []const u8) !Message {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    const text = try toCrlf(a, raw);
+
+    const sep = mem.indexOf(u8, text, "\r\n\r\n");
+    const header_block = if (sep) |s| text[0..s] else text;
+    const body = if (sep) |s| text[s + 4 ..] else "";
+
+    var headers: std.ArrayListUnmanaged(Header) = .{};
+
+    var field_start: ?usize = null;
+    var i: usize = 0;
+    while (i <= header_block.len) {
+        const line_end = mem.indexOfPos(u8, header_block, i, "\r\n") orelse header_block.len;
+        const line = header_block[i..line_end];
+        const is_continuation = line.len > 0 and (line[0] == ' ' or line[0] == '\t');
+
+        if (!is_continuation and field_start != null) {
+            try appendField(a, &headers, header_block[field_start.?..i]);
+            field_start = null;
+        }
+        if (line.len > 0 and !is_continuation) field_start = i;
+
+        if (line_end >= header_block.len) break;
+        i = line_end + 2;
+    }
+    if (field_start) |s| try appendField(a, &headers, header_block[s..]);
+
+    return .{
+        .headers = try headers.toOwnedSlice(a),
+        .body = body,
+        .arena = arena,
+    };
+}
+
+/// Record one complete field, trailing CRLF trimmed, split at the first colon.
+///
+/// **The single space after the colon is dropped, on purpose.** A milter receives
+/// header values from the MTA with leading whitespace already removed unless it
+/// negotiates `SMFIP_HDR_LEADSPC`, which no daemon in this suite does. Keeping it
+/// would hand the verifier a byte sequence production never produces, and
+/// `simple` header canonicalization — which hashes the field verbatim — would
+/// disagree for every case. Continuation lines keep their own leading whitespace,
+/// which is also what the MTA delivers.
+fn appendField(
+    a: Allocator,
+    headers: *std.ArrayListUnmanaged(Header),
+    field_raw: []const u8,
+) !void {
+    const field = mem.trimRight(u8, field_raw, "\r\n");
+    if (field.len == 0) return;
+    const colon = mem.indexOfScalar(u8, field, ':') orelse return;
+    var value = field[colon + 1 ..];
+    if (value.len > 0 and (value[0] == ' ' or value[0] == '\t')) value = value[1..];
+    try headers.append(a, .{ .name = field[0..colon], .value = value });
+}
+
+/// Normalise CR, LF and CRLF to CRLF.
+fn toCrlf(a: Allocator, raw: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    try out.ensureTotalCapacity(a, raw.len + raw.len / 8 + 2);
+    var i: usize = 0;
+    while (i < raw.len) {
+        const c = raw[i];
+        if (c == '\r') {
+            try out.appendSlice(a, "\r\n");
+            i += if (i + 1 < raw.len and raw[i + 1] == '\n') 2 else 1;
+        } else if (c == '\n') {
+            try out.appendSlice(a, "\r\n");
+            i += 1;
+        } else {
+            try out.append(a, c);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
+fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
+const Args = struct {
+    file: ?[]const u8 = null,
+    nameserver: []const u8 = "127.0.0.1",
+    port: u16 = 53,
+    min_key_bits: ?u32 = null,
+    body_length_policy: verify.BodyLengthPolicy = .honor,
+};
+
+fn parseArgs(allocator: Allocator) !Args {
+    var result = Args{};
+    var it = try process.argsWithAllocator(allocator);
+    defer it.deinit();
+    _ = it.next();
+
+    while (it.next()) |arg| {
+        if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
+            writeOut(Usage);
+            process.exit(0);
+        } else if (mem.eql(u8, arg, "-f")) {
+            result.file = try allocator.dupe(u8, it.next() orelse fatal("-f needs a value"));
+        } else if (mem.eql(u8, arg, "-n")) {
+            result.nameserver = try allocator.dupe(u8, it.next() orelse fatal("-n needs a value"));
+        } else if (mem.eql(u8, arg, "-p")) {
+            const raw = it.next() orelse fatal("-p needs a value");
+            result.port = std.fmt.parseInt(u16, raw, 10) catch fatal("invalid port");
+        } else if (mem.eql(u8, arg, "-b")) {
+            const raw = it.next() orelse fatal("-b needs a value");
+            result.min_key_bits = std.fmt.parseInt(u32, raw, 10) catch fatal("invalid bits");
+        } else if (mem.eql(u8, arg, "--refuse-l")) {
+            result.body_length_policy = .refuse;
+        } else if (arg.len > 0 and arg[0] == '-') {
+            fatal("unknown option");
+        } else {
+            result.file = try allocator.dupe(u8, arg);
+        }
+    }
+
+    if (result.file == null) fatal("a message file is required (see -h)");
+    return result;
+}
+
+fn emit(key: []const u8, value: []const u8) void {
+    writeOut(key);
+    writeOut("=");
+    writeOut(value);
+    writeOut("\n");
+}
+
+/// `sig.<n>.<field>=<value>`, built without an allocator so a reporting failure
+/// cannot become an allocation failure mid-run.
+fn emitSig(index: usize, field: []const u8, value: []const u8) void {
+    var buf: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "sig.{d}.{s}", .{ index, field }) catch return;
+    emit(key, value);
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Argument strings outlive parsing and are never individually freed, so they
+    // get their own arena. Without it the leak detector prints a report on every
+    // run, which a conformance harness reading stderr cannot distinguish from a
+    // real fault.
+    var arg_arena = std.heap.ArenaAllocator.init(allocator);
+    defer arg_arena.deinit();
+
+    const args = try parseArgs(arg_arena.allocator());
+
+    const raw = std.fs.cwd().readFileAlloc(allocator, args.file.?, MAX_MESSAGE_BYTES) catch
+        fatal("could not read the message file");
+    defer allocator.free(raw);
+
+    var msg = parseMessage(allocator, raw) catch fatal("could not parse the message");
+    defer msg.deinit();
+
+    // Same floor reconciliation the daemon performs, so a conformance run cannot
+    // accidentally accept a key the shipped verifier would reject. Note that
+    // RFC 8463's own example uses a 1024-bit RSA key, which is exactly the
+    // RFC 8301 floor -- a checker defaulting any higher could not verify it.
+    const min_key_bits: u32 = if (args.min_key_bits) |b|
+        crypto.resolveMinRsaBits(b).bits
+    else
+        crypto.RFC8301_MIN_RSA_BITS;
+
+    var resolver = dns_mod.Resolver.init(allocator, .{
+        .nameservers = &.{args.nameserver},
+        .port = args.port,
+    });
+    defer resolver.deinit();
+
+    // The header list the verifier sees: every field, in order, as the milter
+    // would have accumulated them.
+    var header_strings: std.ArrayListUnmanaged([]const u8) = .{};
+    defer {
+        for (header_strings.items) |s| allocator.free(s);
+        header_strings.deinit(allocator);
+    }
+    for (msg.headers) |hdr| {
+        const full = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ hdr.name, hdr.value });
+        try header_strings.append(allocator, full);
+    }
+
+    var count: usize = 0;
+    var any_pass = false;
+    var first: ?verify.Result = null;
+
+    // Every signature is reported, not just the first to pass. RFC 8463's own
+    // example message carries two independent signatures and states each must
+    // stand alone; an overall verdict would let one mask the other.
+    for (msg.headers) |hdr| {
+        if (!eqlIgnoreCase(hdr.name, "DKIM-Signature")) continue;
+
+        const sig_header_raw = try std.fmt.allocPrint(allocator, "DKIM-Signature: {s}", .{hdr.value});
+        defer allocator.free(sig_header_raw);
+
+        const result = verify.verifySignature(
+            allocator,
+            &resolver,
+            hdr.value,
+            sig_header_raw,
+            header_strings.items,
+            msg.body,
+            min_key_bits,
+            args.body_length_policy,
+        );
+
+        emitSig(count, "result", result.result.toString());
+        emitSig(count, "domain", result.domain);
+        emitSig(count, "selector", result.selector);
+        if (result.reason) |reason| emitSig(count, "reason", reason);
+        if (result.unsigned_body_bytes > 0) {
+            var buf: [24]u8 = undefined;
+            const n = std.fmt.bufPrint(&buf, "{d}", .{result.unsigned_body_bytes}) catch "?";
+            emitSig(count, "unsigned", n);
+        }
+
+        if (result.result == .pass) any_pass = true;
+        if (first == null) first = result.result;
+        count += 1;
+    }
+
+    var cbuf: [24]u8 = undefined;
+    emit("signatures", std.fmt.bufPrint(&cbuf, "{d}", .{count}) catch "?");
+
+    // RFC 6376 §6.1: a verifier that finds one valid signature "MAY choose to
+    // stop", so a single pass makes the message verified regardless of the rest.
+    const overall: []const u8 = if (any_pass)
+        "pass"
+    else if (first) |f| f.toString() else "none";
+    emit("result", overall);
+}

@@ -195,8 +195,16 @@ pub fn verifySignature(
         },
     };
 
-    const bh_decoded = crypto.base64Decode(allocator, dkim.stripWhitespace(allocator, sig.body_hash) catch
-        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "invalid bh= encoding" }) catch
+    // Bound to a name so it can be freed. Nesting this call inside
+    // `base64Decode` leaked it on every signature verified: `conn.allocator` is
+    // the worker's allocator, not a per-message arena, so nothing reclaimed it
+    // when the message ended and a busy daemon grew without limit. The b= path
+    // six lines below always had the `defer`; only this one was missed.
+    const bh_stripped = dkim.stripWhitespace(allocator, sig.body_hash) catch
+        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "invalid bh= encoding" };
+    defer allocator.free(bh_stripped);
+
+    const bh_decoded = crypto.base64Decode(allocator, bh_stripped) catch
         return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "invalid bh= base64" };
     defer allocator.free(bh_decoded);
 
@@ -439,7 +447,11 @@ fn verifyWithKey(
             var sig_bytes: [64]u8 = undefined;
             @memcpy(&sig_bytes, signature_bytes[0..64]);
 
-            return crypto.ed25519Verify(pub_key, signed_data, sig_bytes);
+            // `signed_data` is the canonicalized signing input. RFC 8463 §3
+            // signs the SHA-256 digest of it, and that hashing happens inside
+            // `ed25519Sha256Verify` -- see its doc comment for why it is not
+            // done here.
+            return crypto.ed25519Sha256Verify(pub_key, signed_data, sig_bytes);
         },
     }
 }

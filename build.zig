@@ -32,6 +32,25 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // securedkim-check: verify every DKIM-Signature on a message and print each
+    // result. Exists so the RFC 6376 / RFC 8463 conformance suite and the dkimpy
+    // differential harness can drive the shipped verifier, the way
+    // securespf-check and securearc-check do.
+    const check_mod = b.createModule(.{
+        .root_source_file = b.path("src/check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "securemilter", .module = securemilter_mod },
+            .{ .name = "securemilter_crypto", .module = crypto_mod },
+        },
+    });
+    const check_exe = b.addExecutable(.{
+        .name = "securedkim-check",
+        .root_module = check_mod,
+    });
+    b.installArtifact(check_exe);
+
     // securedkim-genkey CLI tool (only needs securemilter_crypto)
     const genkey_mod = b.createModule(.{
         .root_source_file = b.path("src/genkey.zig"),
