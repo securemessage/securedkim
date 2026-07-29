@@ -42,6 +42,19 @@ pub fn parseMode(raw: []const u8) error{InvalidMode}!Mode {
     return error.InvalidMode;
 }
 
+/// Parse `BodyLengthTag`, which decides what a signature's `l=` tag means here.
+///
+/// Rejected rather than defaulted on a typo, for the same reason `Mode` is: this
+/// selects between accepting a body whose tail nobody signed and refusing it, and
+/// quietly picking one because the operator misspelled the other is not a choice
+/// this daemon should make on their behalf.
+pub fn parseBodyLengthTag(raw: []const u8) error{InvalidBodyLengthTag}!verify.BodyLengthPolicy {
+    if (mem.eql(u8, raw, "honor")) return .honor;
+    if (mem.eql(u8, raw, "honour")) return .honor;
+    if (mem.eql(u8, raw, "refuse")) return .refuse;
+    return error.InvalidBodyLengthTag;
+}
+
 /// Listener mode for DKIM processing.
 pub const Mode = enum {
     sign_only,
@@ -97,6 +110,8 @@ pub const DkimConfig = struct {
     zmq_topic: []const u8,
     limits: connection_mod.Limits,
     min_key_bits: crypto.MinRsaBits,
+    /// What a verified signature's `l=` tag means here (audit D-5).
+    body_length_policy: verify.BodyLengthPolicy,
 };
 
 const reload_mod = securemilter.reload;
@@ -211,6 +226,11 @@ var g_strip_policy: header_scrub.StripPolicy = .{ .own_methods = &.{"dkim"} };
 /// only the two that verify signatures have any use for this.
 var g_min_key_bits: u32 = crypto.RFC8301_MIN_RSA_BITS;
 
+/// Default `honor`, which is what RFC 6376 §3.5 specifies and what a signer using
+/// `l=` expects. `refuse` is available for operators who would rather take RFC
+/// 6376 §8.2 at its word and ignore such signatures; see the man page.
+var g_body_length_policy: verify.BodyLengthPolicy = .honor;
+
 pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !DkimConfig {
     const global = cfg.getSection("global") orelse return error.MissingGlobalSection;
 
@@ -299,6 +319,13 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
         global.getInt(crypto.MIN_KEY_BITS_OPTION, u32, crypto.RFC8301_MIN_RSA_BITS),
     );
 
+    // RFC 6376 §3.5 says to honour l=; §8.2 says a verifier may refuse signatures
+    // that carry it. Both are legitimate, so it is the operator's call.
+    const body_length_policy: verify.BodyLengthPolicy = if (global.get("BodyLengthTag")) |raw|
+        try parseBodyLengthTag(raw)
+    else
+        .honor;
+
     // ZMQ event publishing
     const zmq_endpoint = global.get("ZmqEndpoint");
     const zmq_topic = global.getOrDefault("ZmqTopic", "dkim");
@@ -327,6 +354,7 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
         .zmq_topic = zmq_topic,
         .limits = limits,
         .min_key_bits = min_key_bits,
+        .body_length_policy = body_length_policy,
     };
 }
 
@@ -381,6 +409,7 @@ pub fn main() !void {
     g_zmq_topic = dkim_cfg.zmq_topic;
     g_strip_policy = .{ .own_methods = &.{"dkim"}, .strip_all = dkim_cfg.strip_auth_results };
     g_min_key_bits = dkim_cfg.min_key_bits.bits;
+    g_body_length_policy = dkim_cfg.body_length_policy;
 
     // Say so rather than silently disagreeing with the config file. An operator
     // who wrote a smaller number is trying to accept keys the RFC forbids, and
@@ -659,11 +688,14 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
         }
     }
 
-    // Compute body hash using the body accumulated on the connection.
+    // The body is passed to each signature rather than hashed once here. `c=`
+    // chooses the canonicalization and `l=` chooses how much of the body is
+    // covered, both per signature, so one hash cannot serve them all. This used
+    // to hash every body with `simple` regardless of what the signature asked,
+    // which meant no `c=*/relaxed` signature could verify -- that is what almost
+    // everything on the internet sends, Gmail included.
     // `contentTruncated` above already established the body is whole.
     const body_data = conn.getBody() orelse return @intFromEnum(responses.Code.@"continue");
-    const body_hash = sign_mod.computeBodyHash(conn.allocator, body_data, .simple) catch
-        return @intFromEnum(responses.Code.@"continue");
 
     // Build header list from accumulated headers
     var header_strings: std.ArrayList([]const u8) = .{};
@@ -695,8 +727,9 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
             hdr.value,
             sig_header_raw,
             header_strings.items,
-            body_hash,
+            body_data,
             g_min_key_bits,
+            g_body_length_policy,
         );
 
         // A weak key is a signer-side fault the postmaster on this side cannot
@@ -712,6 +745,19 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
                     .{ escape.logField(result.domain), g_min_key_bits },
                 );
             }
+        }
+
+        // A pass that covers part of a body is a weaker claim than a pass that
+        // covers all of it, and `dkim=pass` alone cannot express the difference.
+        // Said out loud because RFC 6376 §8.2's attack is precisely that the
+        // unsigned tail can "completely replace the original content in the end
+        // recipient's eyes" while the signature still validates. The domain is
+        // sender-chosen, hence escaped (audit X-5).
+        if (result.unsigned_body_bytes > 0) {
+            log.warn(
+                "{f}: dkim=pass covers only the first l= octets, {d} trailing body octets are unsigned (RFC 6376 8.2)",
+                .{ escape.logField(result.domain), result.unsigned_body_bytes },
+            );
         }
 
         addArHeader(conn, "dkim", result.result.toString(), result.domain, result.selector) catch |err|

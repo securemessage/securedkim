@@ -88,6 +88,23 @@ SignedHeaders   = from:to:subject:date:message-id
 # mail signed below it fails DKIM at every conformant verifier.
 # MinimumKeyBits = 1024
 
+# What a signature's l= tag means: honor or refuse. Default: honor.
+#
+# l= says how many octets of the canonicalized body the signature covers, so that
+# a mailing list appending a footer does not break the original signature. What it
+# also means is that an intermediary can append content the signer never saw while
+# the signature keeps validating -- RFC 6376 8.2 notes the appended part can
+# "completely replace the original content in the end recipient's eyes", and
+# concludes that "Assessors might wish to ignore signatures that use the tag".
+#
+# honor  obeys the tag per RFC 6376 3.5, and logs a warning naming the domain and
+#        the number of unsigned octets whenever a pass covers only part of a body.
+# refuse declines to evaluate such signatures at all, reporting dkim=policy.
+#        Signatures without l= are unaffected.
+#
+# Both are conformant. l= is rare, and RFC 6377 3.5 discourages using it.
+# BodyLengthTag = honor
+
 # ZMQ event publishing endpoint (optional).
 # ZmqEndpoint   = tcp://events.internal:5555
 

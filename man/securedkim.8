@@ -187,6 +187,65 @@ is always held to the 1024-bit floor irrespective of this setting, and the
 daemon refuses to start if it is smaller: RFC 8301 binds signers to the same
 minimum, so mail signed below it fails DKIM at every conformant verifier.
 Read at startup only.
+.It Cm BodyLengthTag
+What a verified signature's
+.Cm l=
+tag means.
+One of
+.Cm honor
+or
+.Cm refuse .
+Default:
+.Cm honor .
+An unrecognised value is refused at startup rather than silently falling back.
+.Pp
+The
+.Cm l=
+tag states how many octets of the canonicalized body a signature covers, leaving
+anything beyond that count unsigned.
+It exists so that a mailing list which appends a footer, and does not re-sign,
+does not thereby break the original signature.
+.Pp
+With
+.Cm honor ,
+the tag is obeyed as RFC 6376 \[sc]3.5 specifies: only the first
+.Cm l=
+octets are hashed.
+A signature claiming to cover more body than the message actually has is refused
+as
+.Cm dkim=permerror ,
+since RFC 6376 requires that the value
+.Dq MUST NOT be larger than the actual number of octets in the canonicalized message body .
+When a signature passes but leaves a tail uncovered, a warning naming the
+signing domain and the number of unsigned octets is logged, because
+.Cm dkim=pass
+on its own cannot express that only part of the body was vouched for.
+.Pp
+With
+.Cm refuse ,
+a signature carrying
+.Cm l=
+is not evaluated at all and is reported as
+.Cm dkim=policy ,
+which RFC 8601 \[sc]2.7.1 defines as
+.Dq the message was signed but the signature or signatures were not acceptable to the verifier .
+Signatures without
+.Cm l=
+are unaffected.
+.Pp
+The reason to consider
+.Cm refuse
+is RFC 6376 \[sc]8.2, which observes that an intermediary can append content
+after the signed portion, that the appended content may
+.Dq completely replace the original content in the end recipient's eyes ,
+and that the signature still validates while it does.
+The same section concludes that
+.Dq Assessors might wish to ignore signatures that use the tag .
+Both settings are therefore standards-conformant; the choice is whether
+interoperability with such lists is worth accepting a partially signed body.
+.Cm l=
+is rare in practice and RFC 6377 \[sc]3.5 discourages its use.
+Read at startup only.
 .It Cm ZmqEndpoint
 ZeroMQ PUB endpoint for event publishing.
 Disabled if not set.

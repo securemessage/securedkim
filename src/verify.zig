@@ -21,6 +21,12 @@ pub const Result = enum {
     permerror,
     neutral,
     none,
+    /// RFC 8601 §2.7.1: "the message was signed but the signature or signatures
+    /// were not acceptable to the verifier". Distinct from `fail`, which asserts
+    /// the signature did not validate: `policy` says this verifier declined to
+    /// evaluate a signature that might well be good. Used when a signature
+    /// carries `l=` and the operator has chosen to refuse those.
+    policy,
 
     pub fn toString(self: Result) []const u8 {
         return switch (self) {
@@ -30,8 +36,21 @@ pub const Result = enum {
             .permerror => "permerror",
             .neutral => "neutral",
             .none => "none",
+            .policy => "policy",
         };
     }
+};
+
+/// What to do with a signature that limits body coverage with `l=`.
+pub const BodyLengthPolicy = enum {
+    /// Hash only the first `l=` octets, as RFC 6376 §3.5 specifies. The rest of
+    /// the body is not covered by the signature, and `unsigned_body_bytes` says
+    /// how much of it is not.
+    honor,
+    /// Decline to evaluate the signature at all, reporting `policy`. RFC 6376
+    /// §8.2 sanctions this directly: "Assessors might wish to ignore signatures
+    /// that use the tag."
+    refuse,
 };
 
 /// Detailed verification result for a single DKIM-Signature.
@@ -40,18 +59,35 @@ pub const VerifyResult = struct {
     domain: []const u8,
     selector: []const u8,
     reason: ?[]const u8 = null,
+    /// Octets of the canonicalized body this signature does not cover, which is
+    /// non-zero only when the signature carries `l=` and it is being honoured.
+    ///
+    /// Reported because `pass` over part of a body is a weaker claim than `pass`
+    /// over all of it, and nothing downstream can tell the difference otherwise.
+    /// RFC 6376 §8.2: appended content "to completely replace the original
+    /// content in the end recipient's eyes" is the attack this enables.
+    unsigned_body_bytes: u64 = 0,
 };
 
-/// Verify a single DKIM-Signature against the message headers and body hash.
+/// Verify a single DKIM-Signature against the message headers and body.
 ///
 /// Steps (RFC 6376 §6.1):
 /// 1. Parse DKIM-Signature tag-value list
 /// 2. DNS lookup: selector._domainkey.domain TXT
 /// 3. Parse DNS key record, extract public key
-/// 4. Compute body hash (caller provides pre-computed canonicalized body hash)
+/// 4. Canonicalize and hash the body as *this* signature specifies
 /// 5. Compare body hash with bh= tag value
 /// 6. Reconstruct signed header block (canonicalized headers per h= list)
 /// 7. Verify signature over the header block
+///
+/// Takes the raw body rather than a hash of it. The body hash is not a property
+/// of the message: `c=` chooses the canonicalization and `l=` chooses how much of
+/// the body is covered, both per signature, and one message may carry several
+/// signatures that disagree on both. A hash computed once by the caller can only
+/// be right for signatures that happen to share the caller's assumptions -- which
+/// is how this daemon came to hash every body with `simple` canonicalization no
+/// matter what the signature asked for, and so could not verify the near-universal
+/// `c=relaxed/relaxed`.
 ///
 /// `min_key_bits` is the smallest RSA modulus this verifier will accept, already
 /// reconciled with the RFC 8301 floor by `crypto.resolveMinRsaBits`. It is a
@@ -62,8 +98,9 @@ pub fn verifySignature(
     sig_header_value: []const u8,
     sig_header_raw: []const u8,
     headers: []const []const u8,
-    body_hash: [32]u8,
+    body: []const u8,
     min_key_bits: u32,
+    body_length_policy: BodyLengthPolicy,
 ) VerifyResult {
     // Step 1: Parse the DKIM-Signature
     const sig = dkim.parseSignature(sig_header_value) catch
@@ -131,13 +168,39 @@ pub fn verifySignature(
     if (!keyTypeMatchesAlgorithm(key_record.key_type, sig.algorithm))
         return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "key type mismatch" };
 
-    // Step 4-5: Verify body hash
+    // RFC 6376 §8.2 lets a verifier decline `l=` outright, and an operator may
+    // prefer that to accepting a body whose tail nobody signed. Checked before
+    // any hashing so a refused signature costs nothing.
+    if (sig.body_length != null and body_length_policy == .refuse)
+        return .{ .result = .policy, .domain = sig.domain, .selector = sig.selector, .reason = "l= body length limit refused by policy" };
+
+    // Step 4-5: Verify body hash, canonicalized and bounded as *this* signature
+    // asks rather than as the caller guessed.
+    const body_result = computeBodyHash(allocator, body, sig.canonicalization.body, sig.body_length) catch |err| switch (err) {
+        // RFC 6376 §3.5: l= "MUST NOT be larger than the actual number of octets
+        // in the canonicalized message body". A signature claiming to cover more
+        // body than exists is malformed, and honouring it would mean hashing
+        // whatever happened to be in memory past the end.
+        error.BodyLengthExceedsBody => return .{
+            .result = .permerror,
+            .domain = sig.domain,
+            .selector = sig.selector,
+            .reason = "l= exceeds the canonicalized body length",
+        },
+        error.OutOfMemory => return .{
+            .result = .temperror,
+            .domain = sig.domain,
+            .selector = sig.selector,
+            .reason = "body canonicalization failed",
+        },
+    };
+
     const bh_decoded = crypto.base64Decode(allocator, dkim.stripWhitespace(allocator, sig.body_hash) catch
         return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "invalid bh= encoding" }) catch
         return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "invalid bh= base64" };
     defer allocator.free(bh_decoded);
 
-    if (bh_decoded.len != 32 or !mem.eql(u8, bh_decoded, &body_hash))
+    if (bh_decoded.len != 32 or !mem.eql(u8, bh_decoded, &body_result.hash))
         return .{ .result = .fail, .domain = sig.domain, .selector = sig.selector, .reason = "body hash mismatch" };
 
     // Step 6: Build the signed data block (canonicalized headers + DKIM-Signature with empty b=)
@@ -171,10 +234,57 @@ pub fn verifySignature(
     };
 
     if (verified) {
-        return .{ .result = .pass, .domain = sig.domain, .selector = sig.selector };
+        return .{
+            .result = .pass,
+            .domain = sig.domain,
+            .selector = sig.selector,
+            // Carried up so a partial pass can be reported as one.
+            .unsigned_body_bytes = body_result.unsigned_bytes,
+        };
     } else {
         return .{ .result = .fail, .domain = sig.domain, .selector = sig.selector, .reason = "signature mismatch" };
     }
+}
+
+/// A body hash together with how much of the body it left uncovered.
+const BodyHashResult = struct {
+    hash: [32]u8,
+    unsigned_bytes: u64,
+};
+
+/// Canonicalize the body per `algorithm`, bound it per `body_length`, and hash it.
+///
+/// `body_length` is the `l=` tag: the count of octets **of the canonicalized
+/// body** that the signature covers (RFC 6376 §3.5), so the bound is applied after
+/// canonicalization and never before. Getting that order wrong would matter for
+/// exactly the messages `l=` exists to serve, since relaxed canonicalization
+/// changes the body's length.
+fn computeBodyHash(
+    allocator: Allocator,
+    body: []const u8,
+    algorithm: canon.Algorithm,
+    body_length: ?u64,
+) error{ OutOfMemory, BodyLengthExceedsBody }!BodyHashResult {
+    var bc = canon.BodyCanonicalizer.init(allocator, algorithm);
+    defer bc.deinit();
+    try bc.update(body);
+    const canonicalized = try bc.finish();
+    defer allocator.free(canonicalized);
+
+    const limit = body_length orelse
+        return .{ .hash = crypto.sha256(canonicalized), .unsigned_bytes = 0 };
+
+    // RFC 6376 §3.5 forbids l= from exceeding the canonicalized body length. The
+    // comparison is done in u64 before any narrowing cast, because the tag is
+    // specified as up to 76 digits and the RFC asks implementers explicitly to
+    // "test for integer overflow when decoding the value".
+    if (limit > canonicalized.len) return error.BodyLengthExceedsBody;
+
+    const covered: usize = @intCast(limit);
+    return .{
+        .hash = crypto.sha256(canonicalized[0..covered]),
+        .unsigned_bytes = canonicalized.len - covered,
+    };
 }
 
 // =============================================================================
@@ -368,6 +478,92 @@ test "find header case insensitive reverse order" {
 
     // Not found
     try std.testing.expect(findHeader(headers, "Date") == null);
+}
+
+// --- CRITICAL-2 / D-5: the body hash belongs to the signature ------------------
+
+test "body canonicalization follows the signature, not a fixed choice" {
+    // A body whose two canonicalizations differ: a line with trailing spaces and
+    // a run of internal spaces. Plain one-line bodies canonicalize identically
+    // under both algorithms, which is why hardcoding `simple` went unnoticed for
+    // so long -- every message the lab ever verified had one.
+    const allocator = std.testing.allocator;
+    const body = "Trailing spaces here.   \r\nInternal    run.\r\n";
+
+    const as_simple = try computeBodyHash(allocator, body, .simple, null);
+    const as_relaxed = try computeBodyHash(allocator, body, .relaxed, null);
+
+    try std.testing.expect(!mem.eql(u8, &as_simple.hash, &as_relaxed.hash));
+    // Neither leaves anything uncovered when there is no l= tag.
+    try std.testing.expectEqual(@as(u64, 0), as_simple.unsigned_bytes);
+    try std.testing.expectEqual(@as(u64, 0), as_relaxed.unsigned_bytes);
+}
+
+test "l= hashes only the covered prefix, and reports the rest as unsigned" {
+    const allocator = std.testing.allocator;
+    // Simple canonicalization leaves this body's 14 octets alone: it already ends
+    // in CRLF and has no trailing empty lines.
+    const body = "Hello world.\r\n";
+
+    const bounded = try computeBodyHash(allocator, body, .simple, 6);
+
+    // Compared against the hash of the exact octets, not against another call to
+    // this function on a shorter body -- canonicalization would append a CRLF to
+    // a body that lacks one, so those are different operations.
+    const expected = crypto.sha256("Hello ");
+    try std.testing.expectEqualSlices(u8, &expected, &bounded.hash);
+    try std.testing.expectEqual(@as(u64, 8), bounded.unsigned_bytes);
+}
+
+test "l= is counted after canonicalization, not before" {
+    const allocator = std.testing.allocator;
+    // Relaxed canonicalization collapses the run of spaces, so "a    b c\r\n"
+    // becomes "a b c\r\n" -- 7 octets where the raw body had 10. An l= of 5 must
+    // therefore cover "a b c", which is only true if the bound is applied to the
+    // canonicalized stream. Applied to the raw body it would cover "a    ".
+    const body = "a    b c\r\n";
+
+    const bounded = try computeBodyHash(allocator, body, .relaxed, 5);
+
+    const expected = crypto.sha256("a b c");
+    try std.testing.expectEqualSlices(u8, &expected, &bounded.hash);
+    try std.testing.expectEqual(@as(u64, 2), bounded.unsigned_bytes);
+}
+
+test "an l= larger than the body is a malformed signature" {
+    // RFC 6376 §3.5: the value "MUST NOT be larger than the actual number of
+    // octets in the canonicalized message body". Honouring it anyway would mean
+    // hashing past the end of the buffer.
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.BodyLengthExceedsBody,
+        computeBodyHash(allocator, "short\r\n", .simple, 999),
+    );
+}
+
+test "an l= of exactly the body length covers everything" {
+    const allocator = std.testing.allocator;
+    const body = "Hello world.\r\n";
+
+    const bounded = try computeBodyHash(allocator, body, .simple, body.len);
+    const whole = try computeBodyHash(allocator, body, .simple, null);
+
+    try std.testing.expectEqualSlices(u8, &whole.hash, &bounded.hash);
+    try std.testing.expectEqual(@as(u64, 0), bounded.unsigned_bytes);
+}
+
+test "an l= of zero covers nothing at all" {
+    // Legal, and worth pinning: the signature vouches for no body content
+    // whatsoever, so the whole body is reported unsigned and the hash is the hash
+    // of nothing.
+    const allocator = std.testing.allocator;
+    const body = "Hello world.\r\n";
+
+    const bounded = try computeBodyHash(allocator, body, .simple, 0);
+
+    const expected = crypto.sha256("");
+    try std.testing.expectEqualSlices(u8, &expected, &bounded.hash);
+    try std.testing.expectEqual(@as(u64, body.len), bounded.unsigned_bytes);
 }
 
 test "signed data matches an independent implementation, octet for octet" {
