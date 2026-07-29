@@ -282,8 +282,18 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
         }
     }
 
+    // Loopback, NOT 0.0.0.0. The milter protocol has no authentication, so anything
+    // that reaches this socket is trusted absolutely. The stakes here are the
+    // highest of the four daemons: on a sign listener a reachable port is an
+    // unauthenticated signing oracle -- anyone can have arbitrary mail DKIM-signed
+    // as the configured domain, which is the whole guarantee DKIM exists to make.
+    // Postfix is the only intended client and it is local.
+    //
+    // A-2 was re-rated High because an instance of THIS daemon had its public
+    // inbound socket in sign mode. Wide binding must be written down deliberately,
+    // not inherited from an omitted config section.
     if (addrs.items.len == 0) {
-        try addrs.append(allocator, .{ .tcp = .{ .host = "0.0.0.0", .port = 8891 } });
+        try addrs.append(allocator, .{ .tcp = .{ .host = "127.0.0.1", .port = 8891 } });
         try modes.append(allocator, default_mode);
     }
 
@@ -1105,6 +1115,11 @@ test "get sending domain" {
 
 // `parseDkimConfig` had no tests at all, which is why A-2 survived here after
 // being written up against `securearc`.
+//
+// CAUTION: this frees the parsed config before returning, so anything in the result
+// that BORROWS from it dangles. Safe for `modes` and slice lengths, which is all the
+// existing callers touch. NOT safe for a listener host from a `Socket =` line -- the
+// tests below that inspect host strings parse inline and keep `cfg` alive instead.
 fn parseForTest(ini_text: []const u8) !DkimConfig {
     var cfg = try config_mod.parse(std.testing.allocator, ini_text);
     defer cfg.deinit();
@@ -1115,6 +1130,59 @@ fn freeTestConfig(dkim_cfg: DkimConfig) void {
     std.testing.allocator.free(dkim_cfg.listen_addresses);
     std.testing.allocator.free(dkim_cfg.modes);
     std.testing.allocator.free(dkim_cfg.dns_nameservers);
+}
+
+// The implicit listener binds loopback, never 0.0.0.0.
+//
+// Until 2026-07-29 it bound 0.0.0.0 and NOTHING TESTED IT, in any of the four
+// daemons -- a config-less run silently offered an unauthenticated signing oracle
+// on every interface. The milter protocol has no authentication, so a reachable
+// sign-mode port lets anyone have arbitrary mail signed as the configured domain.
+//
+// Pinned per daemon rather than once in the library because each hardcodes its own
+// fallback, so one of them can regress alone.
+test "the implicit listener binds loopback, not every interface" {
+    var cfg = try config_mod.parse(std.testing.allocator,
+        \\[global]
+        \\AuthservID = mail.test.com
+    );
+    defer cfg.deinit();
+
+    const dkim_cfg = try parseDkimConfig(std.testing.allocator, &cfg);
+    defer freeTestConfig(dkim_cfg);
+
+    try std.testing.expectEqual(@as(usize, 1), dkim_cfg.listen_addresses.len);
+    switch (dkim_cfg.listen_addresses[0]) {
+        .tcp => |tcp| {
+            try std.testing.expectEqualStrings("127.0.0.1", tcp.host);
+            try std.testing.expectEqual(@as(u16, 8891), tcp.port);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+// An explicit wide bind is still honoured: this is a safe DEFAULT, not a policy
+// that overrides the operator. Removing this test would let a future "harden the
+// listener" change quietly break every deployment that needs a routable socket
+// because Postfix runs in a different jail.
+test "an explicit 0.0.0.0 socket is still honoured" {
+    var cfg = try config_mod.parse(std.testing.allocator,
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\
+        \\[listener:wide]
+        \\Socket = inet:8891@0.0.0.0
+        \\Mode = verify
+    );
+    defer cfg.deinit();
+
+    const dkim_cfg = try parseDkimConfig(std.testing.allocator, &cfg);
+    defer freeTestConfig(dkim_cfg);
+
+    switch (dkim_cfg.listen_addresses[0]) {
+        .tcp => |tcp| try std.testing.expectEqualStrings("0.0.0.0", tcp.host),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 // A-2 regression, and the reason this instance is worse than securearc's: with

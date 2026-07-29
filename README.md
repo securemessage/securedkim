@@ -45,11 +45,11 @@ PidFile         = /var/run/securedkim/securedkim.pid
 DnsNameserver   = 127.0.0.1
 
 [listener:verify-inbound]
-Socket          = inet:8891@0.0.0.0
+Socket          = inet:8891@127.0.0.1
 Mode            = verify
 
 [listener:sign-outbound]
-Socket          = inet:8892@0.0.0.0
+Socket          = inet:8892@127.0.0.1
 Mode            = sign
 Domain          = example.com
 Selector        = 2026

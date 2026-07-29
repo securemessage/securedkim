@@ -1,3 +1,15 @@
+# 2026-07-29, X-13: the implicit listener now binds loopback instead of 0.0.0.0.
+#   main.zig 1237 -> 1305, two tests plus the reasoning. Highest stakes of the four:
+#   a reachable sign-mode port is an unauthenticated signing oracle for the domain.
+#
+#   DEFERRED, WITH A PLAN, NOT FORGOTTEN: at 1305 lines this is now the largest file
+#   in the suite and it holds ~190 lines of tests. The securearc precedent is to move
+#   them to <module>_test.zig, and it applies honestly here because parseDkimConfig is
+#   already pub -- no internals would be published to satisfy a line count. The
+#   blockers are the tests using PRIVATE helpers (stripAngleBrackets, getSendingDomain,
+#   extractDomain), which must stay behind. Scope: move the config/listener/mode tests
+#   to main_test.zig, leave the private-helper tests in place. Deliberately NOT bundled
+#   into a security fix to a shipped default.
 # Files currently over the 400-line goal, with the ceiling each
 # may not exceed. Ceilings tighten by themselves as files shrink; a
 # file that reaches the goal drops off this list entirely.
@@ -5,11 +17,6 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-# src/verify.zig 644 -> 656: the D-19 memory-leak fix. The leaking call was
-#   nested as an argument inside base64Decode(), which is exactly why it had no
-#   `defer` and leaked on every signature verified; unnesting it into a named
-#   binding costs four lines of code plus the comment recording why the shape
-#   matters. Compressing it back would restore the shape that caused the defect.
 420 src/dkim.zig
-1237 src/main.zig
+1305 src/main.zig
 656 src/verify.zig

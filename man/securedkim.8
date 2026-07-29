@@ -315,8 +315,24 @@ Single-domain signing shorthand: path to private key file.
 .El
 .Pp
 If no listener sections are defined, the default is
-.Dq inet:8891@0.0.0.0
-in verify mode.
+.Dq inet:8891@127.0.0.1
+in verify mode, loopback only.
+.Pp
+The milter protocol carries no authentication, so any client that can reach a
+listener is trusted completely.
+On a
+.Cm sign
+listener this is an unauthenticated signing oracle: the caller can have arbitrary
+mail signed under the configured domain and selector.
+On a
+.Cm verify
+listener the caller dictates the
+.Va Authentication-Results
+field this host records.
+Only the local MTA should ever connect.
+Bind a routable address only when the MTA runs on a different machine, and
+restrict access to it with
+.Xr pf 4 .
 .Ss Signing Table Format
 One entry per line:
 .Bd -literal -offset indent
