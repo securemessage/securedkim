@@ -123,6 +123,54 @@ def sign_with_bits(message, keys, *, selector, domain, canon, sign_headers, rsa_
     return sig + message
 
 
+def securedkim_sign(sign_bin, message, keys, *, selector, domain, algorithm, canon,
+                    sign_headers, use_length=False):
+    """Sign with `securedkim-sign`, so dkimpy can verify what the daemon produces.
+
+    The reverse direction, and the one nothing could test before: D-18 broke signing
+    and verification symmetrically, and while the RFC 8463 vector caught the verify
+    half, no test could hand a signature the daemon *made* to an outside verifier.
+
+    Returns the signed message bytes, or raises with stderr attached.
+    """
+    with tempfile.TemporaryDirectory(prefix="dkimdiff-sign-") as d:
+        msg_path = os.path.join(d, "m.eml")
+        with open(msg_path, "wb") as f:
+            f.write(message)
+
+        key_path = os.path.join(d, "key")
+        if algorithm == "ed25519-sha256":
+            with open(key_path, "w") as f:
+                f.write(keys.ed25519[0])
+        else:
+            with open(key_path, "wb") as f:
+                f.write(keys.rsa[2048][0])
+
+        cmd = [sign_bin, "-d", domain, "-s", selector, "-k", key_path,
+               "-a", algorithm, "-c", canon,
+               "--headers", ":".join(sign_headers),
+               # Deterministic output, so a failure reproduces byte for byte
+               # instead of depending on when it ran.
+               "--no-timestamp",
+               # Same reasoning as the verify side: the corpus is already
+               # CRLF-canonical and its bare CR octets are body data.
+               "--no-normalize"]
+        if use_length:
+            cmd.append("-l")
+        cmd.append(msg_path)
+
+        p = subprocess.run(cmd, capture_output=True, timeout=60)
+        if p.returncode != 0:
+            raise RuntimeError(
+                f"securedkim-sign exited {p.returncode}: "
+                f"{p.stderr.decode(errors='replace').strip()[:200]}")
+        if p.stderr.strip():
+            raise RuntimeError(
+                f"securedkim-sign wrote to stderr: "
+                f"{p.stderr.decode(errors='replace').strip()[:200]}")
+        return p.stdout
+
+
 def verify(signed_message, key_record, *, dns_name, minkey=1024):
     """Have dkimpy verify, resolving the key through an injected function.
 

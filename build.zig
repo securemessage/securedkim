@@ -51,6 +51,29 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(check_exe);
 
+    // securedkim-sign: sign a message file with the daemon's own signing path and
+    // write the signed message to stdout.
+    //
+    // The counterpart to securedkim-check, and the reason it exists is D-18: that
+    // defect was two-way, and while the RFC 8463 vector caught the verify half,
+    // nothing could look at a signature the daemon PRODUCED. A round-trip test
+    // agrees with a symmetric mistake, so the signing half was undetectable until
+    // an outside verifier could be handed our output.
+    const sign_cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/sign_cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "securemilter", .module = securemilter_mod },
+            .{ .name = "securemilter_crypto", .module = crypto_mod },
+        },
+    });
+    const sign_cli_exe = b.addExecutable(.{
+        .name = "securedkim-sign",
+        .root_module = sign_cli_mod,
+    });
+    b.installArtifact(sign_cli_exe);
+
     // securedkim-genkey CLI tool (only needs securemilter_crypto)
     const genkey_mod = b.createModule(.{
         .root_source_file = b.path("src/genkey.zig"),

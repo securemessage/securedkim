@@ -1,24 +1,28 @@
-# DKIM differential suite — dkimpy signs, both implementations must agree
+# DKIM differential suite — tested against dkimpy in both directions
 
-dkimpy signs a matrix of messages, then dkimpy and `securedkim` must reach the
-same verdict on each. **The first run found three real defects**, two of them
-canonicalization bugs that would have rejected legitimate mail.
+**Forward:** dkimpy signs, and dkimpy and `securedkim` must reach the same verdict.
+**Reverse:** `securedkim` signs, and dkimpy must accept it.
 
-Current result: **156 agree, 2 known limitations, 0 disagreements.**
+**The first run found three real defects**, two of them canonicalization bugs that
+would have rejected legitimate mail.
+
+Current result: **201 agree, 3 known limitations, 0 disagreements.**
 
 ```
-$ cd ../.. && zig build                          # produces securedkim-check
+$ cd ../.. && zig build              # securedkim-check and securedkim-sign
 $ python3.12 rundiff.py
 
-total=158 agree=156 known=2 disagree=0 harness=0
+total=204 agree=201 known=3 disagree=0 harness=0
 ```
 
 Needs `py312-dkimpy`. Note **python3.12**, not `python3` — the port targets 3.12
 while the system default here is 3.11. The RFC 8463 suite in `../rfc6376/` is
 stdlib-only and runs under either.
 
-Flags: `-v` lists every case, `--sweep bodies|headers|ed25519|length|keysize|tamper`,
-`--body`/`--header`/`--canon` filter, `SECUREDKIM_CHECK=` overrides the binary.
+Flags: `-v` lists every case,
+`--sweep bodies|headers|ed25519|length|keysize|tamper|reverse`,
+`--body`/`--header`/`--canon` filter, `SECUREDKIM_CHECK=` and `SECUREDKIM_SIGN=`
+override the binaries.
 
 ## Why this exists alongside the RFC 8463 suite
 
@@ -185,14 +189,47 @@ milter receives body octets verbatim over `SMFIC_BODY`. Hence the new
   inherent to asserting agreement, and it is why the positive sweeps carry the
   detection load.
 
+## The reverse direction, and why it is not optional
+
+The forward sweep tests our **verify** path against an independent signer. That
+leaves the other half of every signing defect untested, and D-18 was exactly such a
+defect: Ed25519 signing and verification were broken *symmetrically*, so they
+round-tripped perfectly and only an outside party could tell.
+
+`securedkim-sign` closes it — the counterpart to `securedkim-check`, driving the
+same `sign.signMessage` the milter uses. The reverse sweep signs 46 messages with it
+and requires dkimpy to accept each one (and to reject the tampered ones).
+
+**The measurement that justifies it.** Reverting *only* D-18's signing half, leaving
+verification correct:
+
+| sweep | result |
+|---|---|
+| reverse | **4 disagreements** — every Ed25519 row |
+| forward `ed25519` | **16/16 agree — completely blind** |
+
+So the reverse direction detects a class of defect that nothing else in this
+repository can see: 204 differential cases, 17 RFC vectors and 388 unit tests all
+pass while every signature the daemon emits is rejected by the rest of the internet.
+
+Like `securedkim-check`, it **deliberately reproduces the milter's lossy view of
+headers** — parsing the file and then rebuilding each field as `name + ": " + value`
+— because a tool that signed the pristine file bytes would produce signatures the
+daemon cannot produce, and would hide defects rather than expose them. `D-23` shows
+up in this direction too, for the same reason and on the same case.
+
+The reverse sweep is deliberately smaller than the forward one. Signing shares the
+same canonicalizer, so re-running the full cross product would mostly re-test what
+the forward sweep covers; what is unique here is signature and header assembly, so
+the axes kept are the ones that change those — both algorithms across all four
+canonicalizations, the bodies D-21 and D-22 broke, folding and oversigning and
+absent fields in `h=`, `l=`, and tampering.
+
 ## Not yet done
 
-**The reverse direction: `securedkim` signs, dkimpy verifies.** This suite only
-tests our *verify* path against an independent signer. D-18 was a two-way defect —
-our signing half was equally broken — and nothing here would have caught that half.
-It needs a signing entry point equivalent to `securedkim-check`; `sign.signMessage`
-is already public, so the work is a CLI wrapper. This is the same gap `securearc`
-has with the ValiMail signing half.
+**The ValiMail signing half for `securearc`** remains unwired; it needs the same
+treatment this commit gave DKIM — a sealing entry point equivalent to
+`securearc-check`.
 
 ## Provenance
 

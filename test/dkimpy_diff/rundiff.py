@@ -44,6 +44,7 @@ import corpus                        # noqa: E402
 import oracle                        # noqa: E402
 
 DEFAULT_CHECK = os.path.join(HERE, "..", "..", "zig-out", "bin", "securedkim-check")
+DEFAULT_SIGN = os.path.join(HERE, "..", "..", "zig-out", "bin", "securedkim-sign")
 DEFAULT_PORT = 5364
 
 DOMAIN = "example.com"
@@ -86,6 +87,59 @@ def securedkim_verify(check_bin, signed, key_record, port, min_key_bits=None):
     if p.returncode != 0:
         return "error", f"exit {p.returncode}: {stderr[:200]}", stderr
     return out.get("sig.0.result", "none"), out.get("sig.0.reason", ""), stderr
+
+
+def run_reverse_case(case, keys, sign_bin):
+    """securedkim signs, dkimpy verifies. Returns (outcome, detail).
+
+    The direction the suite could not test until `securedkim-sign` existed, and the
+    one that matters for D-18's other half: a signature the daemon produces is only
+    known to be correct once something that is not the daemon accepts it.
+
+    There is no self-check control to run here -- the whole assertion IS an
+    independent verifier's verdict. A signing failure is reported as HARNESS only
+    when `securedkim-sign` could not produce output at all, since that is a tooling
+    fault rather than a disagreement about a signature.
+    """
+    message, sign_headers = corpus.build_message(case["body"], case["header"])
+
+    try:
+        signed = oracle.securedkim_sign(
+            sign_bin, message, keys, selector=SELECTOR, domain=DOMAIN,
+            algorithm=case["algorithm"], canon=case["canon"],
+            sign_headers=sign_headers, use_length=case.get("use_length", False))
+    except Exception as e:
+        return "HARNESS", f"securedkim-sign failed: {e}"
+
+    if not signed.strip():
+        return "HARNESS", "securedkim-sign produced no output"
+
+    if case.get("tamper"):
+        old, new = case["tamper"]
+        if signed.count(old) < 1:
+            return "HARNESS", f"tamper target absent: {old[:40]!r}"
+        signed = signed.replace(old, new, 1)
+
+    key_record = keys.key_record(case["algorithm"], 2048)
+    dkimpy_ok = oracle.verify(signed, key_record, dns_name=DNS_NAME)
+
+    # Tampered messages must be rejected; untampered ones must be accepted.
+    want_ok = not case.get("tamper")
+
+    known = known_limitation(case)
+    if known and dkimpy_ok != want_ok:
+        return "KNOWN", (f"dkimpy={'pass' if dkimpy_ok else 'fail'} on our signature "
+                         f"-- {known}")
+
+    if dkimpy_ok == want_ok:
+        return "AGREE", ("dkimpy accepted our signature" if want_ok
+                         else "dkimpy rejected our tampered signature")
+
+    if want_ok:
+        return "DISAGREE", ("dkimpy REJECTED a signature securedkim produced -- "
+                            "the signing path disagrees with an independent verifier")
+    return "DISAGREE", ("dkimpy ACCEPTED a tampered message signed by securedkim -- "
+                        "investigate before assuming it is dkimpy's fault")
 
 
 def run_case(case, keys, check_bin, port):
@@ -188,6 +242,65 @@ def known_limitation(case):
     return None
 
 
+def build_reverse_cases():
+    """The reverse sweep: securedkim signs, dkimpy verifies.
+
+    Deliberately smaller than the forward sweep. The forward direction crosses every
+    body against every canonicalization because canonicalization is where the verify
+    path has repeatedly gone wrong. Signing shares that same canonicalizer, so
+    re-running the full cross product here would mostly re-test code the forward
+    sweep already covers. What is unique to this direction is the *signature and
+    header assembly* -- algorithm handling, the h= list, l=, and the b=/bh= encoding
+    -- so the axes kept are the ones that change those.
+    """
+    cases = []
+
+    def add(**kw):
+        kw.setdefault("algorithm", "rsa-sha256")
+        kw.setdefault("header", "plain")
+        kw.setdefault("body", "plain")
+        name_bits = ["rev", kw["body"], kw["header"],
+                     kw["canon"].replace("/", "-"), kw["algorithm"].split("-")[0]]
+        if kw.get("use_length"):
+            name_bits.append("l")
+        if kw.get("tamper"):
+            name_bits.append("tampered")
+        cases.append({"sweep": "reverse", "name": ".".join(name_bits), **kw})
+
+    # Both algorithms across all four canonicalizations. This is the D-18 grid: had
+    # it existed, the signing half would have failed on every ed25519 row.
+    for canon in CANONS:
+        for algorithm in ("rsa-sha256", "ed25519-sha256"):
+            add(canon=canon, algorithm=algorithm)
+
+    # Bodies that stress the canonicalizer from the signing side, including the two
+    # that D-21 and D-22 broke.
+    for body in ("trailing_wsp", "internal_wsp_runs", "empty", "only_crlf",
+                 "bare_cr", "no_final_crlf", "utf8", "long_line"):
+        for canon in ("simple/simple", "relaxed/relaxed"):
+            add(body=body, canon=canon)
+
+    # Header assembly: folding, oversigning and an absent field are all things the
+    # signer has to render into h= correctly, and a verifier will notice if not.
+    for header in ("folded", "folded_with_tabs", "mixed_case_name", "oversigned",
+                   "signed_absent_header", "duplicate_instances", "empty_value"):
+        for canon in ("simple/simple", "relaxed/relaxed"):
+            add(header=header, canon=canon)
+
+    for canon in CANONS:
+        add(canon=canon, use_length=True, body="blank_lines_in_middle")
+
+    # Tamper: dkimpy must reject a modified message we signed. Without these the
+    # reverse sweep could be satisfied by a signature that verifies against
+    # anything.
+    for canon in ("simple/simple", "relaxed/relaxed"):
+        add(canon=canon, tamper=(b"This is a plain body.", b"This is a plaan body."))
+        add(canon=canon, tamper=(b"Subject: Differential test message",
+                                 b"Subject: tampered"))
+
+    return cases
+
+
 def build_cases():
     """The sweeps. Each varies one axis so a failure localises immediately."""
     cases = []
@@ -254,12 +367,16 @@ def build_cases():
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("-v", "--verbose", action="store_true")
-    ap.add_argument("--sweep", help="one sweep: bodies, headers, ed25519, length, keysize, tamper")
+    ap.add_argument("--sweep",
+                    help="one sweep: bodies, headers, ed25519, length, keysize, "
+                         "tamper, reverse")
     ap.add_argument("--body", help="filter by body key")
     ap.add_argument("--header", help="filter by header key")
     ap.add_argument("--canon", help="filter by canonicalization, e.g. relaxed/relaxed")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--check", default=os.environ.get("SECUREDKIM_CHECK", DEFAULT_CHECK))
+    ap.add_argument("--sign", default=os.environ.get("SECUREDKIM_SIGN", DEFAULT_SIGN),
+                    help="path to securedkim-sign, used by the reverse sweep")
     args = ap.parse_args()
 
     check_bin = os.path.abspath(args.check)
@@ -268,7 +385,13 @@ def main():
               f"Build it first:  cd ../.. && zig build", file=sys.stderr)
         return 2
 
-    cases = build_cases()
+    sign_bin = os.path.abspath(args.sign)
+    if not os.path.isfile(sign_bin):
+        print(f"securedkim-sign not found at {sign_bin}\n"
+              f"Build it first:  cd ../.. && zig build", file=sys.stderr)
+        return 2
+
+    cases = build_cases() + build_reverse_cases()
     if args.sweep:
         cases = [c for c in cases if c["sweep"] == args.sweep]
     if args.body:
@@ -290,7 +413,10 @@ def main():
 
     with oracle.Keys() as keys:
         for case in cases:
-            outcome, detail = run_case(case, keys, check_bin, args.port)
+            if case["sweep"] == "reverse":
+                outcome, detail = run_reverse_case(case, keys, sign_bin)
+            else:
+                outcome, detail = run_case(case, keys, check_bin, args.port)
             if outcome == "AGREE":
                 agree += 1
                 if args.verbose:
