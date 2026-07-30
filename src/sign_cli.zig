@@ -29,6 +29,8 @@ const posix = std.posix;
 const process = std.process;
 const Allocator = mem.Allocator;
 
+const securemilter = @import("securemilter");
+const cli = securemilter.cli.Tool("securedkim-sign");
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
 const canon = securemilter_crypto.canon;
@@ -70,20 +72,6 @@ const Usage =
     \\
 ;
 
-fn writeOut(data: []const u8) void {
-    const stdout = posix.STDOUT_FILENO;
-    var written: usize = 0;
-    while (written < data.len) {
-        written += posix.write(stdout, data[written..]) catch return;
-    }
-}
-
-fn fatal(comptime msg: []const u8) noreturn {
-    const stderr = posix.STDERR_FILENO;
-    _ = posix.write(stderr, "securedkim-sign: " ++ msg ++ "\n") catch {};
-    process.exit(1);
-}
-
 const Args = struct {
     file: ?[]const u8 = null,
     domain: ?[]const u8 = null,
@@ -105,24 +93,24 @@ fn parseArgs(allocator: Allocator) !Args {
 
     while (it.next()) |arg| {
         if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
-            writeOut(Usage);
+            cli.out(Usage);
             process.exit(0);
         } else if (mem.eql(u8, arg, "-d")) {
-            result.domain = try allocator.dupe(u8, it.next() orelse fatal("-d needs a value"));
+            result.domain = try allocator.dupe(u8, it.next() orelse cli.fatal("-d needs a value"));
         } else if (mem.eql(u8, arg, "-s")) {
-            result.selector = try allocator.dupe(u8, it.next() orelse fatal("-s needs a value"));
+            result.selector = try allocator.dupe(u8, it.next() orelse cli.fatal("-s needs a value"));
         } else if (mem.eql(u8, arg, "-k")) {
-            result.key_file = try allocator.dupe(u8, it.next() orelse fatal("-k needs a value"));
+            result.key_file = try allocator.dupe(u8, it.next() orelse cli.fatal("-k needs a value"));
         } else if (mem.eql(u8, arg, "-a")) {
-            const raw = it.next() orelse fatal("-a needs a value");
-            result.algorithm = dkim.Algorithm.parse(raw) catch fatal("unknown algorithm");
+            const raw = it.next() orelse cli.fatal("-a needs a value");
+            result.algorithm = dkim.Algorithm.parse(raw) catch cli.fatal("unknown algorithm");
         } else if (mem.eql(u8, arg, "-c")) {
-            const raw = it.next() orelse fatal("-c needs a value");
+            const raw = it.next() orelse cli.fatal("-c needs a value");
             result.canonicalization = canon.parseCanonicalization(raw) catch
-                fatal("unknown canonicalization");
+                cli.fatal("unknown canonicalization");
         } else if (mem.eql(u8, arg, "--headers")) {
             result.signed_headers = try allocator.dupe(u8, it.next() orelse
-                fatal("--headers needs a value"));
+                cli.fatal("--headers needs a value"));
         } else if (mem.eql(u8, arg, "-l")) {
             result.include_length = true;
         } else if (mem.eql(u8, arg, "--no-timestamp")) {
@@ -130,16 +118,16 @@ fn parseArgs(allocator: Allocator) !Args {
         } else if (mem.eql(u8, arg, "--no-normalize")) {
             result.normalize_eol = false;
         } else if (arg.len > 0 and arg[0] == '-') {
-            fatal("unknown option (see --help)");
+            cli.fatal("unknown option (see --help)");
         } else {
             result.file = try allocator.dupe(u8, arg);
         }
     }
 
-    if (result.file == null) fatal("a message file is required (see --help)");
-    if (result.domain == null) fatal("-d <domain> is required");
-    if (result.selector == null) fatal("-s <selector> is required");
-    if (result.key_file == null) fatal("-k <keyfile> is required");
+    if (result.file == null) cli.fatal("a message file is required (see --help)");
+    if (result.domain == null) cli.fatal("-d <domain> is required");
+    if (result.selector == null) cli.fatal("-s <selector> is required");
+    if (result.key_file == null) cli.fatal("-k <keyfile> is required");
     return result;
 }
 
@@ -242,18 +230,18 @@ fn appendField(
 fn loadKey(allocator: Allocator, path: []const u8, algorithm: dkim.Algorithm) !crypto.SigningKey {
     switch (algorithm) {
         .rsa_sha256 => return crypto.loadRsaKeyFile(path, crypto.RFC8301_MIN_RSA_BITS) catch
-            fatal("could not load the RSA private key"),
+            cli.fatal("could not load the RSA private key"),
         .ed25519_sha256 => {
             const raw = std.fs.cwd().readFileAlloc(allocator, path, MAX_KEY_BYTES) catch
-                fatal("could not read the key file");
+                cli.fatal("could not read the key file");
             defer allocator.free(raw);
 
             const trimmed = mem.trim(u8, raw, " \t\r\n");
             const decoded = crypto.base64Decode(allocator, trimmed) catch
-                fatal("Ed25519 key file is not valid base64");
+                cli.fatal("Ed25519 key file is not valid base64");
             defer allocator.free(decoded);
 
-            if (decoded.len != 32) fatal("an Ed25519 seed must be exactly 32 bytes");
+            if (decoded.len != 32) cli.fatal("an Ed25519 seed must be exactly 32 bytes");
             var seed: [32]u8 = undefined;
             @memcpy(&seed, decoded[0..32]);
             return crypto.loadEd25519Seed(seed);
@@ -274,11 +262,11 @@ pub fn main() !void {
     const args = try parseArgs(arg_arena.allocator());
 
     const raw = std.fs.cwd().readFileAlloc(allocator, args.file.?, MAX_MESSAGE_BYTES) catch
-        fatal("could not read the message file");
+        cli.fatal("could not read the message file");
     defer allocator.free(raw);
 
     var msg = parseMessage(allocator, raw, args.normalize_eol) catch
-        fatal("could not parse the message");
+        cli.fatal("could not parse the message");
     defer msg.deinit();
 
     var key = try loadKey(allocator, args.key_file.?, args.algorithm);
@@ -293,8 +281,8 @@ pub fn main() !void {
     // canonicalization is done once here and its length is what l= reports.
     var bc = canon.BodyCanonicalizer.init(allocator, args.canonicalization.body);
     defer bc.deinit();
-    bc.update(msg.body) catch fatal("body canonicalization failed");
-    const canonical_body = bc.finish() catch fatal("body canonicalization failed");
+    bc.update(msg.body) catch cli.fatal("body canonicalization failed");
+    const canonical_body = bc.finish() catch cli.fatal("body canonicalization failed");
     defer allocator.free(canonical_body);
 
     const params = sign.SigningParams{
@@ -313,15 +301,15 @@ pub fn main() !void {
         &key,
         msg.headers,
         crypto.sha256(canonical_body),
-    ) catch fatal("signing failed");
+    ) catch cli.fatal("signing failed");
     defer result.deinit();
 
     // The signed message: our DKIM-Signature, then the original file unchanged.
     // The original is emitted rather than the reconstruction, because the point is
     // to produce something another implementation can verify -- and a verifier
     // reading the file must see the message it was signed over.
-    writeOut(result.header);
-    writeOut("\r\n");
-    writeOut(if (args.normalize_eol) toCrlf(msg.arena.allocator(), raw) catch
-        fatal("out of memory") else raw);
+    cli.out(result.header);
+    cli.out("\r\n");
+    cli.out(if (args.normalize_eol) toCrlf(msg.arena.allocator(), raw) catch
+        cli.fatal("out of memory") else raw);
 }

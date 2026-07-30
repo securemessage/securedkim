@@ -4,18 +4,11 @@ const posix = std.posix;
 const process = std.process;
 
 const securemilter = @import("securemilter");
+const cli = securemilter.cli.Tool("securedkim-testkey");
 const dns_mod = securemilter.dns;
 
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
-
-fn writeOut(data: []const u8) void {
-    _ = posix.write(posix.STDOUT_FILENO, data) catch {};
-}
-
-fn writeErr(data: []const u8) void {
-    _ = posix.write(posix.STDERR_FILENO, data) catch {};
-}
 
 const Usage =
     \\Usage: securedkim-testkey [options]
@@ -46,24 +39,24 @@ pub fn main() !void {
 
     while (args.next()) |arg| {
         if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
-            writeOut(Usage);
+            cli.out(Usage);
             return;
         } else if (mem.eql(u8, arg, "-s")) {
-            selector = args.next() orelse return fatal("missing argument for -s");
+            selector = args.next() orelse return cli.fatal("missing argument for -s");
         } else if (mem.eql(u8, arg, "-d")) {
-            domain = args.next() orelse return fatal("missing argument for -d");
+            domain = args.next() orelse return cli.fatal("missing argument for -d");
         } else if (mem.eql(u8, arg, "-k")) {
-            keyfile = args.next() orelse return fatal("missing argument for -k");
+            keyfile = args.next() orelse return cli.fatal("missing argument for -k");
         } else if (mem.eql(u8, arg, "-n")) {
-            nameserver = args.next() orelse return fatal("missing argument for -n");
+            nameserver = args.next() orelse return cli.fatal("missing argument for -n");
         } else {
-            return fatal("unknown option (use -h for help)");
+            return cli.fatal("unknown option (use -h for help)");
         }
     }
 
-    const sel = selector orelse return fatal("-s <selector> is required");
-    const dom = domain orelse return fatal("-d <domain> is required");
-    const kf = keyfile orelse return fatal("-k <keyfile> is required");
+    const sel = selector orelse return cli.fatal("-s <selector> is required");
+    const dom = domain orelse return cli.fatal("-d <domain> is required");
+    const kf = keyfile orelse return cli.fatal("-k <keyfile> is required");
 
     // Build DNS query name
     const qname = try std.fmt.allocPrint(allocator, "{s}._domainkey.{s}", .{ sel, dom });
@@ -82,8 +75,8 @@ pub fn main() !void {
     var dns_result = resolver.resolve(qname, .TXT) catch {
         const msg = try std.fmt.allocPrint(allocator, "DNS lookup failed for {s}\n", .{qname});
         defer allocator.free(msg);
-        writeErr(msg);
-        return fatal("cannot resolve DNS TXT record");
+        cli.err(msg);
+        return cli.fatal("cannot resolve DNS TXT record");
     };
     defer dns_result.deinit();
 
@@ -107,13 +100,13 @@ pub fn main() !void {
     const dns_pub = pubkey_b64 orelse {
         const msg = try std.fmt.allocPrint(allocator, "No DKIM key record found at {s}\n", .{qname});
         defer allocator.free(msg);
-        writeErr(msg);
-        return fatal("key record not found or revoked (empty p=)");
+        cli.err(msg);
+        return cli.fatal("key record not found or revoked (empty p=)");
     };
 
     // Load local private key and extract its public key
     const local_pub_b64 = extractPublicKey(allocator, kf, key_type) catch {
-        return fatal("failed to load or parse private key file");
+        return cli.fatal("failed to load or parse private key file");
     };
     defer allocator.free(local_pub_b64);
 
@@ -124,12 +117,12 @@ pub fn main() !void {
         \\
     , .{ sel, dom, key_type });
     defer allocator.free(out_header);
-    writeOut(out_header);
+    cli.out(out_header);
 
     if (mem.eql(u8, dns_pub, local_pub_b64)) {
-        writeOut("  result: PASS — DNS public key matches local private key\n");
+        cli.out("  result: PASS — DNS public key matches local private key\n");
     } else {
-        writeErr("  result: FAIL — DNS public key does NOT match local private key\n");
+        cli.err("  result: FAIL — DNS public key does NOT match local private key\n");
         process.exit(1);
     }
 }
@@ -223,11 +216,4 @@ fn findTag(header_value: []const u8, tag_name: []const u8) ?[]const u8 {
         rest = if (semi_pos) |sp| rest[value_start + sp + 1 ..] else "";
     }
     return null;
-}
-
-fn fatal(msg: []const u8) noreturn {
-    writeErr("error: ");
-    writeErr(msg);
-    writeErr("\n");
-    process.exit(1);
 }

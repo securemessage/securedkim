@@ -7,12 +7,28 @@ const process = std.process;
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
 
+// These three are a deliberate copy of `securemilter.cli`, which this tool cannot
+// import: its build.zig takes only `securemilter_crypto`, and pulling in the whole
+// milter library to share three functions is a worse trade than the duplication.
+// Keep them in step with securemilter-lib/src/cli.zig.
+
+/// Write all of `data`, looping because a short write is legal.
+///
+/// This ignored the byte count until 2026-07-29, as seven of the nine tools did.
+/// `write(2)` may transfer fewer bytes than requested and report how many, so
+/// discarding that silently truncates output.
 fn writeOut(data: []const u8) void {
-    _ = posix.write(posix.STDOUT_FILENO, data) catch {};
+    var written: usize = 0;
+    while (written < data.len) {
+        written += posix.write(posix.STDOUT_FILENO, data[written..]) catch return;
+    }
 }
 
 fn writeErr(data: []const u8) void {
-    _ = posix.write(posix.STDERR_FILENO, data) catch {};
+    var written: usize = 0;
+    while (written < data.len) {
+        written += posix.write(posix.STDERR_FILENO, data[written..]) catch return;
+    }
 }
 
 const c = @cImport({
@@ -195,9 +211,12 @@ fn generateEd25519(
     writeOut(output);
 }
 
+/// Matches `securemilter.cli.Tool("securedkim-genkey").fatal`: the tool's own name
+/// as the prefix rather than a bare "error: ", and `EXIT_FATAL` = 2 so every tool in
+/// the suite reports a fatal error with the same status.
 fn fatal(msg: []const u8) noreturn {
-    writeErr("error: ");
+    writeErr("securedkim-genkey: ");
     writeErr(msg);
     writeErr("\n");
-    process.exit(1);
+    process.exit(2);
 }

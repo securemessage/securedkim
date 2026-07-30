@@ -30,25 +30,11 @@ const process = std.process;
 const Allocator = mem.Allocator;
 
 const securemilter = @import("securemilter");
+const cli = securemilter.cli.Tool("securedkim-check");
 const dns_mod = securemilter.dns;
 const crypto = @import("securemilter_crypto").crypto;
 
 const verify = @import("verify.zig");
-
-fn writeOut(data: []const u8) void {
-    _ = posix.write(posix.STDOUT_FILENO, data) catch {};
-}
-
-fn writeErr(data: []const u8) void {
-    _ = posix.write(posix.STDERR_FILENO, data) catch {};
-}
-
-fn fatal(msg: []const u8) noreturn {
-    writeErr("securedkim-check: ");
-    writeErr(msg);
-    writeErr("\n");
-    process.exit(2);
-}
 
 const Usage =
     \\Usage: securedkim-check [options] <message-file>
@@ -226,38 +212,38 @@ fn parseArgs(allocator: Allocator) !Args {
 
     while (it.next()) |arg| {
         if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
-            writeOut(Usage);
+            cli.out(Usage);
             process.exit(0);
         } else if (mem.eql(u8, arg, "-f")) {
-            result.file = try allocator.dupe(u8, it.next() orelse fatal("-f needs a value"));
+            result.file = try allocator.dupe(u8, it.next() orelse cli.fatal("-f needs a value"));
         } else if (mem.eql(u8, arg, "-n")) {
-            result.nameserver = try allocator.dupe(u8, it.next() orelse fatal("-n needs a value"));
+            result.nameserver = try allocator.dupe(u8, it.next() orelse cli.fatal("-n needs a value"));
         } else if (mem.eql(u8, arg, "-p")) {
-            const raw = it.next() orelse fatal("-p needs a value");
-            result.port = std.fmt.parseInt(u16, raw, 10) catch fatal("invalid port");
+            const raw = it.next() orelse cli.fatal("-p needs a value");
+            result.port = std.fmt.parseInt(u16, raw, 10) catch cli.fatal("invalid port");
         } else if (mem.eql(u8, arg, "-b")) {
-            const raw = it.next() orelse fatal("-b needs a value");
-            result.min_key_bits = std.fmt.parseInt(u32, raw, 10) catch fatal("invalid bits");
+            const raw = it.next() orelse cli.fatal("-b needs a value");
+            result.min_key_bits = std.fmt.parseInt(u32, raw, 10) catch cli.fatal("invalid bits");
         } else if (mem.eql(u8, arg, "--refuse-l")) {
             result.body_length_policy = .refuse;
         } else if (mem.eql(u8, arg, "--no-normalize")) {
             result.normalize_eol = false;
         } else if (arg.len > 0 and arg[0] == '-') {
-            fatal("unknown option");
+            cli.fatal("unknown option");
         } else {
             result.file = try allocator.dupe(u8, arg);
         }
     }
 
-    if (result.file == null) fatal("a message file is required (see -h)");
+    if (result.file == null) cli.fatal("a message file is required (see -h)");
     return result;
 }
 
 fn emit(key: []const u8, value: []const u8) void {
-    writeOut(key);
-    writeOut("=");
-    writeOut(value);
-    writeOut("\n");
+    cli.out(key);
+    cli.out("=");
+    cli.out(value);
+    cli.out("\n");
 }
 
 /// `sig.<n>.<field>=<value>`, built without an allocator so a reporting failure
@@ -283,11 +269,11 @@ pub fn main() !void {
     const args = try parseArgs(arg_arena.allocator());
 
     const raw = std.fs.cwd().readFileAlloc(allocator, args.file.?, MAX_MESSAGE_BYTES) catch
-        fatal("could not read the message file");
+        cli.fatal("could not read the message file");
     defer allocator.free(raw);
 
     var msg = parseMessage(allocator, raw, args.normalize_eol) catch
-        fatal("could not parse the message");
+        cli.fatal("could not parse the message");
     defer msg.deinit();
 
     // Same floor reconciliation the daemon performs, so a conformance run cannot
