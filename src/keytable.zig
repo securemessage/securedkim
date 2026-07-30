@@ -69,17 +69,35 @@ pub const KeyTable = struct {
 
     /// Find all key entries for a given signing-entry name.
     /// Returns a slice of matching entries (may be multiple for multi-sign).
+    ///
+    /// Returns the run of ADJACENT matching rows. `parseKeyTable` groups rows by
+    /// signing entry precisely so that run is all of them — but this does not
+    /// assume it did, because the cost of being wrong is asymmetric. Every element
+    /// returned has been compared, so a table grouped by nobody yields too FEW
+    /// keys, never one belonging to somebody else (D-7).
+    ///
+    /// The previous version took the index of the first match and the count of all
+    /// matches and returned that many rows from there, which is only correct when
+    /// the matches are contiguous. Given
+    ///
+    ///     example.com  example.com:rsa:/k/rsa
+    ///     other.org    other.org:sel:/k/other
+    ///     example.com  example.com:ed:/k/ed
+    ///
+    /// it returned example.com's first key followed by **other.org's** — one
+    /// domain's signing key offered under another's name — and silently dropped
+    /// the row that was actually asked for.
     pub fn lookup(self: *const KeyTable, signing_entry: []const u8) []const KeyTableEntry {
-        var start: ?usize = null;
-        var count: usize = 0;
-        for (self.entries, 0..) |entry, i| {
-            if (mem.eql(u8, entry.signing_entry, signing_entry)) {
-                if (start == null) start = i;
-                count += 1;
-            }
-        }
-        if (start) |s| return self.entries[s .. s + count];
-        return &.{};
+        const first = for (self.entries, 0..) |entry, i| {
+            if (mem.eql(u8, entry.signing_entry, signing_entry)) break i;
+        } else return &.{};
+
+        var end = first + 1;
+        while (end < self.entries.len and
+            mem.eql(u8, self.entries[end].signing_entry, signing_entry)) : (end += 1)
+        {}
+
+        return self.entries[first..end];
     }
 };
 
@@ -159,10 +177,51 @@ pub fn parseKeyTable(allocator: Allocator, content: []const u8) !KeyTable {
         });
     }
 
+    const owned = try entries.toOwnedSlice(allocator);
+    groupBySigningEntry(owned);
+
     return .{
-        .entries = try entries.toOwnedSlice(allocator),
+        .entries = owned,
         .allocator = allocator,
     };
+}
+
+/// Bring rows sharing a signing entry together, preserving file order.
+///
+/// This is what makes `lookup` COMPLETE. A hand-maintained table accumulates
+/// appends and edits, so rows for one signing entry drift apart; grouping them
+/// once here costs a parse rather than a lookup, and the lookup runs per message.
+///
+/// **Stable on purpose.** Multi-sign emits one signature per row, so the order
+/// within a group decides which signature is added first. Reordering rows that
+/// share an entry would silently change the output of a table nobody edited.
+///
+/// The comparison MUST match `lookup`'s. If grouping said two rows were the same
+/// entry and the lookup disagreed, grouping would scatter rows the lookup then
+/// could not find — the defect back again by a longer route.
+///
+/// Quadratic in the number of rows, which is affordable exactly once per load:
+/// `MAX_TABLE_BYTES` caps a table at 1 MiB, and this runs at startup and on
+/// SIGHUP, never on the message path.
+fn groupBySigningEntry(items: []KeyTableEntry) void {
+    var group_start: usize = 0;
+    while (group_start < items.len) {
+        var insert = group_start + 1;
+        var j = insert;
+        while (j < items.len) : (j += 1) {
+            if (!mem.eql(u8, items[j].signing_entry, items[group_start].signing_entry)) continue;
+            if (j != insert) {
+                // Shift the run right rather than swapping: a swap would drag an
+                // unrelated row backwards past its own group and lose file order.
+                const moved = items[j];
+                var k = j;
+                while (k > insert) : (k -= 1) items[k] = items[k - 1];
+                items[insert] = moved;
+            }
+            insert += 1;
+        }
+        group_start = insert;
+    }
 }
 
 // =============================================================================
@@ -283,6 +342,75 @@ test "key table lookup multi-sign" {
 
     const none = table.lookup("missing.com");
     try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+// --- D-7: rows for one signing entry need not be adjacent ---------------------
+//
+// The test above only ever asked the easy question. Its rows are grouped, which is
+// what a freshly written table looks like and not what one looks like after six
+// months of edits and appends -- and grouping was exactly the unstated assumption
+// the lookup was built on. Same shape as D-15/D-16, where the suite only ever asked
+// the daemon to verify its own signatures.
+
+test "D-7: rows for one signing entry are found with another entry between them" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\example.com  example.com:rsa2026:/keys/rsa.key
+        \\other.org    other.org:sel:/keys/other.key
+        \\example.com  example.com:ed2026:/keys/ed.key
+    ;
+
+    var table = try parseKeyTable(allocator, content);
+    defer table.deinit();
+
+    const results = table.lookup("example.com");
+
+    // Soundness first, because it is the worse half. The old lookup took the index
+    // of the FIRST match and the count of ALL matches and returned that many rows
+    // from there -- so this returned example.com's first key and then other.org's,
+    // which is a different domain's signing key handed out under our name.
+    for (results) |r| try std.testing.expectEqualStrings("example.com", r.signing_entry);
+
+    // Completeness, and in file order: multi-sign order decides which signature is
+    // added first, so it is part of the answer rather than an implementation detail.
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("rsa2026", results[0].selector);
+    try std.testing.expectEqualStrings("ed2026", results[1].selector);
+}
+
+test "D-7: a trailing row is not dropped" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\other.org    other.org:s0:/keys/o0.key
+        \\example.com  example.com:s1:/keys/e1.key
+        \\other.org    other.org:s2:/keys/o2.key
+    ;
+
+    var table = try parseKeyTable(allocator, content);
+    defer table.deinit();
+
+    const results = table.lookup("other.org");
+    for (results) |r| try std.testing.expectEqualStrings("other.org", r.signing_entry);
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("s0", results[0].selector);
+    try std.testing.expectEqualStrings("s2", results[1].selector);
+}
+
+test "D-7: lookup is sound on a table the parser did not build" {
+    // Built by hand, deliberately ungrouped. The parser groups rows now, which is
+    // what makes the lookup COMPLETE -- but a lookup that hands out another
+    // domain's key whenever that invariant is not upheld is one refactor away from
+    // the original defect. Soundness must not depend on who built the table.
+    var raw = [_]KeyTableEntry{
+        .{ .signing_entry = "a", .domain = "a.example", .selector = "s1", .key_path = "/k/a1" },
+        .{ .signing_entry = "b", .domain = "b.example", .selector = "s2", .key_path = "/k/b" },
+        .{ .signing_entry = "a", .domain = "a.example", .selector = "s3", .key_path = "/k/a2" },
+    };
+    // Not deinit'd: the strings are literals, nothing was allocated.
+    const table = KeyTable{ .entries = &raw, .allocator = std.testing.allocator };
+
+    for (table.lookup("a")) |e| try std.testing.expectEqualStrings("a", e.signing_entry);
+    for (table.lookup("b")) |e| try std.testing.expectEqualStrings("b", e.signing_entry);
 }
 
 test "pattern matching wildcard local" {
