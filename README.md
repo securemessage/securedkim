@@ -90,7 +90,7 @@ securedkim -c /usr/local/etc/securedkim/securedkim.conf
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `Socket` | — | `inet:port@host` or `unix:/path` |
+| `Socket` | — | `inet:port@ip` or `unix:/path`. The IP must be numeric (no DNS). An unparseable value is a fatal startup error, never ignored. |
 | `Mode` | `verify` | `sign`, `verify`, or `both` |
 | `SigningTable` | *(none)* | Path to signing table (multi-domain) |
 | `KeyTable` | *(none)* | Path to key table (multi-domain) |

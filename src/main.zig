@@ -271,8 +271,9 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
     for (cfg.section_order.items) |section_name| {
         if (mem.startsWith(u8, section_name, "listener:")) {
             const section = cfg.getSection(section_name) orelse continue;
-            const socket_str = section.get("Socket") orelse continue;
-            const addr = listener_mod.ListenAddress.parse(socket_str) catch continue;
+
+            // X-14: a malformed or missing Socket is refused, not skipped.
+            const addr = try listener_mod.parseListenerSocket(section_name, section.get("Socket"));
             try addrs.append(allocator, addr);
 
             // Appended in lockstep with `addrs`, so the index the worker
@@ -1074,6 +1075,63 @@ fn freeTestConfig(dkim_cfg: DkimConfig) void {
     std.testing.allocator.free(dkim_cfg.listen_addresses);
     std.testing.allocator.free(dkim_cfg.modes);
     std.testing.allocator.free(dkim_cfg.dns_nameservers);
+}
+
+// X-14. A malformed Socket must be refused rather than skipped. Safe through
+// `parseForTest` despite its borrowing caveat above, because the failure path
+// returns no config to read from.
+test "a malformed listener Socket is refused, not replaced by the default" {
+    try std.testing.expectError(error.InvalidListenerSocket, parseForTest(
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\
+        \\[listener:typo]
+        \\Socket = inet6:8891@::1
+        \\Mode = verify
+    ));
+}
+
+test "a hostname in Socket is refused at config time" {
+    try std.testing.expectError(error.InvalidListenerSocket, parseForTest(
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\
+        \\[listener:main]
+        \\Socket = inet:8891@localhost
+    ));
+}
+
+test "a listener section with no Socket is refused" {
+    try std.testing.expectError(error.MissingListenerSocket, parseForTest(
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\
+        \\[listener:empty]
+        \\Mode = verify
+    ));
+}
+
+// The worst consequence of the silent skip, and the reason this is not merely
+// tidiness. `[global] Mode` is a documented way to supply the default for a
+// listener that names none, so on a signing instance it is `sign`. A typo in the
+// *only* listener's Socket emptied the address list, the loopback fallback fired,
+// and the fallback takes `default_mode` -- so a listener written as `verify` came
+// up in `sign` mode. That is an unauthenticated signing oracle reachable by any
+// local process, assembled entirely out of one mistyped character.
+//
+// X-13's note beside that fallback asks for a wide bind to be "written down
+// deliberately, not inherited from an omitted config section". A typo made the
+// section omitted, which is the case it did not consider.
+test "a typo cannot silently invert a verify listener into a signing one" {
+    try std.testing.expectError(error.InvalidListenerSocket, parseForTest(
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\Mode = sign
+        \\
+        \\[listener:verify]
+        \\Socket = inet6:8891@::1
+        \\Mode = verify
+    ));
 }
 
 // The implicit listener binds loopback, never 0.0.0.0.
