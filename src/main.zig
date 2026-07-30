@@ -28,6 +28,9 @@ pub const dkim = @import("dkim.zig");
 pub const verify = @import("verify.zig");
 pub const sign_mod = @import("sign.zig");
 pub const keytable = @import("keytable.zig");
+pub const signing = @import("signing.zig");
+
+var g_signing: signing.Rcu = undefined;
 
 /// Parse a `Mode` value from a config section.
 ///
@@ -147,135 +150,7 @@ fn getPublisher() *zmq.Publisher {
     }
     return &tl_publisher.?;
 }
-/// Everything a message needs in order to sign, published as one unit.
-///
-/// Bundling these is not tidiness. Reloading the table and the key as separate
-/// atomic swaps lets a message resolve a domain out of the new SigningTable
-/// and then sign it with the previous key. One pointer means a message sees
-/// either the whole of the old configuration or the whole of the new one.
-///
-/// Previously these were three module globals replaced by value on SIGHUP
-/// while workers held pointers into them — a torn read, and the old contents
-/// (including the EVP_PKEY) were never freed (audit X-2).
-const SigningAssets = struct {
-    signing_table: ?keytable.SigningTable = null,
-    key_table: ?keytable.KeyTable = null,
-    sign_key: ?crypto.SigningKey = null,
-};
 
-const SigningRcu = rcu_mod.Rcu(SigningAssets);
-var g_signing: SigningRcu = undefined;
-
-fn freeSigningAssets(allocator: Allocator, assets: *SigningAssets) void {
-    if (assets.signing_table) |*st| st.deinit();
-    if (assets.key_table) |*kt| kt.deinit();
-    if (assets.sign_key) |*k| k.deinit();
-    allocator.destroy(assets);
-}
-
-/// Largest SigningTable/KeyTable we will read.
-const MAX_TABLE_BYTES: usize = 1024 * 1024;
-
-fn loadSigningTable(allocator: Allocator, path: []const u8) !keytable.SigningTable {
-    // parseSigningTable copies what it keeps, so the file buffer is ours to
-    // free. It previously was not freed, leaking the whole file on every read.
-    const content = try std.fs.cwd().readFileAlloc(allocator, path, MAX_TABLE_BYTES);
-    defer allocator.free(content);
-    return keytable.parseSigningTable(allocator, content);
-}
-
-fn loadKeyTable(allocator: Allocator, path: []const u8) !keytable.KeyTable {
-    const content = try std.fs.cwd().readFileAlloc(allocator, path, MAX_TABLE_BYTES);
-    defer allocator.free(content);
-    return keytable.parseKeyTable(allocator, content);
-}
-
-/// Build a complete set of signing assets from a parsed config.
-///
-/// All or nothing: if any piece fails to load the caller keeps the previous
-/// set, rather than running on a half-updated mixture.
-fn buildSigningAssets(allocator: Allocator, cfg: *const DkimConfig) !*SigningAssets {
-    const assets = try allocator.create(SigningAssets);
-    assets.* = .{};
-    errdefer freeSigningAssets(allocator, assets);
-
-    if (cfg.signing_table_path) |path| assets.signing_table = try loadSigningTable(allocator, path);
-    if (cfg.key_table_path) |path| assets.key_table = try loadKeyTable(allocator, path);
-
-    // D-24: table-based signing has to be able to actually sign.
-    //
-    // Every one of these was previously a config that started cleanly and then
-    // silently declined to sign, because parameters were resolved from the
-    // KeyTable while the key came from somewhere else entirely. A refusal here
-    // costs a restart; the silence cost unsigned outbound mail with nothing in
-    // the log to say so. On SIGHUP an error is free — `buildSigningAssets` is
-    // all-or-nothing, so the running daemon keeps the table it already had.
-    if (assets.signing_table != null and assets.key_table == null) {
-        log.err("SigningTable is set without a KeyTable: nothing can be signed through it", .{});
-        return error.SigningTableWithoutKeyTable;
-    }
-    if (assets.key_table != null and assets.signing_table == null) {
-        log.err("KeyTable is set without a SigningTable: the key table can never be consulted", .{});
-        return error.KeyTableWithoutSigningTable;
-    }
-
-    if (assets.key_table) |*kt| {
-        var failed_path: []const u8 = "";
-        kt.loadKeys(crypto.RFC8301_MIN_RSA_BITS, &failed_path) catch |err| {
-            if (err == error.RsaKeyTooSmall) {
-                log.err(
-                    "KeyTable key {s} is below the RFC 8301 minimum of {d} bits: refusing to sign with it",
-                    .{ failed_path, crypto.RFC8301_MIN_RSA_BITS },
-                );
-            } else {
-                log.err("KeyTable key {s} could not be loaded: {}", .{ failed_path, err });
-            }
-            return err;
-        };
-        log.info("loaded {d} KeyTable signing key(s)", .{kt.entries.len});
-
-        // A SigningTable row naming an entry the KeyTable does not define is
-        // the same silent hole one level up: the sender matches, the lookup
-        // finds nothing, and the message goes out unsigned. Catch it while
-        // somebody is watching the config, not per message in the dark.
-        if (assets.signing_table) |*st| {
-            for (st.entries) |entry| {
-                if (kt.lookup(entry.signing_entry).len == 0) {
-                    log.err(
-                        "SigningTable pattern {s} maps to signing entry {s}, which the KeyTable does not define",
-                        .{ entry.pattern, entry.signing_entry },
-                    );
-                    return error.SigningEntryHasNoKey;
-                }
-            }
-        }
-    }
-    // The signing key is held to the RFC 8301 floor, not to the operator's
-    // MinimumKeyBits. That option is a policy about keys *other people* publish;
-    // coupling our own key to it would mean tightening the verify policy could
-    // stop the daemon starting, which is a surprise nobody asked for. The floor
-    // itself is not optional: RFC 8301 §3.2 says signers MUST use at least 1024
-    // bits, and mail signed below it fails DKIM at every conformant verifier.
-    if (cfg.sign_key_file) |path| {
-        var key = crypto.loadRsaKeyFile(path, crypto.RFC8301_MIN_RSA_BITS) catch |err| {
-            if (err == error.RsaKeyTooSmall) {
-                log.err(
-                    "signing key {s} is below the RFC 8301 minimum of {d} bits: refusing to sign with it",
-                    .{ path, crypto.RFC8301_MIN_RSA_BITS },
-                );
-            }
-            return err;
-        };
-        log.info("loaded {d}-bit signing key from {s}", .{ crypto.signingKeyBits(&key), path });
-        assets.sign_key = key;
-    }
-
-    return assets;
-}
-
-var g_sign_domain: ?[]const u8 = null;
-var g_sign_selector: ?[]const u8 = null;
-var g_signed_headers: []const u8 = "from:to:subject:date:message-id";
 var g_strip_policy: header_scrub.StripPolicy = .{ .own_methods = &.{"dkim"} };
 
 /// Smallest RSA modulus accepted from a signer's DNS key record.
@@ -495,7 +370,6 @@ fn runDaemon() !void {
     };
 
     g_modes = dkim_cfg.modes;
-    g_signed_headers = dkim_cfg.signed_headers;
     g_zmq_endpoint = dkim_cfg.zmq_endpoint;
     g_zmq_topic = dkim_cfg.zmq_topic;
     g_strip_policy = .{ .own_methods = &.{"dkim"}, .strip_all = dkim_cfg.strip_auth_results };
@@ -513,21 +387,28 @@ fn runDaemon() !void {
     }
 
     // Load signing config as one publishable unit.
-    g_signing = SigningRcu.init(allocator, freeSigningAssets);
-    const initial_assets = buildSigningAssets(allocator, &dkim_cfg) catch |err| {
+    // Shorthand before the assets: `build` validates the table config, and a
+    // failure there should report against the configuration actually in force.
+    signing.setShorthand(.{
+        .domain = dkim_cfg.sign_domain,
+        .selector = dkim_cfg.sign_selector,
+        .signed_headers = dkim_cfg.signed_headers,
+    });
+
+    g_signing = signing.Rcu.init(allocator, signing.free);
+    const initial_assets = signing.build(allocator, .{
+        .signing_table = dkim_cfg.signing_table_path,
+        .key_table = dkim_cfg.key_table_path,
+        .key_file = dkim_cfg.sign_key_file,
+    }) catch |err| {
         log.err("failed to load signing configuration: {}", .{err});
         return err;
     };
     g_signing.publish(&g_config_gen, initial_assets) catch |err| {
-        freeSigningAssets(allocator, initial_assets);
+        signing.free(allocator, initial_assets);
         log.err("failed to publish signing configuration: {}", .{err});
         return err;
     };
-
-    // Single-domain shorthand. These point into `cfg`, which lives for the
-    // whole process, and are not reloadable.
-    g_sign_domain = dkim_cfg.sign_domain;
-    g_sign_selector = dkim_cfg.sign_selector;
 
     // Daemonize, block signals, start the monitor thread, claim the PID file, raise the
     // fd budget, drop privileges — in that order, for reasons recorded once in
@@ -840,7 +721,7 @@ fn doSign(conn: *connection_mod.Connection) u8 {
     const assets = g_signing.get() orelse return @intFromEnum(responses.Code.@"continue");
 
     // How to sign, and what with — resolved together so they cannot disagree.
-    const choice = resolveSigning(assets, domain, mail_from) orelse
+    const choice = signing.resolve(assets, domain, mail_from) orelse
         return @intFromEnum(responses.Code.@"continue");
     const sign_params = choice.params;
     const sign_key = choice.key;
@@ -945,73 +826,6 @@ fn publishEvent(
     getPublisher().publish(json);
 }
 
-/// What to sign a message as, and the key to do it with.
-///
-/// One type, because they are one decision. D-24 was two functions answering
-/// half the question each with nothing holding them together: parameters came
-/// from the `KeyTable` while the key came from the single-domain `KeyFile`, so a
-/// host with both configured signed `d=b.example` using a.example's key —
-/// measured, and caught by key size rather than by anything the daemon said.
-const SigningChoice = struct {
-    params: sign_mod.SigningParams,
-    /// Borrowed from `assets`, valid for the rest of this message (see
-    /// securemilter `rcu.zig`).
-    key: *const crypto.SigningKey,
-};
-
-/// Resolve how to sign this message against one snapshot of the signing assets.
-///
-/// The snapshot is passed in rather than re-read here so that the table
-/// consulted and the key used come from the same published configuration.
-///
-/// **Every branch yields the parameters and the key together or yields
-/// nothing.** That is the invariant D-24 lacked, and it is structural now rather
-/// than a rule somebody has to remember: there is no way to return a `d=` this
-/// function cannot also hand over the matching key for.
-fn resolveSigning(
-    assets: *const SigningAssets,
-    domain: []const u8,
-    sender: []const u8,
-) ?SigningChoice {
-    // Single-domain shorthand: d=/s= from config, key from KeyFile.
-    if (g_sign_domain) |d| {
-        if (std.ascii.eqlIgnoreCase(d, domain)) {
-            const key = if (assets.sign_key) |*k| k else return null;
-            return .{
-                .params = .{
-                    .domain = d,
-                    .selector = g_sign_selector orelse "default",
-                    .signed_headers = g_signed_headers,
-                },
-                .key = key,
-            };
-        }
-    }
-
-    // SigningTable + KeyTable: d=/s= and the key all come off the same row.
-    //
-    // The first row with a usable key wins. Multi-sign — a signature per row —
-    // is still not implemented, but the single signature now carries the key
-    // belonging to the row that named the domain.
-    if (assets.signing_table) |*st| {
-        const entry_name = st.lookup(sender) orelse return null;
-        const kt = if (assets.key_table) |*t| t else return null;
-        for (kt.lookup(entry_name)) |*row| {
-            const key = if (row.key) |*k| k else continue;
-            return .{
-                .params = .{
-                    .domain = row.domain,
-                    .selector = row.selector,
-                    .signed_headers = g_signed_headers,
-                },
-                .key = key,
-            };
-        }
-    }
-
-    return null;
-}
-
 fn addArHeader(
     conn: *connection_mod.Connection,
     method: []const u8,
@@ -1095,7 +909,11 @@ fn reloadConfig() void {
         g_allocator.free(dkim_cfg.dns_nameservers);
     }
 
-    const assets = buildSigningAssets(g_allocator, &dkim_cfg) catch |err| {
+    const assets = signing.build(g_allocator, .{
+        .signing_table = dkim_cfg.signing_table_path,
+        .key_table = dkim_cfg.key_table_path,
+        .key_file = dkim_cfg.sign_key_file,
+    }) catch |err| {
         log.warn("reload: failed to load signing configuration ({}), keeping previous", .{err});
         _ = g_config_gen.increment();
         return;
@@ -1104,7 +922,7 @@ fn reloadConfig() void {
     g_signing.publish(&g_config_gen, assets) catch |err| {
         // publish reserves its retire slot before swapping, so on failure the
         // previous snapshot is still the live one.
-        freeSigningAssets(g_allocator, assets);
+        signing.free(g_allocator, assets);
         log.warn("reload: failed to publish signing configuration ({}), keeping previous", .{err});
         _ = g_config_gen.increment();
         return;
@@ -1136,6 +954,7 @@ test {
     _ = verify;
     _ = sign_mod;
     _ = keytable;
+    _ = signing;
 }
 
 test "strip angle brackets" {
@@ -1146,126 +965,6 @@ test "strip angle brackets" {
 test "get sending domain" {
     try std.testing.expectEqualStrings("example.com", getSendingDomain("user@example.com").?);
     try std.testing.expect(getSendingDomain("postmaster") == null);
-}
-
-// --- D-24: the d= and the key must come off the same row ----------------------
-//
-// These need to tell two keys apart, not use them, and `resolveSigning` never
-// dereferences the key it returns -- so the keys here are distinguishable
-// sentinels rather than real ones. That keeps the test about resolution, which
-// is where the defect was, and off OpenSSL entirely.
-//
-// The tables are built by hand and never deinit'd: every string is a literal
-// and no key holds an EVP_PKEY, so there is nothing to free.
-
-const D24_SHORTHAND_SEED: [32]u8 = @splat(0xAA);
-const D24_TABLE_SEED: [32]u8 = @splat(0xBB);
-
-fn d24Key(seed: [32]u8) crypto.SigningKey {
-    return .{ .algorithm = .ed25519_sha256, .ed25519_seed = seed };
-}
-
-test "D-24: a sender matched by the KeyTable is signed with that row's key" {
-    const saved_domain = g_sign_domain;
-    const saved_selector = g_sign_selector;
-    defer {
-        g_sign_domain = saved_domain;
-        g_sign_selector = saved_selector;
-    }
-    // Shorthand configured for a.example, table for b.example. This is the
-    // migration-shaped config that produced d=b.example signed with a's key.
-    g_sign_domain = "a.example";
-    g_sign_selector = "sela";
-
-    var st_rows = [_]keytable.SigningTableEntry{
-        .{ .pattern = "*@b.example", .signing_entry = "b.example" },
-    };
-    var kt_rows = [_]keytable.KeyTableEntry{
-        .{
-            .signing_entry = "b.example",
-            .domain = "b.example",
-            .selector = "selb",
-            .key_path = "/k/b",
-            .key = d24Key(D24_TABLE_SEED),
-        },
-    };
-    const assets = SigningAssets{
-        .signing_table = .{ .entries = &st_rows, .allocator = std.testing.allocator },
-        .key_table = .{ .entries = &kt_rows, .allocator = std.testing.allocator },
-        .sign_key = d24Key(D24_SHORTHAND_SEED),
-    };
-
-    const choice = resolveSigning(&assets, "b.example", "user@b.example").?;
-    try std.testing.expectEqualStrings("b.example", choice.params.domain);
-    try std.testing.expectEqualStrings("selb", choice.params.selector);
-    // The half that was broken: the right d= with the wrong key still fails at
-    // every verifier, and nothing in the header would show it.
-    try std.testing.expectEqual(D24_TABLE_SEED, choice.key.ed25519_seed.?);
-}
-
-test "D-24: a KeyTable-only config resolves a key instead of declining" {
-    const saved_domain = g_sign_domain;
-    defer g_sign_domain = saved_domain;
-    g_sign_domain = null; // no shorthand at all -- the sample's multi-domain stanza
-
-    var st_rows = [_]keytable.SigningTableEntry{
-        .{ .pattern = "*@b.example", .signing_entry = "b.example" },
-    };
-    var kt_rows = [_]keytable.KeyTableEntry{
-        .{
-            .signing_entry = "b.example",
-            .domain = "b.example",
-            .selector = "selb",
-            .key_path = "/k/b",
-            .key = d24Key(D24_TABLE_SEED),
-        },
-    };
-    const assets = SigningAssets{
-        .signing_table = .{ .entries = &st_rows, .allocator = std.testing.allocator },
-        .key_table = .{ .entries = &kt_rows, .allocator = std.testing.allocator },
-        .sign_key = null,
-    };
-
-    // Previously null, which the caller turned into a silent `continue`: the
-    // documented multi-domain configuration signed nothing and logged nothing.
-    const choice = resolveSigning(&assets, "b.example", "user@b.example").?;
-    try std.testing.expectEqualStrings("b.example", choice.params.domain);
-    try std.testing.expectEqual(D24_TABLE_SEED, choice.key.ed25519_seed.?);
-}
-
-test "D-24: a keyless row declines rather than borrowing the shorthand key" {
-    const saved_domain = g_sign_domain;
-    const saved_selector = g_sign_selector;
-    defer {
-        g_sign_domain = saved_domain;
-        g_sign_selector = saved_selector;
-    }
-    g_sign_domain = "a.example";
-    g_sign_selector = "sela";
-
-    var st_rows = [_]keytable.SigningTableEntry{
-        .{ .pattern = "*@b.example", .signing_entry = "b.example" },
-    };
-    // Key loading now fails the whole config load, so this state should be
-    // unreachable in production. The invariant is asserted anyway: declining is
-    // survivable, signing b.example with a.example's key is not, and the next
-    // person to add a lazy-loading path should find that written down as a test.
-    var kt_rows = [_]keytable.KeyTableEntry{
-        .{
-            .signing_entry = "b.example",
-            .domain = "b.example",
-            .selector = "selb",
-            .key_path = "/k/b",
-            .key = null,
-        },
-    };
-    const assets = SigningAssets{
-        .signing_table = .{ .entries = &st_rows, .allocator = std.testing.allocator },
-        .key_table = .{ .entries = &kt_rows, .allocator = std.testing.allocator },
-        .sign_key = d24Key(D24_SHORTHAND_SEED),
-    };
-
-    try std.testing.expect(resolveSigning(&assets, "b.example", "user@b.example") == null);
 }
 
 // `parseDkimConfig` had no tests at all, which is why A-2 survived here after

@@ -123,6 +123,14 @@
 #   cohesive unit and moves to src/signing.zig next, taking main.zig back UNDER 1065.
 #   That is the number to hit; if the next commit does not hit it, this note is the
 #   evidence the debt was taken and not repaid.
+#
+#   PAID, same day, next commit: 1163 -> 964, against the 1065 promised. src/signing.zig
+#   is 355 lines and so does not join this list at all. `resolve` and the three
+#   shorthand globals went with the loaders rather than staying behind, because the
+#   module is only cohesive if it holds all three of what the assets ARE, how they are
+#   validated, and which one applies to a message -- D-24 WAS the third drifting from
+#   the other two. The 1163 ceiling above is left in place as the record of what was
+#   borrowed; the generated list below is the truth about what is owed now.
 
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
@@ -136,5 +144,5 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-1163 src/main.zig
+964 src/main.zig
 443 src/verify.zig
