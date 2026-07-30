@@ -43,6 +43,11 @@
 #   parser extracted into its own settings.zig the way securearc has it -- an
 #   architectural change, and the only one that would actually reduce anything.
 #
+# WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
+#
+# From here down is regenerated whenever a ceiling moves. A comment
+# above that line is preserved; one below it is reported and then lost.
+#
 # Files currently over the 400-line goal, with the ceiling each
 # may not exceed. Ceilings tighten by themselves as files shrink; a
 # file that reaches the goal drops off this list entirely.
@@ -50,9 +55,5 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-#
-# WHY A CEILING EXISTS BELONGS ABOVE THIS HEADER. Comments there are
-# preserved when the list is rewritten; this header and the entries
-# under it are regenerated every time a ceiling moves.
 1056 src/main.zig
 443 src/verify.zig
