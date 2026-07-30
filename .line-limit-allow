@@ -54,5 +54,5 @@
 # WHY A CEILING EXISTS BELONGS ABOVE THIS HEADER. Comments there are
 # preserved when the list is rewritten; this header and the entries
 # under it are regenerated every time a ceiling moves.
-1117 src/main.zig
+1098 src/main.zig
 462 src/verify.zig
