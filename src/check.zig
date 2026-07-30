@@ -196,10 +196,6 @@ fn toCrlf(a: Allocator, raw: []const u8) ![]const u8 {
     return out.toOwnedSlice(a);
 }
 
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(a, b);
-}
-
 const Args = struct {
     file: ?[]const u8 = null,
     nameserver: []const u8 = "127.0.0.1",
@@ -329,7 +325,7 @@ pub fn main() !void {
     // example message carries two independent signatures and states each must
     // stand alone; an overall verdict would let one mask the other.
     for (msg.headers) |hdr| {
-        if (!eqlIgnoreCase(hdr.name, "DKIM-Signature")) continue;
+        if (!std.ascii.eqlIgnoreCase(hdr.name, "DKIM-Signature")) continue;
 
         const sig_header_raw = try std.fmt.allocPrint(allocator, "DKIM-Signature: {s}", .{hdr.value});
         defer allocator.free(sig_header_raw);

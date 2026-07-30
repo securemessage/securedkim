@@ -317,7 +317,7 @@ fn signsFrom(signed_headers: []const u8) bool {
     var iter = mem.splitScalar(u8, signed_headers, ':');
     while (iter.next()) |field| {
         const trimmed = mem.trim(u8, field, " \t\r\n");
-        if (eqlIgnoreCase(trimmed, "from")) return true;
+        if (std.ascii.eqlIgnoreCase(trimmed, "from")) return true;
     }
     return false;
 }
@@ -391,20 +391,6 @@ fn findHeader(headers: []const []const u8, field_name: []const u8) ?[]const u8 {
         0,
     ) orelse return null;
     return headers[idx];
-}
-
-/// Case-insensitive string comparison.
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (toLower(ca) != toLower(cb)) return false;
-    }
-    return true;
-}
-
-fn toLower(c: u8) u8 {
-    if (c >= 'A' and c <= 'Z') return c + 32;
-    return c;
 }
 
 /// Perform the actual cryptographic verification.
@@ -649,8 +635,8 @@ test "is expired" {
 }
 
 test "eql ignore case" {
-    try std.testing.expect(eqlIgnoreCase("From", "from"));
-    try std.testing.expect(eqlIgnoreCase("SUBJECT", "Subject"));
-    try std.testing.expect(!eqlIgnoreCase("From", "To"));
-    try std.testing.expect(!eqlIgnoreCase("ab", "abc"));
+    try std.testing.expect(std.ascii.eqlIgnoreCase("From", "from"));
+    try std.testing.expect(std.ascii.eqlIgnoreCase("SUBJECT", "Subject"));
+    try std.testing.expect(!std.ascii.eqlIgnoreCase("From", "To"));
+    try std.testing.expect(!std.ascii.eqlIgnoreCase("ab", "abc"));
 }

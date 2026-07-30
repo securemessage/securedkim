@@ -176,7 +176,7 @@ pub fn parseKeyTable(allocator: Allocator, content: []const u8) !KeyTable {
 ///   - Wildcard subdomain: "*@*.domain.com"
 fn matchPattern(pattern: []const u8, sender: []const u8) bool {
     // Exact match first
-    if (eqlIgnoreCase(pattern, sender)) return true;
+    if (std.ascii.eqlIgnoreCase(pattern, sender)) return true;
 
     // Split pattern and sender at @
     const pat_at = mem.indexOfScalar(u8, pattern, '@') orelse return false;
@@ -189,7 +189,7 @@ fn matchPattern(pattern: []const u8, sender: []const u8) bool {
 
     // Check local-part: * matches any, otherwise must match exactly
     if (!mem.eql(u8, pat_local, "*")) {
-        if (!eqlIgnoreCase(pat_local, snd_local)) return false;
+        if (!std.ascii.eqlIgnoreCase(pat_local, snd_local)) return false;
     }
 
     // Check domain: may have leading *. for subdomain wildcard
@@ -198,27 +198,14 @@ fn matchPattern(pattern: []const u8, sender: []const u8) bool {
         // Sender domain must end with this suffix
         if (snd_domain.len > suffix.len) {
             const snd_suffix = snd_domain[snd_domain.len - suffix.len ..];
-            return eqlIgnoreCase(snd_suffix, suffix);
+            return std.ascii.eqlIgnoreCase(snd_suffix, suffix);
         }
         // Or exact match on the base domain (without the dot prefix)
-        return eqlIgnoreCase(snd_domain, pat_domain[2..]);
+        return std.ascii.eqlIgnoreCase(snd_domain, pat_domain[2..]);
     }
 
     // Exact domain match
-    return eqlIgnoreCase(pat_domain, snd_domain);
-}
-
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (toLower(ca) != toLower(cb)) return false;
-    }
-    return true;
-}
-
-fn toLower(c: u8) u8 {
-    if (c >= 'A' and c <= 'Z') return c + 32;
-    return c;
+    return std.ascii.eqlIgnoreCase(pat_domain, snd_domain);
 }
 
 // =============================================================================

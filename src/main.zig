@@ -722,7 +722,7 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
     // Find DKIM-Signature headers and verify each
     var found_any = false;
     for (conn.headers.items) |hdr| {
-        if (!eqlIgnoreCase(hdr.name, "DKIM-Signature")) continue;
+        if (!std.ascii.eqlIgnoreCase(hdr.name, "DKIM-Signature")) continue;
         found_any = true;
 
         const sig_header_raw = std.fmt.allocPrint(conn.allocator, "DKIM-Signature: {s}", .{hdr.value}) catch continue;
@@ -926,7 +926,7 @@ fn resolveSigningParams(
 ) ?sign_mod.SigningParams {
     // Single-domain shorthand
     if (g_sign_domain) |d| {
-        if (eqlIgnoreCase(d, domain)) {
+        if (std.ascii.eqlIgnoreCase(d, domain)) {
             return .{
                 .domain = d,
                 .selector = g_sign_selector orelse "default",
@@ -1009,19 +1009,6 @@ fn getSendingDomain(sender: []const u8) ?[]const u8 {
         return sender[at + 1 ..];
     }
     return null;
-}
-
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (toLower(ca) != toLower(cb)) return false;
-    }
-    return true;
-}
-
-fn toLower(c: u8) u8 {
-    if (c >= 'A' and c <= 'Z') return c + 32;
-    return c;
 }
 
 // =============================================================================
