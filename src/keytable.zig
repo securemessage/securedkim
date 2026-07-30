@@ -3,6 +3,8 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 
 const dkim = @import("dkim.zig");
+const securemilter_crypto = @import("securemilter_crypto");
+const crypto = securemilter_crypto.crypto;
 
 /// A SigningTable entry: maps a sender pattern to a signing-entry name.
 ///
@@ -25,6 +27,15 @@ pub const KeyTableEntry = struct {
     domain: []const u8,
     selector: []const u8,
     key_path: []const u8,
+
+    /// The key at `key_path`, loaded by `loadKeys` once the table is parsed.
+    ///
+    /// It lives on the row rather than in a parallel array beside the table
+    /// (D-24). A parallel array would have to stay index-aligned with
+    /// `entries`, and D-7 was precisely a lookup that assumed an alignment
+    /// nobody enforced. Here the row that supplies `d=` and `s=` carries the
+    /// key that signs them, so the two cannot be paired wrongly.
+    key: ?crypto.SigningKey = null,
 };
 
 /// Loaded SigningTable.
@@ -58,13 +69,35 @@ pub const KeyTable = struct {
     allocator: Allocator,
 
     pub fn deinit(self: *KeyTable) void {
-        for (self.entries) |entry| {
+        for (self.entries) |*entry| {
             self.allocator.free(entry.signing_entry);
             self.allocator.free(entry.domain);
             self.allocator.free(entry.selector);
             self.allocator.free(entry.key_path);
+            if (entry.key) |*k| k.deinit();
         }
         self.allocator.free(self.entries);
+    }
+
+    /// Load the key named by every row, holding each to `min_bits`.
+    ///
+    /// **Every row or none.** A row whose key will not load is a row that would
+    /// silently stop signing a domain, which is the whole of D-24 — so it fails
+    /// the load and names the file. That has no availability cost on reload:
+    /// `buildSigningAssets` is all-or-nothing, so a failed SIGHUP keeps the
+    /// previous working table rather than applying a half-broken one. At startup
+    /// it is the difference between refusing to run and running unsigned.
+    ///
+    /// The caller reports the error; this returns the offending path through
+    /// `failed_path` so the message can name it.
+    pub fn loadKeys(self: *KeyTable, min_bits: u32, failed_path: *[]const u8) !void {
+        for (self.entries) |*entry| {
+            if (entry.key != null) continue;
+            entry.key = crypto.loadRsaKeyFile(entry.key_path, min_bits) catch |err| {
+                failed_path.* = entry.key_path;
+                return err;
+            };
+        }
     }
 
     /// Find all key entries for a given signing-entry name.

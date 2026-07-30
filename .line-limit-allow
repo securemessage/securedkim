@@ -91,6 +91,39 @@
 #   NOT PAID DOWN HERE ON PURPOSE, same as the X-16(b) note above: these files are the
 #   roadmap's settings.zig extraction target and should be cut there, not nibbled here.
 
+# 2026-07-30, D-24: main.zig 1065 -> 1163, RAISED AND BEING PAID BACK IMMEDIATELY.
+#
+#   Unlike the X-16 notes above, +98 is not noise and is not being deferred to the
+#   settings.zig extraction. It is paid down in the very next commit.
+#
+#   +98, not the +66 this note first claimed, and the difference is worth stating
+#   rather than quietly editing the number: +66 was the validation, then +15 came
+#   from freeing the three parseDkimConfig slices on the way out (a startup failure
+#   used to print its reason followed by three GPA "leaked" lines, which is how a
+#   reader learns to ignore leak output) and +17 from the D-24 test helpers, which
+#   sit outside test blocks and so count -- the same honest overhead the 2026-07-29
+#   note above measured at ~47 lines.
+#
+#   What was added: table-based signing previously resolved d=/s= from the KeyTable
+#   while the key came from the single-domain KeyFile, with nothing making the two
+#   agree. Measured in the lab: a host with both configured emitted d=b.example
+#   signed with a.example's key -- caught by SIGNATURE LENGTH (344 base64 chars, a
+#   2048-bit key, where b.example's 3072-bit key would give 512), because the daemon
+#   said nothing that would have revealed it. A table-ONLY config, which is the
+#   stanza the shipped sample advertises, signed nothing at all and logged nothing.
+#
+#   The +66 is the config-time validation that makes those states unreachable:
+#   loading every KeyTable row's key against the RFC 8301 floor, and refusing a
+#   SigningTable without a KeyTable, a KeyTable without a SigningTable, or a signing
+#   entry the KeyTable does not define. It is bulk because each refusal names what is
+#   wrong -- which is the entire point, the old behaviour being silence.
+#
+#   OBLIGATION: the signing-asset lifecycle (MAX_TABLE_BYTES, loadSigningTable,
+#   loadKeyTable, buildSigningAssets, freeSigningAssets and this validation) is one
+#   cohesive unit and moves to src/signing.zig next, taking main.zig back UNDER 1065.
+#   That is the number to hit; if the next commit does not hit it, this note is the
+#   evidence the debt was taken and not repaid.
+
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -103,5 +136,5 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-1065 src/main.zig
+1163 src/main.zig
 443 src/verify.zig
