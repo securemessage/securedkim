@@ -4,6 +4,7 @@ const Allocator = mem.Allocator;
 
 const securemilter_crypto = @import("securemilter_crypto");
 const canon = securemilter_crypto.canon;
+const sig_header = securemilter_crypto.sig_header;
 
 /// DKIM signing algorithm (RFC 6376 §3.3, RFC 8463).
 pub const Algorithm = enum {
@@ -79,6 +80,18 @@ pub const Signature = struct {
 /// Whitespace around tags and values is ignored.
 /// FWS within base64 values (b=, bh=) is stripped.
 pub fn parseSignature(value: []const u8) !Signature {
+    // RFC 6376 §3.2, before any tag is interpreted: the grammar, plus "Tags with
+    // duplicate names MUST NOT occur within a single tag-list; if a tag name does
+    // occur more than once, the entire tag-list is invalid" (audit D-6). The loop
+    // below was last-wins, so `d=a.com; d=b.com` bound b.com here and a.com in an
+    // implementation taking the first -- two verifiers reading a different signing
+    // domain out of identical bytes, which is what the MUST exists to prevent.
+    //
+    // THE VALIDATOR ALREADY EXISTED: `securearc` has called `sig_header.validateTagList`
+    // on the AMS and AS since it landed, and only this parser was never wired to it.
+    // Same shape as X-17.
+    try sig_header.validateTagList(value);
+
     var sig = Signature{};
 
     var pairs = mem.splitScalar(u8, value, ';');
@@ -101,7 +114,14 @@ pub fn parseSignature(value: []const u8) !Signature {
         } else if (mem.eql(u8, tag, "bh")) {
             sig.body_hash = val;
         } else if (mem.eql(u8, tag, "c")) {
-            sig.canonicalization = canon.parseCanonicalization(val) catch .{};
+            // Propagated, not defaulted (audit D-14). An ABSENT `c=` still means
+            // `simple/simple`; the fallback for an UNPARSEABLE one was that same
+            // value, quietly rewriting a signature naming an algorithm we cannot
+            // perform into one we can. The hash then mismatched and the verdict was
+            // `dkim=fail` -- an accusation of forgery for something never tested.
+            // RFC 6376 §6.1.1 requires ignoring such a signature: permerror. Same
+            // correction A-5 made in `securearc`.
+            sig.canonicalization = try canon.parseCanonicalization(val);
         } else if (mem.eql(u8, tag, "d")) {
             sig.domain = val;
         } else if (mem.eql(u8, tag, "h")) {
@@ -342,6 +362,51 @@ test "parse signature missing required tag" {
 test "parse signature unsupported version" {
     const value = "v=2; a=rsa-sha256; d=example.com; s=sel; h=from; bh=x; b=y";
     try std.testing.expectError(error.UnsupportedVersion, parseSignature(value));
+}
+
+// D-6. The `d=` case is the one that matters: last-wins here and first-wins in
+// another implementation means two verifiers read a different signing domain out of
+// identical bytes, and `d=` is what DMARC aligns against.
+test "D-6: a duplicate tag invalidates the whole signature" {
+    try std.testing.expectError(error.DuplicateTagName, parseSignature(
+        "v=1; a=rsa-sha256; d=a.com; d=b.com; s=sel; h=from; bh=x; b=y",
+    ));
+
+    // Not special to `d=` -- §3.2 invalidates the tag-list whatever the tag is.
+    for ([_][]const u8{
+        "v=1; v=1; a=rsa-sha256; d=a.com; s=sel; h=from; bh=x; b=y",
+        "v=1; a=rsa-sha256; d=a.com; s=sel; s=other; h=from; bh=x; b=y",
+        "v=1; a=rsa-sha256; d=a.com; s=sel; h=from; h=from:to; bh=x; b=y",
+        "v=1; a=rsa-sha256; d=a.com; s=sel; h=from; bh=x; b=y; b=z",
+    }) |value| {
+        try std.testing.expectError(error.DuplicateTagName, parseSignature(value));
+    }
+
+    // Case-sensitively distinct, per §3.2's "Tags MUST be interpreted in a
+    // case-sensitive manner" -- `S=` is an unrecognised tag, not a second `s=`,
+    // so this is NOT a duplicate and must still parse.
+    _ = try parseSignature("v=1; a=rsa-sha256; d=a.com; s=sel; S=x; h=from; bh=x; b=y");
+}
+
+// D-14. An absent `c=` still defaults to simple/simple; it is only the UNPARSEABLE
+// one that must now propagate. Both halves asserted, because collapsing them was
+// the defect.
+test "D-14: an unparseable c= is refused, an absent one still defaults" {
+    try std.testing.expectError(error.InvalidCanonicalization, parseSignature(
+        "v=1; a=rsa-sha256; c=nonsense/nonsense; d=a.com; s=sel; h=from; bh=x; b=y",
+    ));
+
+    const absent = try parseSignature("v=1; a=rsa-sha256; d=a.com; s=sel; h=from; bh=x; b=y");
+    try std.testing.expectEqual(canon.Algorithm.simple, absent.canonicalization.header);
+    try std.testing.expectEqual(canon.Algorithm.simple, absent.canonicalization.body);
+
+    // And a `c=` we CAN perform is still honoured, so the change did not turn the
+    // whole tag into a refusal.
+    const relaxed = try parseSignature(
+        "v=1; a=rsa-sha256; c=relaxed/relaxed; d=a.com; s=sel; h=from; bh=x; b=y",
+    );
+    try std.testing.expectEqual(canon.Algorithm.relaxed, relaxed.canonicalization.header);
+    try std.testing.expectEqual(canon.Algorithm.relaxed, relaxed.canonicalization.body);
 }
 
 test "parse public key record" {

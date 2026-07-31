@@ -190,10 +190,12 @@ fn computeSignature(
         },
         .ed25519_sha256 => {
             // `data` is the canonicalized signing input; RFC 8463 §3 signs its
-            // SHA-256 digest, which `ed25519Sha256Sign` applies internally.
+            // SHA-256 digest, which `signEd25519Sha256` applies internally.
             // Until this call was corrected, every Ed25519 signature this daemon
             // produced was rejected by every conformant verifier.
-            const sig_bytes = try crypto.ed25519Sha256Sign(key.ed25519_seed.?, data);
+            //
+            // The keypair is derived once at key load, not here (audit C-2).
+            const sig_bytes = try key.signEd25519Sha256(data);
             return crypto.base64Encode(allocator, &sig_bytes);
         },
     }

@@ -19,7 +19,6 @@ const crypto = securemilter_crypto.crypto;
 const keytable = @import("keytable.zig");
 const sign_mod = @import("sign.zig");
 
-
 /// Where the signing configuration is read from.
 ///
 /// Three paths rather than the whole DkimConfig: this module is imported BY
@@ -257,8 +256,16 @@ pub fn resolve(
 const D24_SHORTHAND_SEED: [32]u8 = @splat(0xAA);
 const D24_TABLE_SEED: [32]u8 = @splat(0xBB);
 
+// Goes through `loadEd25519Seed` rather than building the struct literally: the
+// keypair is the only copy of the secret now (audit C-2), so a literal would leave
+// it null and the sentinel would be indistinguishable from an unset key.
 fn d24Key(seed: [32]u8) crypto.SigningKey {
-    return .{ .algorithm = .ed25519_sha256, .ed25519_seed = seed };
+    return crypto.loadEd25519Seed(seed) catch unreachable;
+}
+
+// Which sentinel a resolved key is, recovered from the derived keypair.
+fn d24SeedOf(key: *const crypto.SigningKey) [32]u8 {
+    return key.ed25519_key_pair.?.secret_key.seed();
 }
 
 test "D-24: a sender matched by the KeyTable is signed with that row's key" {
@@ -291,7 +298,7 @@ test "D-24: a sender matched by the KeyTable is signed with that row's key" {
     try std.testing.expectEqualStrings("selb", choice.params.selector);
     // The half that was broken: the right d= with the wrong key still fails at
     // every verifier, and nothing in the header would show it.
-    try std.testing.expectEqual(D24_TABLE_SEED, choice.key.ed25519_seed.?);
+    try std.testing.expectEqual(D24_TABLE_SEED, d24SeedOf(choice.key));
 }
 
 test "D-24: a KeyTable-only config resolves a key instead of declining" {
@@ -321,7 +328,7 @@ test "D-24: a KeyTable-only config resolves a key instead of declining" {
     // documented multi-domain configuration signed nothing and logged nothing.
     const choice = resolve(&assets, "b.example", "user@b.example").?;
     try std.testing.expectEqualStrings("b.example", choice.params.domain);
-    try std.testing.expectEqual(D24_TABLE_SEED, choice.key.ed25519_seed.?);
+    try std.testing.expectEqual(D24_TABLE_SEED, d24SeedOf(choice.key));
 }
 
 test "D-24: a keyless row declines rather than borrowing the shorthand key" {

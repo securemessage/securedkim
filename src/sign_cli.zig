@@ -239,19 +239,32 @@ fn loadKey(allocator: Allocator, path: []const u8, algorithm: dkim.Algorithm) !c
         .rsa_sha256 => return crypto.loadRsaKeyFile(path, crypto.RFC8301_MIN_RSA_BITS) catch
             cli.fatal("could not load the RSA private key"),
         .ed25519_sha256 => {
+            // Three buffers hold the private seed on the way in -- the file text,
+            // its base64 decoding, and the fixed-size copy handed to the loader --
+            // and all three were released without being wiped (audit C-1). Each
+            // gets zeroed here, in reverse order of creation.
             const raw = std.fs.cwd().readFileAlloc(allocator, path, MAX_KEY_BYTES) catch
                 cli.fatal("could not read the key file");
-            defer allocator.free(raw);
+            defer {
+                std.crypto.secureZero(u8, raw);
+                allocator.free(raw);
+            }
 
             const trimmed = mem.trim(u8, raw, " \t\r\n");
             const decoded = crypto.base64Decode(allocator, trimmed) catch
                 cli.fatal("Ed25519 key file is not valid base64");
-            defer allocator.free(decoded);
+            defer {
+                std.crypto.secureZero(u8, decoded);
+                allocator.free(decoded);
+            }
 
             if (decoded.len != 32) cli.fatal("an Ed25519 seed must be exactly 32 bytes");
             var seed: [32]u8 = undefined;
+            defer std.crypto.secureZero(u8, &seed);
             @memcpy(&seed, decoded[0..32]);
-            return crypto.loadEd25519Seed(seed);
+
+            return crypto.loadEd25519Seed(seed) catch
+                cli.fatal("the Ed25519 seed does not yield a usable key");
         },
     }
 }

@@ -158,6 +158,26 @@
 #   This file was the largest in the suite at 1008. It is not any more:
 #   securespf/src/evaluate.zig at 861 now leads.
 #
+# 2026-07-31, D-6/D-14/D-17: main.zig 777 -> 792 (+15), verify.zig 443 -> 454 (+11).
+#
+#   verify.zig: `parseSignature`'s failures were all reported as "malformed signature".
+#   They now map to their own reasons, because a duplicate tag (D-6) and a `c=` we
+#   cannot perform (D-14) have different causes and different fixes. Ten lines of
+#   switch and four of comment.
+#
+#   main.zig: the reason `verify.zig` computes for every non-pass verdict is now
+#   logged. It was computed and discarded for everything except the weak-key case, so
+#   `dkim=fail` reached the postmaster with the body-hash/signature distinction already
+#   thrown away -- the fact whose absence made diagnosing D-15 and D-16 require
+#   reimplementing the hash in Python (D-17).
+#
+#   Both comments were cut back before taking the raise; the first drafts were roughly
+#   double. main.zig is also 216 lines below where it stood this morning, since the
+#   settings.zig extraction took it from 1008 to 777 -- this gives back 15 of that.
+#
+#   NO OBLIGATION TO UNDO. Neither change created a seam; the extraction already took
+#   the one main.zig had.
+#
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -170,5 +190,5 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-777 src/main.zig
-443 src/verify.zig
+792 src/main.zig
+454 src/verify.zig

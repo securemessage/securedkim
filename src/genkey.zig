@@ -38,6 +38,54 @@ const c = @cImport({
     @cInclude("openssl/rsa.h");
 });
 
+/// RSA size RFC 8301 §3.2 recommends for signers, as distinct from the 1024-bit
+/// floor below which a verifier must reject (`crypto.RFC8301_MIN_RSA_BITS`).
+/// Between the two is legal but worth saying out loud, so this warns and the floor
+/// refuses.
+const RSA_RECOMMENDED_BITS = 2048;
+
+/// Create the private key file: mode 0600 **at creation**, and refusing to replace
+/// one that is already there (audit D-8).
+///
+/// Both halves matter and both were missing from the RSA branch. The mode has to be
+/// set by the `open` that creates the file, not by a later `chmod`, because the key
+/// is written in between and an fd opened during that window stays readable
+/// afterwards. `O_EXCL` stops a generate from silently destroying a signing key that
+/// is in use, and stops the create from following a symlink planted at a predictable
+/// output path.
+///
+/// Shared by both algorithms so the two cannot drift again -- the Ed25519 branch had
+/// the mode right and the exclusivity wrong, which is precisely how the pair of them
+/// ended up half-correct in different ways.
+fn createKeyFile(allocator: std.mem.Allocator, output_path: []const u8) fs.File {
+    return fs.cwd().createFile(output_path, .{
+        .mode = 0o600,
+        .exclusive = true,
+    }) catch |err| {
+        // Reported through `fatal` like every other operator error in this tool.
+        // Returning the error from `main` instead printed a Zig stack trace, which
+        // tells an operator who typo'd a path nothing they can act on.
+        if (err == error.PathAlreadyExists) {
+            const msg = std.fmt.allocPrint(
+                allocator,
+                "{s} already exists; refusing to replace a private key that may be in use\n",
+                .{output_path},
+            ) catch fatal("the output path already exists");
+            defer allocator.free(msg);
+            writeErr(msg);
+            fatal("refusing to overwrite an existing key");
+        }
+        const msg = std.fmt.allocPrint(
+            allocator,
+            "could not create {s}: {t}\n",
+            .{ output_path, err },
+        ) catch fatal("could not create the key file");
+        defer allocator.free(msg);
+        writeErr(msg);
+        fatal("could not create the key file");
+    };
+}
+
 const Usage =
     \\Usage: securedkim-genkey [options]
     \\
@@ -45,7 +93,7 @@ const Usage =
     \\
     \\Options:
     \\  -a <algorithm>   rsa (default) or ed25519
-    \\  -b <bits>        RSA key size: 2048 (default) or 4096
+    \\  -b <bits>        RSA key size: 2048 (default) or 4096; minimum 1024
     \\  -s <selector>    DKIM selector name (required)
     \\  -d <domain>      Domain name (required)
     \\  -o <path>        Output private key file (required)
@@ -95,6 +143,39 @@ pub fn main() !void {
     const out = output_path orelse return fatal("-o <output-path> is required");
 
     if (mem.eql(u8, algorithm, "rsa")) {
+        // Refused, not clamped (audit D-9). RFC 8301 §3.2 makes a verifier reject
+        // signatures from RSA keys below 1024 bits, so `-b 512` produced a key whose
+        // every signature fails everywhere -- mail that leaves looking signed and
+        // arrives failing DKIM, which is worse than not signing at all. Generating it
+        // silently was the defect; quietly rounding it up would be a different one,
+        // because the operator asked for something specific and would not learn that
+        // they got something else.
+        //
+        // C-3 (§11.10) already stopped the daemons LOADING such a key. This is the
+        // other end of the same rule: stop creating one.
+        if (bits < crypto.RFC8301_MIN_RSA_BITS) {
+            const msg = std.fmt.allocPrint(
+                allocator,
+                "-b {d} is below the RFC 8301 3.2 minimum of {d}; " ++
+                    "every verifier would reject signatures from this key\n",
+                .{ bits, crypto.RFC8301_MIN_RSA_BITS },
+            ) catch return fatal("RSA key size is too small");
+            defer allocator.free(msg);
+            writeErr(msg);
+            return fatal("refusing to generate an unusable key");
+        }
+        // A warning, not a refusal: 1024 is still valid per RFC 8301 and an operator
+        // may be constrained by a DNS provider's TXT size limits. 2048 is what §3.2
+        // recommends.
+        if (bits < RSA_RECOMMENDED_BITS) {
+            const msg = std.fmt.allocPrint(
+                allocator,
+                "warning: -b {d} is below the {d} bits RFC 8301 3.2 recommends\n",
+                .{ bits, RSA_RECOMMENDED_BITS },
+            ) catch return fatal("could not format warning");
+            defer allocator.free(msg);
+            writeErr(msg);
+        }
         try generateRsa(allocator, bits, sel, dom, out);
     } else if (mem.eql(u8, algorithm, "ed25519")) {
         try generateEd25519(allocator, sel, dom, out);
@@ -122,19 +203,23 @@ fn generateRsa(
     if (c.EVP_PKEY_keygen(ctx, &pkey) != 1) return error.KeygenFailed;
     defer c.EVP_PKEY_free(pkey);
 
-    // Write private key to file with restrictive permissions (0600)
-    var path_buf: [4096]u8 = undefined;
-    @memcpy(path_buf[0..output_path.len], output_path);
-    path_buf[output_path.len] = 0;
+    // Own the descriptor here and hand it to OpenSSL, rather than letting OpenSSL
+    // open the path (audit D-8). This was `BIO_new_file(path, "w")` -- an `fopen`, so
+    // the file appeared 0666 & ~umask and the key was written into it before the
+    // trailing `chmod(0600)` landed. See `createKeyFile` for the rest.
+    //
+    // It also disposes of an unchecked `@memcpy` into a 4096-byte `path_buf`: `-o`
+    // longer than that wrote past the end of it, a check `loadRsaKeyFile` has and
+    // this did not.
+    const file = createKeyFile(allocator, output_path);
+    defer file.close();
 
-    const bio_file = c.BIO_new_file(&path_buf, "w") orelse return error.FileCreateFailed;
+    // BIO_NOCLOSE: the descriptor stays owned by `file` above, so exactly one of the
+    // two closes it.
+    const bio_file = c.BIO_new_fd(file.handle, c.BIO_NOCLOSE) orelse return error.FileCreateFailed;
     defer _ = c.BIO_free(bio_file);
     if (c.PEM_write_bio_PrivateKey(bio_file, pkey, null, null, 0, null, null) != 1)
         return error.KeyWriteFailed;
-
-    // Restrict permissions: private key must not be world/group-readable
-    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
-    _ = std.c.chmod(path_z, 0o600);
 
     // Extract public key in DER format for DNS record
     var der_len: c_int = 0;
@@ -173,8 +258,10 @@ fn generateEd25519(
     // Generate Ed25519 keypair using Zig std.crypto
     const Ed25519 = std.crypto.sign.Ed25519;
 
-    // Random seed
+    // Random seed. Wiped on the way out along with its base64 form: this is the
+    // private key, and both buffers outlived their use unzeroed (audit C-1).
     var seed: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &seed);
     std.crypto.random.bytes(&seed);
 
     const kp = try Ed25519.KeyPair.generateDeterministic(seed);
@@ -182,18 +269,24 @@ fn generateEd25519(
     // Write seed as raw 32 bytes in PEM-like format
     // OpenDKIM convention: base64-encoded seed in a PEM wrapper
     const seed_b64 = try crypto.base64Encode(allocator, &seed);
-    defer allocator.free(seed_b64);
+    defer {
+        std.crypto.secureZero(u8, seed_b64);
+        allocator.free(seed_b64);
+    }
 
     // PEM markers built at comptime (avoids gitleaks pattern match on literal)
     const pem_type = "ED25519 PRIVATE KEY";
     const pem_begin = "-----BEGIN " ++ pem_type ++ "-----\n";
     const pem_end = "\n-----END " ++ pem_type ++ "-----\n";
 
-    var file = try fs.cwd().createFile(output_path, .{ .mode = 0o600 });
+    const file = createKeyFile(allocator, output_path);
     defer file.close();
-    _ = try file.write(pem_begin);
-    _ = try file.write(seed_b64);
-    _ = try file.write(pem_end);
+    // `writeAll`, not `write`: a short write is legal and `_ = try file.write(...)`
+    // discarded the count, so a truncated key file was possible and silent. Same
+    // defect the `writeOut` helper above carries a note about.
+    try file.writeAll(pem_begin);
+    try file.writeAll(seed_b64);
+    try file.writeAll(pem_end);
 
     // Public key for DNS (raw 32-byte public key, base64 encoded)
     const pub_b64 = try crypto.base64Encode(allocator, &kp.public_key.toBytes());

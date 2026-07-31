@@ -102,9 +102,20 @@ pub fn verifySignature(
     min_key_bits: u32,
     body_length_policy: BodyLengthPolicy,
 ) VerifyResult {
-    // Step 1: Parse the DKIM-Signature
-    const sig = dkim.parseSignature(sig_header_value) catch
-        return .{ .result = .permerror, .domain = "", .selector = "", .reason = "malformed signature" };
+    // Step 1: Parse the DKIM-Signature. Every outcome is permerror -- we could not
+    // evaluate this signature, which is not the claim `fail` makes -- but the reasons
+    // have different causes and different fixes, and one "malformed" for all of them
+    // leaves a postmaster to work out which by hand (audit D-6, D-14, D-17).
+    const sig = dkim.parseSignature(sig_header_value) catch |err| {
+        const reason: []const u8 = switch (err) {
+            error.DuplicateTagName => "duplicate tag in signature (RFC 6376 3.2)",
+            error.InvalidCanonicalization => "unsupported c= canonicalization (RFC 6376 6.1.1)",
+            error.UnsupportedAlgorithm => "unsupported a= algorithm",
+            error.TooManyTags => "signature carries too many tags",
+            else => "malformed signature",
+        };
+        return .{ .result = .permerror, .domain = "", .selector = "", .reason = reason };
+    };
 
     // Validate required fields for verification
     dkim.validateForVerification(&sig) catch

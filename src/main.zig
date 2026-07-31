@@ -476,14 +476,29 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
             g_body_length_policy,
         );
 
-        // A weak key is a signer-side fault the postmaster on this side cannot
-        // fix, so it is worth a log line: the A-R header records only the
-        // permerror, and without this nobody can tell it apart from a
-        // canonicalization failure without recomputing the signature by hand.
+        // D-17: `verify.zig` computes a precise reason for every outcome and this is
+        // where it stopped -- only the weak-key case was logged, and the A-R carries
+        // no reason, so `dkim=fail` reached the postmaster with the distinction gone.
+        // A body-hash mismatch (transport or canonicalization) and a signature
+        // mismatch (key, header set, or forgery) have opposite responses. Diagnosing
+        // D-15/D-16 meant reimplementing the hash in Python to recover a fact this
+        // daemon already had.
+        //
+        // No line for a pass: it is the common case and would bury the rest. `reason`
+        // is one of our own literals so it is not escaped; `domain` is the signature's
+        // sender-chosen `d=` and is (audit X-5).
         if (result.reason) |reason| {
+            if (result.result != .pass) {
+                log.info("{f}: dkim={s} ({s})", .{
+                    escape.logField(result.domain),
+                    result.result.toString(),
+                    reason,
+                });
+            }
+
+            // Weak keys keep a second line: it names the configured threshold, which
+            // the generic reason cannot, and it is a signer-side fault.
             if (mem.eql(u8, reason, "key too small")) {
-                // The domain is the signature's own `d=` tag, so it is entirely
-                // sender-chosen (audit X-5).
                 log.warn(
                     "{f}: RSA key below MinimumKeyBits={d}, signature permanently failed (RFC 8301 3.2)",
                     .{ escape.logField(result.domain), g_min_key_bits },
