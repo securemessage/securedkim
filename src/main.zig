@@ -144,6 +144,30 @@ var g_config_gen: reload_mod.ConfigGeneration = reload_mod.ConfigGeneration.init
 // Thread-local ZMQ publisher (one socket per worker thread — ZMQ thread-safety)
 threadlocal var tl_publisher: ?zmq.Publisher = null;
 
+// Thread-local DNS resolver (audit X-3).
+//
+// This one was the worst of the four: the resolver was built and destroyed
+// inside the loop over `DKIM-Signature` headers, so the cost scaled with the
+// number of signatures a sender chose to attach rather than with the number of
+// messages. That is the mechanism behind D-4's measured 355x amplification --
+// 300 signatures meant 300 resolvers and 300 uncached key fetches, ~5 seconds of
+// wall time, and with `WorkerThreads=2` two such messages stalled every DKIM
+// worker. A per-worker cache does not remove the per-signature RSA verify, but
+// it does collapse repeated `selector._domainkey.domain` lookups -- including
+// the identical-selector floods -- to one query.
+//
+// Per worker thread so it needs no lock, matching the publisher above.
+// `g_allocator`, not `conn.allocator`, because it now outlives the connection --
+// the same allocator either way, since the pool is handed `g_allocator`.
+threadlocal var tl_resolver: ?dns_mod.Resolver = null;
+
+fn getResolver() *dns_mod.Resolver {
+    if (tl_resolver == null) {
+        tl_resolver = dns_mod.Resolver.initWithMonitor(g_allocator, g_dns_config, g_health_monitor);
+    }
+    return &tl_resolver.?;
+}
+
 fn getPublisher() *zmq.Publisher {
     if (tl_publisher == null) {
         tl_publisher = zmq.Publisher.init(g_zmq_endpoint, g_zmq_topic);
@@ -631,6 +655,13 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
         for (header_strings.items) |s| conn.allocator.free(s);
     }
 
+    // One resolver for every signature in this message, not one each. Hoisted
+    // out of the loop deliberately: signatures in a flood overwhelmingly repeat
+    // the same `s=`/`d=` pair, and sharing the cache across them is what turns
+    // that flood from N key fetches into one (audit X-3, and the amplification
+    // measured as D-4).
+    const resolver = getResolver();
+
     // Find DKIM-Signature headers and verify each
     var found_any = false;
     for (conn.headers.items) |hdr| {
@@ -640,12 +671,9 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
         const sig_header_raw = std.fmt.allocPrint(conn.allocator, "DKIM-Signature: {s}", .{hdr.value}) catch continue;
         defer conn.allocator.free(sig_header_raw);
 
-        var resolver = dns_mod.Resolver.initWithMonitor(conn.allocator, g_dns_config, g_health_monitor);
-        defer resolver.deinit();
-
         const result = verify.verifySignature(
             conn.allocator,
-            &resolver,
+            resolver,
             hdr.value,
             sig_header_raw,
             header_strings.items,
@@ -938,9 +966,19 @@ fn reloadConfig() void {
     });
 }
 
-/// Per-worker reload callback: flush thread-local state.
-/// Future: flush LRU key cache when implemented.
+/// Per-worker reload callback: flush thread-local state. The resolver's TTL
+/// cache is where verified signers' public keys are held between messages, so
+/// dropping the resolver is what flushes the key cache.
 fn onWorkerReload() void {
+    // The resolver captured the nameserver list and cache sizing when it was
+    // built, so a reload that changes either has to be able to replace it.
+    // Dropping it also discards cached answers, which is the intent: after a
+    // reload the operator means the new configuration, not keys fetched under
+    // the old one.
+    if (tl_resolver) |*r| {
+        r.deinit();
+        tl_resolver = null;
+    }
     log.debug("worker: config reload acknowledged", .{});
 }
 
