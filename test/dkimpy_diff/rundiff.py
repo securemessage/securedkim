@@ -212,49 +212,36 @@ def run_case(case, keys, check_bin, port):
 def known_limitation(case):
     """Return a description if this case is a documented limitation, else None.
 
-    Exactly one entry, and it is a real production limitation rather than a
-    harness artifact -- which is why it is recorded here instead of being removed
-    from the corpus.
+    EMPTY, and that is the interesting state. It held exactly one entry for the
+    whole life of this harness -- D-23, the `c=simple` empty-value cases -- and
+    that entry is gone because the defect was fixed, not because it was tidied
+    away.
 
-    A milter never sees a header field's original octets. The MTA hands over a name
-    and a value, with one leading space already removed unless the daemon
-    negotiates `SMFIP_HDR_LEADSPC`, which none of these do. `securedkim` therefore
-    reconstructs the field as `name + ": " + value`, and `securedkim-check`
-    reproduces that deliberately (see `appendField`) so the tool predicts what the
-    daemon does.
+    The removal was not voluntary. This harness treats a KNOWN that has stopped
+    firing as a failure, on the grounds that an entry claiming a limitation which
+    no longer exists is a lie told with authority. When `securedkim` began
+    negotiating `SMFIP_HDR_LEADSPC` the two cases started agreeing with dkimpy,
+    the run went red, and it printed "expected a known disagreement and got
+    agreement -- the limitation may be fixed, so remove the entry". That is the
+    guard doing its job, and it is worth more than the entry was.
 
-    For a field with an EMPTY value the reconstruction is `X-Empty: ` with a
-    trailing space, where the wire almost certainly carried `X-Empty:`. Under
-    relaxed header canonicalization that trailing WSP is deleted and nothing is
-    lost, which is why only the `simple` header cases disagree. Under simple, which
-    hashes the field verbatim, the extra octet breaks the signature.
+    History, kept because both halves were once written here as fact and both
+    were wrong:
 
-    CORRECTED 2026-07-29. This docstring previously claimed the defect was "not
-    fixable" and "inherent to c=simple header canonicalization in any milter". THAT
-    WAS WRONG, and the correction is left visible rather than edited away, because a
-    confident wrong claim inside a test harness is worse than no claim -- it tells
-    the next reader to stop looking.
+      - First claim: the defect was "not fixable", "inherent to c=simple header
+        canonicalization in any milter". Wrong -- the milter protocol exposes the
+        original spacing via SMFIP_HDR_LEADSPC and the library already modelled
+        the flag; no daemon asked for it.
+      - Second claim: the breadth was unknown, and if an MTA stripped ALL leading
+        WSP then every field with two or more spaces would fail too. Measured
+        (audit §11.40): Postfix 3.11.5 and FreeBSD base sendmail both strip
+        exactly one SP, if and only if one is present, and never a TAB. So the
+        breadth was two shapes -- `Name:value` and `Name:<TAB>value` -- and the
+        empty value was a sub-case of the first.
 
-    The milter protocol DOES expose the original spacing, via SMFIP_HDR_LEADSPC, and
-    securemilter-lib already models it as `ProtocolFlags.header_leading_space`
-    (securemilter-lib/src/milter/negotiate.zig:49). No daemon negotiates it. So the
-    information is available for the asking and we decline to ask; that is a design
-    choice with a consequence, not a limit of the API.
-
-    The fix is cross-cutting -- negotiate the flag and stop fabricating the separator
-    at six production sites across two daemons -- so it is tracked, not done here.
-
-    The BREADTH is also unestablished, and the severity depends on it: this code
-    strips exactly one leading WSP, and whether sendmail and Postfix strip one or all
-    has not been checked. If all, any field with two or more spaces after the colon
-    also fails c=simple. Only the empty-value case is measured, so only it is claimed.
-
-    Filed as D-23.
+    Both were confident statements inside a test harness, which is the worst place
+    for one: it tells the next reader to stop looking. Closed by audit D-23.
     """
-    if case["header"] == "empty_value" and case["canon"].startswith("simple/"):
-        return ("D-23: no daemon negotiates SMFIP_HDR_LEADSPC, so the separator is "
-                "fabricated -- an empty-valued field reconstructs as 'X-Empty: ' "
-                "and c=simple hashes one octet too many")
     return None
 
 

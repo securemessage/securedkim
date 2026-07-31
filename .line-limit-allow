@@ -132,6 +132,18 @@
 #   the other two. The 1163 ceiling above is left in place as the record of what was
 #   borrowed; the generated list below is the truth about what is owed now.
 
+# 2026-07-31, D-23: main.zig 1002 -> 1008, +6.
+#
+#   This daemon now negotiates SMFIP_HDR_LEADSPC so `c=simple` can hash a header
+#   field as it actually arrived rather than as `name + ": " + value`. The lines
+#   are the `protocol_flags` entry and three short comments at the sites that
+#   rebuild a field -- the verify header list, the sign header list, and the
+#   DKIM-Signature self-reference. The rule itself lives once, in
+#   `securemilter-lib` `header.zig`; these only point at it.
+#
+#   No code was added: the three sites got shorter, since `hdr.render(alloc)`
+#   replaced an allocPrint with a format string.
+#
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -144,5 +156,5 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-1002 src/main.zig
+1008 src/main.zig
 443 src/verify.zig

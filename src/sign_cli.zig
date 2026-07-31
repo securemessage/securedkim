@@ -202,12 +202,16 @@ fn parseMessage(allocator: Allocator, raw: []const u8, normalize_eol: bool) !Mes
     };
 }
 
-/// Rebuild one field the way the milter receives it, then re-emit `name: value`.
+/// Rebuild one field the way the milter receives it, then re-emit it.
 ///
-/// The round trip through name and value is the point, not an oversight: it drops
-/// the single space after the colon and puts exactly one back, which is the only
-/// information a milter has. Signing the file's original octets instead would
-/// produce signatures the daemon cannot produce.
+/// The round trip through name and value is the point, not an oversight: the
+/// daemon signs what the MTA hands it, so signing the file's original octets
+/// instead would produce signatures the daemon cannot produce.
+///
+/// It now round-trips through `Header`, which carries whether a space followed
+/// the colon, so the re-emitted field is byte-identical to the original instead
+/// of having its separator normalised to one space (audit D-23). One SP is split
+/// off, never a TAB, matching what Postfix and sendmail were measured to do.
 fn appendField(
     a: Allocator,
     headers: *std.ArrayListUnmanaged([]const u8),
@@ -216,10 +220,13 @@ fn appendField(
     const field = mem.trimRight(u8, field_raw, "\r\n");
     if (field.len == 0) return;
     const colon = mem.indexOfScalar(u8, field, ':') orelse return;
-    const name = field[0..colon];
-    var value = field[colon + 1 ..];
-    if (value.len > 0 and (value[0] == ' ' or value[0] == '\t')) value = value[1..];
-    try headers.append(a, try std.fmt.allocPrint(a, "{s}: {s}", .{ name, value }));
+    const split = securemilter.connection.splitLeadingSpace(field[colon + 1 ..]);
+    const hdr = securemilter.connection.Header{
+        .name = field[0..colon],
+        .value = split.value,
+        .had_space = split.had_space,
+    };
+    try headers.append(a, try hdr.render(a));
 }
 
 /// Load a signing key, choosing the format from the algorithm.

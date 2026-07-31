@@ -470,6 +470,10 @@ fn runDaemon() !void {
         .on_eom = onEom,
         .on_reload = onWorkerReload,
         .required_actions = required_actions,
+        // Ask for the separator as it appeared on the wire; `c=simple` hashes the
+        // field verbatim (audit D-23). Masked against the MTA's offer, so one that
+        // declines leaves the previous behaviour exactly as it was.
+        .protocol_flags = .{ .header_leading_space = true },
         .limits = dkim_cfg.limits,
     };
 
@@ -648,7 +652,7 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
     defer header_strings.deinit(conn.allocator);
 
     for (conn.headers.items) |hdr| {
-        const full = std.fmt.allocPrint(conn.allocator, "{s}: {s}", .{ hdr.name, hdr.value }) catch continue;
+        const full = hdr.render(conn.allocator) catch continue;
         header_strings.append(conn.allocator, full) catch continue;
     }
     defer {
@@ -668,7 +672,9 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
         if (!std.ascii.eqlIgnoreCase(hdr.name, "DKIM-Signature")) continue;
         found_any = true;
 
-        const sig_header_raw = std.fmt.allocPrint(conn.allocator, "DKIM-Signature: {s}", .{hdr.value}) catch continue;
+        // The signature covers its own field, so under `c=simple` this separator
+        // must be the one that arrived (audit D-23).
+        const sig_header_raw = hdr.render(conn.allocator) catch continue;
         defer conn.allocator.free(sig_header_raw);
 
         const result = verify.verifySignature(
@@ -774,7 +780,7 @@ fn doSign(conn: *connection_mod.Connection) u8 {
         // claims to cover, so every verifier computes a different hash and all
         // mail signed during the fault fails DKIM at the recipient -- while this
         // daemon reports success (audit X-10).
-        const full = std.fmt.allocPrint(conn.allocator, "{s}: {s}", .{ hdr.name, hdr.value }) catch
+        const full = hdr.render(conn.allocator) catch
             return signInternalError("building the header list to sign");
         header_strings.append(conn.allocator, full) catch {
             conn.allocator.free(full);

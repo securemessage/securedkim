@@ -73,10 +73,11 @@ const Usage =
 /// few kilobytes, and bounded so a stray argument cannot exhaust memory.
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 
-const Header = struct {
-    name: []const u8,
-    value: []const u8,
-};
+/// The daemon's own header type, not a copy of it. This tool exists to predict
+/// the daemon, and `had_space` plus `render` are exactly the part a copy would
+/// have silently omitted (audit D-23).
+const Header = securemilter.connection.Header;
+const splitLeadingSpace = securemilter.connection.splitLeadingSpace;
 
 const Message = struct {
     headers: []const Header,
@@ -141,13 +142,15 @@ fn parseMessage(allocator: Allocator, raw: []const u8, normalize_eol: bool) !Mes
 
 /// Record one complete field, trailing CRLF trimmed, split at the first colon.
 ///
-/// **The single space after the colon is dropped, on purpose.** A milter receives
-/// header values from the MTA with leading whitespace already removed unless it
-/// negotiates `SMFIP_HDR_LEADSPC`, which no daemon in this suite does. Keeping it
-/// would hand the verifier a byte sequence production never produces, and
-/// `simple` header canonicalization — which hashes the field verbatim — would
-/// disagree for every case. Continuation lines keep their own leading whitespace,
-/// which is also what the MTA delivers.
+/// **The single space after the colon is split off, not dropped.** A milter
+/// receives header values with one leading space already removed by the MTA;
+/// `securedkim` now negotiates `SMFIP_HDR_LEADSPC` and recovers the bit saying
+/// whether there was one, so `simple` — which hashes the field verbatim — can
+/// rebuild it exactly (audit D-23).
+///
+/// **One SP, never a TAB**, as measured against Postfix and sendmail in §11.40.
+/// This line used to strip a leading TAB too, which no MTA does. Continuation
+/// lines keep their own leading whitespace, which is also what the MTA delivers.
 fn appendField(
     a: Allocator,
     headers: *std.ArrayListUnmanaged(Header),
@@ -156,9 +159,12 @@ fn appendField(
     const field = mem.trimRight(u8, field_raw, "\r\n");
     if (field.len == 0) return;
     const colon = mem.indexOfScalar(u8, field, ':') orelse return;
-    var value = field[colon + 1 ..];
-    if (value.len > 0 and (value[0] == ' ' or value[0] == '\t')) value = value[1..];
-    try headers.append(a, .{ .name = field[0..colon], .value = value });
+    const split = splitLeadingSpace(field[colon + 1 ..]);
+    try headers.append(a, .{
+        .name = field[0..colon],
+        .value = split.value,
+        .had_space = split.had_space,
+    });
 }
 
 /// Normalise CR, LF and CRLF to CRLF.
@@ -299,7 +305,7 @@ pub fn main() !void {
         header_strings.deinit(allocator);
     }
     for (msg.headers) |hdr| {
-        const full = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ hdr.name, hdr.value });
+        const full = try hdr.render(allocator);
         try header_strings.append(allocator, full);
     }
 
@@ -313,7 +319,9 @@ pub fn main() !void {
     for (msg.headers) |hdr| {
         if (!std.ascii.eqlIgnoreCase(hdr.name, "DKIM-Signature")) continue;
 
-        const sig_header_raw = try std.fmt.allocPrint(allocator, "DKIM-Signature: {s}", .{hdr.value});
+        // Rendered, not fabricated: the signature covers its own field, so under
+        // `c=simple` this separator is hashed verbatim (audit D-23).
+        const sig_header_raw = try hdr.render(allocator);
         defer allocator.free(sig_header_raw);
 
         const result = verify.verifySignature(
