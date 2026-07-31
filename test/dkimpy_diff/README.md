@@ -6,13 +6,17 @@
 **The first run found three real defects**, two of them canonicalization bugs that
 would have rejected legitimate mail.
 
-Current result: **201 agree, 3 known limitations, 0 disagreements.**
+Current result: **204 agree, 0 known limitations, 0 disagreements.**
+
+The three KNOWN entries were all D-23 (`c=simple` header canonicalization
+fabricating the `name: value` separator) and all three went away when it was
+fixed, so this suite now carries no documented limitation of any kind.
 
 ```
 $ cd ../.. && zig build              # securedkim-check and securedkim-sign
 $ python3.12 rundiff.py
 
-total=204 agree=201 known=3 disagree=0 harness=0
+total=204 agree=204 known=0 disagree=0 harness=0
 ```
 
 Needs `py312-dkimpy`. Note **python3.12**, not `python3` — the port targets 3.12
@@ -125,7 +129,24 @@ call — but `BodyCanonicalizer`'s own documentation invites streaming, and a la
 bug in a documented API is a live one waiting for its first caller. The new test
 tries **every** split point of a body, not a hand-picked one.
 
-### D-23 — `c=simple` header canonicalization fabricates the separator (severity under revision)
+### D-23 — `c=simple` header canonicalization fabricated the separator — **CLOSED**
+
+> **Closed 2026-07-31** (audit §11.46). `securedkim` and `securearc` now negotiate
+> `SMFIP_HDR_LEADSPC`, and `Header.render` is the single place that decides the
+> separator. All three KNOWN entries below went away: this suite went
+> **201 agree / 3 known → 204 agree / 0 known**, and the harness *forced* the
+> bookkeeping — it treats a KNOWN that has stopped firing as a failure, so the run
+> went red until the entries were deleted.
+>
+> Two claims made below turned out to be wrong and are left standing rather than
+> edited away. **"Six production sites"** was wrong in both directions: three of
+> the six hardcode `.relaxed`, which trims WSP after the colon, so they were never
+> affected — and one affected site, the AMS self-reference, was not on the list.
+> **"The breadth is not yet established"** was settled by measuring Postfix 3.11.5
+> and FreeBSD base sendmail: both strip exactly one leading SP if present, never a
+> TAB, so the narrow reading was right and Low was the correct severity.
+
+The account below is the original one, from when this was open.
 
 Reported as **KNOWN**, not as a failure, and it is a genuine production defect rather
 than a harness artifact.
