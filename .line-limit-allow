@@ -144,6 +144,20 @@
 #   No code was added: the three sites got shorter, since `hdr.render(alloc)`
 #   replaced an allocPrint with a format string.
 #
+# 2026-07-31, THE settings.zig EXTRACTION: main.zig 1008 -> 777, and the two
+#   "NOT PAID DOWN HERE ON PURPOSE" notes above (X-16(a) and X-16(b)) are now paid.
+#   Both deferred +6 and +3 explicitly to this work rather than nibbling at the
+#   file; -231 covers them many times over, and the ceiling tightened by itself.
+#
+#   src/settings.zig (286 production lines, under the goal so it joins no list)
+#   holds Mode, DkimConfig and parseDkimConfig with the config tests beside them.
+#   Every name is re-exported from main.zig at its old spelling, so not one call
+#   site moved -- the same handling securearc gave its own split, and the reason
+#   this shows up as a pure deletion in main.zig rather than a rename everywhere.
+#
+#   This file was the largest in the suite at 1008. It is not any more:
+#   securespf/src/evaluate.zig at 861 now leads.
+#
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -156,5 +170,5 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-1008 src/main.zig
+777 src/main.zig
 443 src/verify.zig
