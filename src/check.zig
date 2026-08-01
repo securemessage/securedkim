@@ -47,6 +47,8 @@ const Usage =
     \\  -n <nameserver>  DNS nameserver (default: 127.0.0.1)
     \\  -p <port>        DNS nameserver port (default: 53)
     \\  -b <bits>        Minimum RSA key bits accepted (default: RFC 8301 floor)
+    \\  --max-key-records <n>
+    \\                   Key records tried at one selector (default: 3)
     \\  --refuse-l       Report `policy` for signatures carrying l= instead of
     \\                   honouring it (RFC 6376 §8.2 sanctions either)
     \\  --no-normalize   Do not rewrite bare CR/LF in the file to CRLF. Use when
@@ -193,6 +195,7 @@ const Args = struct {
     nameserver: []const u8 = "127.0.0.1",
     port: u16 = 53,
     min_key_bits: ?u32 = null,
+    max_key_records: u8 = verify.DEFAULT_MAX_KEY_RECORDS,
     body_length_policy: verify.BodyLengthPolicy = .honor,
     /// Rewrite bare CR and bare LF to CRLF while reading the file.
     ///
@@ -230,6 +233,10 @@ fn parseArgs(allocator: Allocator) !Args {
         } else if (mem.eql(u8, arg, "-b")) {
             const raw = it.next() orelse cli.fatal("-b needs a value");
             result.min_key_bits = std.fmt.parseInt(u32, raw, 10) catch cli.fatal("invalid bits");
+        } else if (mem.eql(u8, arg, "--max-key-records")) {
+            const raw = it.next() orelse cli.fatal("--max-key-records needs a value");
+            result.max_key_records = std.fmt.parseInt(u8, raw, 10) catch
+                cli.fatal("invalid --max-key-records");
         } else if (mem.eql(u8, arg, "--refuse-l")) {
             result.body_length_policy = .refuse;
         } else if (mem.eql(u8, arg, "--no-normalize")) {
@@ -333,6 +340,7 @@ pub fn main() !void {
             msg.body,
             min_key_bits,
             args.body_length_policy,
+            args.max_key_records,
         );
 
         emitSig(count, "result", result.result.toString());

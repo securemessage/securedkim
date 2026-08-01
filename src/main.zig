@@ -110,6 +110,10 @@ var g_strip_policy: header_scrub.StripPolicy = .{ .own_methods = &.{"dkim"} };
 /// only the two that verify signatures have any use for this.
 var g_min_key_bits: u32 = crypto.RFC8301_MIN_RSA_BITS;
 
+/// Key records tried at one selector before giving up (audit D-20). Set once at
+/// startup alongside `g_min_key_bits`, and DKIM-only for the same reason.
+var g_max_key_records: u8 = verify.DEFAULT_MAX_KEY_RECORDS;
+
 /// Default `honor`, which is what RFC 6376 §3.5 specifies and what a signer using
 /// `l=` expects. `refuse` is available for operators who would rather take RFC
 /// 6376 §8.2 at its word and ignore such signatures; see the man page.
@@ -186,6 +190,7 @@ fn runDaemon() !void {
     g_zmq_topic = dkim_cfg.zmq_topic;
     g_strip_policy = .{ .own_methods = &.{"dkim"}, .strip_all = dkim_cfg.strip_auth_results };
     g_min_key_bits = dkim_cfg.min_key_bits.bits;
+    g_max_key_records = dkim_cfg.max_key_records;
     g_body_length_policy = dkim_cfg.body_length_policy;
 
     // Say so rather than silently disagreeing with the config file. An operator
@@ -475,6 +480,7 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
             body_data,
             g_min_key_bits,
             g_body_length_policy,
+            g_max_key_records,
         );
 
         // D-17: `verify.zig` computes a precise reason for every outcome and this is

@@ -242,50 +242,73 @@ NEGATIVE_CASES = [
                  "v=DKIM2; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="},
         "expect": {"sig.0.result": "permerror"},
     },
-    # --- Multiple key records at one selector -----------------------------
+    # --- Multiple key records at one selector (D-20) ----------------------
     #
-    # RFC 6376 §3.6.2.2 permits two behaviours, and this pair records which one
-    # the daemon implements rather than asserting a preference:
+    # RFC 6376 §6.1.2 step 4 permits two behaviours:
     #
     #   "If the query for the public key returns multiple key records, the
     #    Verifier can choose one of the key records or may cycle through the key
-    #    records ... The order of the key records is unspecified."
+    #    records, performing the remainder of these steps on each record at the
+    #    discretion of the implementer. The order of the key records is
+    #    unspecified."
     #
-    # It chooses one: the first returned. Both cases below are therefore
-    # conformant outcomes, and together they prove the choice is the first record
-    # rather than, say, a search.
+    # **The daemon now cycles (D-20).** It previously took the first record only,
+    # which is the other conformant branch, and the pair below recorded that.
     #
-    # I first wrote this as a single case expecting `pass` on the assumption that
-    # the daemon cycled. It does not, and the RFC explicitly allows that, so the
-    # expectation was mine and wrong -- the same mistake as ARC finding A-18,
-    # caught the same way. The cases were corrected; the code was not.
+    # Note the section. These cases were originally filed against §3.6.2.2, and so
+    # was the finding; the quoted sentence is genuine RFC 6376 but lives at §6.1.2
+    # step 4. §3.6.2.2 says something complementary -- "TXT RRs MUST be unique for
+    # a particular selector name; ... if there are multiple records in an RRset,
+    # the results are undefined" -- which binds the SIGNER. The verifier's licence
+    # to cycle is §6.1.2's. Corrected here when the behaviour changed.
     #
-    # **The operational consequence is a real one and is filed as a finding.** A
-    # domain rotating keys publishes old and new at one selector, DNS RRset order
-    # is unspecified and commonly rotated by resolvers, so the same message can
-    # verify on one lookup and fail on the next. Cycling is the robust branch.
+    # Why cycling rather than first-wins: a domain rotating keys publishes old and
+    # new at one selector, and RRset order is unspecified and commonly rotated by
+    # resolvers, so under first-wins the same message verifies on one lookup and
+    # fails on the next. That is the whole finding.
     {
         "name": "multiple_key_records_first_matches",
-        "section": "RFC 6376 3.6.2.2",
+        "section": "RFC 6376 6.1.2 step 4",
         "source": "the Verifier can choose one of the key records or may cycle "
                   "through the key records",
-        "note": "Correct key published first.",
+        "note": "Correct key published first. Unchanged by D-20, and that is the "
+                "point of keeping it: cycling must not disturb the case that "
+                "already worked, and it must still cost exactly one verification.",
         "message": "rfc8463-ed25519.eml",
         "zone": {ED25519_NAME: [ED25519_KEY, ED25519_WRONG_KEY]},
         "expect": {"sig.0.result": "pass"},
     },
     {
-        "name": "multiple_key_records_first_does_not_match",
-        "section": "RFC 6376 3.6.2.2",
+        "name": "multiple_key_records_second_matches",
+        "section": "RFC 6376 6.1.2 step 4",
         "source": "the Verifier can choose one of the key records or may cycle "
                   "through the key records",
-        "note": "Correct key published second. `fail` is the 'choose one' branch "
-                "and is conformant; a verifier that cycled would return `pass`. "
-                "If this case ever flips to `pass`, that is the cycling change "
-                "being made deliberately -- not a regression.",
+        "note": "Correct key published SECOND -- the rotation case, and the one "
+                "D-20 is about. Was `fail` while the daemon took only the first "
+                "record; the old case said in as many words that a flip to `pass` "
+                "would be the cycling change being made deliberately. This is that "
+                "flip. Renamed from multiple_key_records_first_does_not_match, "
+                "which described the old verdict rather than the scenario.",
         "message": "rfc8463-ed25519.eml",
         "zone": {ED25519_NAME: [ED25519_WRONG_KEY, ED25519_KEY]},
-        "expect": {"sig.0.result": "fail"},
+        "expect": {"sig.0.result": "pass"},
+    },
+    {
+        "name": "key_records_beyond_the_cap_are_not_tried",
+        "section": "RFC 6376 6.1.2 step 4",
+        "source": "at the discretion of the implementer",
+        "note": "The cap has to be observable or it is not a cap. The good key is "
+                "published second and only one record is allowed, so the daemon "
+                "must stop before reaching it and report the first record's "
+                "verdict. Without a bound, whoever publishes the zone chooses how "
+                "many public-key verifications each signature costs us -- the same "
+                "per-signature work D-4 caps. Pinning this also proves the cycling "
+                "loop terminates on the operator's limit rather than on the "
+                "RRset's length.",
+        "message": "rfc8463-ed25519.eml",
+        "zone": {ED25519_NAME: [ED25519_WRONG_KEY, ED25519_KEY]},
+        "args": ["--max-key-records", "1"],
+        "expect": {"sig.0.result": "fail", "sig.0.reason": "signature mismatch"},
     },
     {
         "name": "dns_servfail_tempfails",

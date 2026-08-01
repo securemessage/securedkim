@@ -108,6 +108,8 @@ pub const DkimConfig = struct {
     min_key_bits: crypto.MinRsaBits,
     /// What a verified signature's `l=` tag means here (audit D-5).
     body_length_policy: verify.BodyLengthPolicy,
+    /// Key records tried at one selector before giving up (audit D-20).
+    max_key_records: u8,
 };
 
 pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !DkimConfig {
@@ -222,6 +224,12 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
     // verbatim. Empty disables oversigning (audit D-12).
     const oversign_headers = global.getOrDefault("OverSignHeaders", sign.DEFAULT_OVERSIGN_HEADERS);
 
+    // A rotation legitimately publishes two key records at once, so taking only
+    // the first broke whichever half DNS listed second (audit D-20). Bounded
+    // because the count is the zone owner's choice and each record costs another
+    // public-key verification.
+    const max_key_records = global.getInt("MaxKeyRecords", u8, verify.DEFAULT_MAX_KEY_RECORDS);
+
     // Trust boundary: when this is the first milter in the chain, no A-R header
     // claiming our authserv-id can be genuine on arrival (RFC 8601 §5).
     const strip_auth_results = global.getBool("StripAuthResults", false);
@@ -266,6 +274,7 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
         .limits = limits,
         .min_key_bits = min_key_bits,
         .body_length_policy = body_length_policy,
+        .max_key_records = max_key_records,
     };
 }
 

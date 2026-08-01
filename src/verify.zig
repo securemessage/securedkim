@@ -108,6 +108,9 @@ pub const VerifyResult = struct {
 /// `min_key_bits` is the smallest RSA modulus this verifier will accept, already
 /// reconciled with the RFC 8301 floor by `crypto.resolveMinRsaBits`. It is a
 /// parameter rather than a constant so an operator can tighten it past the RFC.
+///
+/// `max_key_records` bounds how many TXT records at the selector we are willing
+/// to try (audit D-20). See `DEFAULT_MAX_KEY_RECORDS`.
 pub fn verifySignature(
     allocator: Allocator,
     resolver: *dns_mod.Resolver,
@@ -117,6 +120,7 @@ pub fn verifySignature(
     body: []const u8,
     min_key_bits: u32,
     body_length_policy: BodyLengthPolicy,
+    max_key_records: u8,
 ) VerifyResult {
     // `t=y` is discovered midway -- the key record has to be fetched and parsed
     // first -- but it belongs on every verdict reached after that point, and this
@@ -136,10 +140,70 @@ pub fn verifySignature(
         body,
         min_key_bits,
         body_length_policy,
+        max_key_records,
         &key_testing,
     );
     result.testing = key_testing;
     return result;
+}
+
+/// Key records tried at one selector before we give up (audit D-20).
+///
+/// RFC 6376 §6.1.2 step 4: "If the query for the public key returns multiple key
+/// records, the Verifier can choose one of the key records or may cycle through
+/// the key records ... at the discretion of the implementer. The order of the key
+/// records is unspecified." §3.6.2.2 tells the *signer* not to publish more than
+/// one, but a verifier that trusts that breaks during a rotation: both the old and
+/// the new record are live for as long as caches hold them, and taking only the
+/// first meant every message signed with the other key failed.
+///
+/// Three, not unbounded, because the count is chosen by whoever publishes the
+/// zone. Each additional record costs one more public-key verification of an
+/// attacker-supplied signature, which is the same per-signature work D-4 caps.
+pub const DEFAULT_MAX_KEY_RECORDS: u8 = 3;
+
+/// Ceiling on the configured value, so the cap cannot itself become the amplifier.
+const MAX_KEY_RECORDS_CEILING: usize = 8;
+
+/// Why this key record cannot be used for this signature, or null if it can.
+///
+/// Every one of these is a property of the *record*, so it decides only whether
+/// this record is a candidate -- with several published, one being unusable says
+/// nothing about the others. Ordered as RFC 6376 §6.1.2 orders them, so a record
+/// tripping more than one reports what another implementation would report.
+fn keyRecordRejection(
+    rec: *const dkim.PublicKeyRecord,
+    sig: *const dkim.Signature,
+) ?[]const u8 {
+    // Empty p= is a revoked key (RFC 6376 §3.6.1).
+    if (rec.public_key.len == 0) return "key revoked";
+
+    if (!keyTypeMatchesAlgorithm(rec.key_type, sig.algorithm)) return "key type mismatch";
+
+    // D-11: `s=`, `h=` and `t=` were parsed into the record from the start and
+    // then never consulted, so a key restricted by its owner verified exactly as
+    // though it were unrestricted. Each is a MUST on the verifier, and each is a
+    // restriction the *signer* asked for, which is why the answer is permerror
+    // (the key is inapplicable) rather than fail (the signature is bad).
+
+    // §3.6.1: "Verifiers for a given service type MUST ignore this record if the
+    // appropriate type is not listed." We are unambiguously the email service.
+    if (!dkim.keyAllowsEmailService(rec))
+        return "key not valid for the email service (s=)";
+
+    // §6.1.2 step 6, verbatim: "the Verifier MUST ignore the key record and return
+    // PERMFAIL (inappropriate hash algorithm)".
+    if (!dkim.keyAllowsHashAlgorithm(rec, sig.algorithm))
+        return "hash algorithm not permitted by the key record (h=)";
+
+    // §3.6.1 `t=s`: the `i=` domain "MUST NOT be a subdomain of 'd='". This is the
+    // flag's entire purpose -- a domain sets it precisely to stop a signature
+    // claiming an identity below the signing domain -- so ignoring it silently
+    // granted every subdomain identity the operator had asked us to refuse.
+    if (dkim.keyHasFlag(rec, "s") and !dkim.auidSatisfiesStrictFlag(sig))
+        return "i= is not exactly d= and the key record sets t=s";
+
+    return null;
 }
 
 fn verifySignatureInner(
@@ -151,6 +215,7 @@ fn verifySignatureInner(
     body: []const u8,
     min_key_bits: u32,
     body_length_policy: BodyLengthPolicy,
+    max_key_records: u8,
     testing_out: *bool,
 ) VerifyResult {
     // Step 1: Parse the DKIM-Signature. Every outcome is permerror -- we could not
@@ -213,54 +278,60 @@ fn verifySignatureInner(
     };
     defer dns_result.deinit();
 
-    // Find the key record in TXT results
+    // Step 3: Collect the usable key records at this selector (audit D-20).
+    //
+    // A rotation publishes the old and the new record together, and RFC 6376
+    // §3.6.2.2 leaves the RRset order undefined, so taking only the first meant
+    // whichever key DNS happened to list second could not verify anything. §6.1.2
+    // step 4 permits cycling explicitly.
+    //
+    // Only the record-level checks happen here. Everything between this and the
+    // signature check below is identical for every record -- the body hash in
+    // particular -- so it is computed once, outside the loop. Repeating it per
+    // record would let whoever publishes the zone multiply our per-signature
+    // hashing by the number of records they choose to publish, which is the same
+    // work D-4 exists to bound.
+    const cap = @min(@as(usize, max_key_records), MAX_KEY_RECORDS_CEILING);
+
+    var records: [MAX_KEY_RECORDS_CEILING]dkim.PublicKeyRecord = undefined;
+    var usable: usize = 0;
+    var seen: usize = 0;
+    var first_rejection: ?[]const u8 = null;
+
     var txt_iter = dns_result.txtRecords();
-    const key_txt = txt_iter.next() orelse
+    while (txt_iter.next()) |key_txt| {
+        if (seen >= cap) break;
+        seen += 1;
+
+        const rec = dkim.parsePublicKeyRecord(key_txt) catch {
+            if (first_rejection == null) first_rejection = "malformed key record";
+            continue;
+        };
+        if (keyRecordRejection(&rec, &sig)) |reason| {
+            if (first_rejection == null) first_rejection = reason;
+            continue;
+        }
+        records[usable] = rec;
+        usable += 1;
+    }
+
+    if (seen == 0)
         return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "no TXT record" };
 
-    // Step 3: Parse DNS key record
-    const key_record = dkim.parsePublicKeyRecord(key_txt) catch
-        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "malformed key record" };
-
-    // Check for revoked key (empty p=)
-    if (key_record.public_key.len == 0)
-        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "key revoked" };
-
-    // Check key type vs algorithm compatibility
-    if (!keyTypeMatchesAlgorithm(key_record.key_type, sig.algorithm))
-        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "key type mismatch" };
-
-    // D-11: `s=`, `h=` and `t=` were parsed into the record from the start and
-    // then never consulted, so a key restricted by its owner verified exactly as
-    // though it were unrestricted. Each of these is a MUST on the verifier, and
-    // each is a restriction the *signer* asked for, which is why the answer is
-    // permerror (the key is inapplicable) rather than fail (the signature is bad).
-    //
-    // Ordered as RFC 6376 §6.1.2 orders them, so a record that trips more than one
-    // reports the same reason another implementation would report.
-
-    // §3.6.1: "Verifiers for a given service type MUST ignore this record if the
-    // appropriate type is not listed." We are unambiguously the email service.
-    if (!dkim.keyAllowsEmailService(&key_record))
-        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "key not valid for the email service (s=)" };
-
-    // §6.1.2 step 6, verbatim: "the Verifier MUST ignore the key record and return
-    // PERMFAIL (inappropriate hash algorithm)".
-    if (!dkim.keyAllowsHashAlgorithm(&key_record, sig.algorithm))
-        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "hash algorithm not permitted by the key record (h=)" };
-
-    // §3.6.1 `t=s`: the `i=` domain "MUST NOT be a subdomain of 'd='". This is the
-    // flag's entire purpose -- a domain sets it precisely to stop a signature
-    // claiming an identity below the signing domain -- so ignoring it silently
-    // granted every subdomain identity the operator had asked us to refuse.
-    if (dkim.keyHasFlag(&key_record, "s") and !dkim.auidSatisfiesStrictFlag(&sig))
-        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "i= is not exactly d= and the key record sets t=s" };
+    // Every record published here is unusable. Reporting the first one's reason
+    // keeps a single-record zone -- overwhelmingly the common case -- answering
+    // exactly what it answered before cycling existed.
+    if (usable == 0)
+        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = first_rejection.? };
 
     // §3.6.1 `t=y`: recorded, never acted on here. See `VerifyResult.testing`.
     // Set before any of the remaining verdicts so all of them carry it, including
     // the failures -- the MUST covers a testing key "even should the signature fail
     // to verify", so a `fail` from a testing key must be as inert as a `pass`.
-    testing_out.* = dkim.keyHasFlag(&key_record, "y");
+    // Provisional until a record actually verifies, at which point the flag is
+    // re-taken from *that* record: with several published they need not agree, and
+    // the one that matters is the one the verdict rests on.
+    testing_out.* = dkim.keyHasFlag(&records[0], "y");
 
     // RFC 6376 §8.2 lets a verifier decline `l=` outright, and an operator may
     // prefer that to accepting a body whose tail nobody signed. Checked before
@@ -319,33 +390,62 @@ fn verifySignatureInner(
         return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "invalid b= base64" };
     defer allocator.free(sig_decoded);
 
-    const verified = verifyWithKey(allocator, sig.algorithm, key_record, signed_data, sig_decoded, min_key_bits) catch |err| {
-        // RFC 8301 §3.2: a signature made with an RSA key below the floor "has
-        // permanently failed evaluation", which is PERMFAIL — the same class as
-        // a malformed key record, not a signature mismatch. Reported with its
-        // own reason because "crypto verify error" would send an operator
-        // hunting a canonicalization bug instead of telling the signer to
-        // rotate to a 2048-bit key.
-        const reason: []const u8 = switch (err) {
-            error.RsaKeyTooSmall => "key too small",
-            error.NotRsaPublicKey => "p= is not an RSA key",
-            error.InvalidPublicKey => "unusable public key",
-            else => "crypto verify error",
-        };
-        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = reason };
-    };
+    // Step 8: try the candidate records against this one signed-data block
+    // (audit D-20). Everything above is key-independent and has already been done
+    // once; all that repeats here is the public-key operation itself, which is
+    // irreducible -- deciding whether a key verifies a signature is the question.
+    //
+    // The first record that verifies wins and returns immediately, so the common
+    // single-record case costs exactly one verification, and a rotation costs one
+    // extra only when the first record tried is the wrong half of the pair.
+    var failure: ?VerifyResult = null;
+    var failure_testing: bool = false;
 
-    if (verified) {
-        return .{
-            .result = .pass,
-            .domain = sig.domain,
-            .selector = sig.selector,
-            // Carried up so a partial pass can be reported as one.
-            .unsigned_body_bytes = body_result.unsigned_bytes,
+    for (records[0..usable]) |rec| {
+        const verified = verifyWithKey(allocator, sig.algorithm, rec, signed_data, sig_decoded, min_key_bits) catch |err| {
+            // RFC 8301 §3.2: a signature made with an RSA key below the floor "has
+            // permanently failed evaluation", which is PERMFAIL — the same class as
+            // a malformed key record, not a signature mismatch. Reported with its
+            // own reason because "crypto verify error" would send an operator
+            // hunting a canonicalization bug instead of telling the signer to
+            // rotate to a 2048-bit key.
+            const reason: []const u8 = switch (err) {
+                error.RsaKeyTooSmall => "key too small",
+                error.NotRsaPublicKey => "p= is not an RSA key",
+                error.InvalidPublicKey => "unusable public key",
+                else => "crypto verify error",
+            };
+            if (failure == null) {
+                failure = .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = reason };
+                failure_testing = dkim.keyHasFlag(&rec, "y");
+            }
+            continue;
         };
-    } else {
-        return .{ .result = .fail, .domain = sig.domain, .selector = sig.selector, .reason = "signature mismatch" };
+
+        if (verified) {
+            // Re-taken from the record that actually carried the verdict, which
+            // need not be the one the provisional flag came from.
+            testing_out.* = dkim.keyHasFlag(&rec, "y");
+            return .{
+                .result = .pass,
+                .domain = sig.domain,
+                .selector = sig.selector,
+                // Carried up so a partial pass can be reported as one.
+                .unsigned_body_bytes = body_result.unsigned_bytes,
+            };
+        }
+
+        // A key that simply did not match. Held rather than returned: a later
+        // record may still verify, and until they have all been tried "this
+        // signature does not verify" is not yet a fact.
+        if (failure == null) {
+            failure = .{ .result = .fail, .domain = sig.domain, .selector = sig.selector, .reason = "signature mismatch" };
+            failure_testing = dkim.keyHasFlag(&rec, "y");
+        }
     }
+
+    testing_out.* = failure_testing;
+    return failure.?;
 }
 
 /// A body hash together with how much of the body it left uncovered.
