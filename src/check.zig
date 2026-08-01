@@ -339,6 +339,11 @@ pub fn main() !void {
         emitSig(count, "domain", result.domain);
         emitSig(count, "selector", result.selector);
         if (result.reason) |reason| emitSig(count, "reason", reason);
+        // Emitted only when set, so every existing expectation is untouched. The
+        // verdict alone cannot show this: a `t=y` key is reported with its real
+        // result precisely so it looks like any other, which means the suite has
+        // no way to tell the flag survived unless it is printed (audit D-11).
+        if (result.testing) emitSig(count, "testing", "true");
         if (result.unsigned_body_bytes > 0) {
             var buf: [24]u8 = undefined;
             const n = std.fmt.bufPrint(&buf, "{d}", .{result.unsigned_body_bytes}) catch "?";

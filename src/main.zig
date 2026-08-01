@@ -400,7 +400,7 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
     // temperror: the result is unknown for a local, transient reason, which is
     // exactly what RFC 6376 6.1 reserves TEMPFAIL for.
     if (conn.contentTruncated()) {
-        addArHeader(conn, "dkim", "temperror", "", "") catch |err|
+        addArHeader(conn, "dkim", "temperror", "", "", false) catch |err|
             return auth_stamp.deferCode(err, "dkim");
         publishEvent(conn.allocator, "verify", "temperror", "", "");
         return @intFromEnum(responses.Code.@"continue");
@@ -419,7 +419,7 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
                 "more than MaxSignatures={d} DKIM-Signature headers from {f}[{f}]: not verifying",
                 .{ max_sigs, escape.logField(peer.name), escape.logField(peer.ip) },
             );
-            addArHeader(conn, "dkim", "permerror", "", "") catch |err|
+            addArHeader(conn, "dkim", "permerror", "", "", false) catch |err|
                 return auth_stamp.deferCode(err, "dkim");
             publishEvent(conn.allocator, "verify", "permerror", "", "");
             return @intFromEnum(responses.Code.@"continue");
@@ -519,13 +519,13 @@ fn doVerify(conn: *connection_mod.Connection) u8 {
             );
         }
 
-        addArHeader(conn, "dkim", result.result.toString(), result.domain, result.selector) catch |err|
+        addArHeader(conn, "dkim", result.result.toString(), result.domain, result.selector, result.testing) catch |err|
             return auth_stamp.deferCode(err, "dkim");
         publishEvent(conn.allocator, "verify", result.result.toString(), result.domain, result.selector);
     }
 
     if (!found_any) {
-        addArHeader(conn, "dkim", "none", "", "") catch |err|
+        addArHeader(conn, "dkim", "none", "", "", false) catch |err|
             return auth_stamp.deferCode(err, "dkim");
         publishEvent(conn.allocator, "verify", "none", "", "");
     }
@@ -669,8 +669,9 @@ fn addArHeader(
     result_str: []const u8,
     domain: []const u8,
     selector: []const u8,
+    testing_key: bool,
 ) !void {
-    var properties: [2]auth_results.MethodResult.Property = undefined;
+    var properties: [3]auth_results.MethodResult.Property = undefined;
     var prop_count: usize = 0;
 
     if (domain.len > 0) {
@@ -679,6 +680,18 @@ fn addArHeader(
     }
     if (selector.len > 0) {
         properties[prop_count] = .{ .ptype = "header", .property = "s", .value = selector };
+        prop_count += 1;
+    }
+
+    // D-11: the key is published `t=y`, so this result must not be acted on --
+    // see `auth_results.testing_key_marker` for why it is reported anyway and why
+    // the fact has to travel in the header rather than in memory.
+    if (testing_key) {
+        properties[prop_count] = .{
+            .ptype = auth_results.testing_key_marker.ptype,
+            .property = auth_results.testing_key_marker.property,
+            .value = auth_results.testing_key_marker.value,
+        };
         prop_count += 1;
     }
 

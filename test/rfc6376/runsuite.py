@@ -116,7 +116,15 @@ def run_case(case, check_bin, port, verbose):
 
             got = parse_output(proc.stdout.decode(errors="replace"))
             for key, want in case["expect"].items():
-                if key not in got:
+                # `None` asserts the field is ABSENT. Needed for fields emitted
+                # only when set, such as sig.N.testing: expecting a value proves
+                # the flag can be raised, and only expecting its absence proves it
+                # is not raised for every key -- which would suppress DMARC
+                # alignment everywhere and look like nothing at all.
+                if want is None:
+                    if key in got:
+                        problems.append(f"{key}: want absent, got {got[key]!r}")
+                elif key not in got:
                     problems.append(f"{key}: missing from output")
                 elif got[key] != want:
                     problems.append(f"{key}: want {want!r} got {got[key]!r}")

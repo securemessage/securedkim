@@ -448,7 +448,20 @@ NEGATIVE_CASES = [
         "message": "rfc8463-ed25519.eml",
         "zone": {ED25519_NAME: "v=DKIM1; t=y; k=ed25519; "
                                "p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="},
-        "expect": {"sig.0.result": "pass"},
+        "expect": {"sig.0.result": "pass", "sig.0.testing": "true"},
+    },
+    {
+        "name": "key_without_t_y_is_not_marked_testing",
+        "section": "RFC 6376 3.6.1",
+        "source": "t= Flags ... OPTIONAL, default is no flags set.",
+        "note": "The guard on the case above, and the one that matters most: if "
+                "every key were marked testing, no DKIM pass would ever reach "
+                "DMARC and the suppression would silently break all alignment. "
+                "This is the ordinary vector with the ordinary key -- the same "
+                "record every other case uses -- so the marker must be absent.",
+        "message": "rfc8463-ed25519.eml",
+        "zone": FULL_ZONE,
+        "expect": {"sig.0.result": "pass", "sig.0.testing": None},
     },
 ]
 
