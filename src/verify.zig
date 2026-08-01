@@ -67,6 +67,22 @@ pub const VerifyResult = struct {
     /// RFC 6376 §8.2: appended content "to completely replace the original
     /// content in the end recipient's eyes" is the attack this enables.
     unsigned_body_bytes: u64 = 0,
+    /// The key record carried `t=y`: the signing domain is testing DKIM.
+    ///
+    /// Deliberately NOT folded into `result`. RFC 6376 §3.6.1 requires that
+    /// verifiers "MUST NOT treat messages from Signers in testing mode differently
+    /// from unsigned email, even should the signature fail to verify" -- but it
+    /// also says "Verifiers MAY wish to track testing mode results to assist the
+    /// Signer", and reporting `none` would throw away the very information the
+    /// signer published the key to obtain. OpenDKIM resolves this the same way,
+    /// reporting the real result and annotating it, suppressing only the action.
+    ///
+    /// The MUST therefore binds whoever *acts* on this, not the verdict itself.
+    /// For us that is DMARC alignment, because `securedmarc` consumes our A-R and
+    /// an aligned pass from a testing key would let it do precisely what the MUST
+    /// forbids. OpenDKIM never faces that half: its scope is DKIM only and
+    /// `opendmarc` is a separate program.
+    testing: bool = false,
 };
 
 /// Verify a single DKIM-Signature against the message headers and body.
@@ -101,6 +117,41 @@ pub fn verifySignature(
     body: []const u8,
     min_key_bits: u32,
     body_length_policy: BodyLengthPolicy,
+) VerifyResult {
+    // `t=y` is discovered midway -- the key record has to be fetched and parsed
+    // first -- but it belongs on every verdict reached after that point, and this
+    // function has around ten of them. Setting it at each `return` would be ten
+    // chances to miss one, and the one missed would be a testing key quietly
+    // contributing a DMARC pass. So the work happens in `verifySignatureInner`,
+    // which reports the flag through an out-parameter (the `reason: *?[]const u8`
+    // convention `chain.zig` and `sealbuild.zig` already use), and it is stamped
+    // here exactly once, on whatever comes back.
+    var key_testing = false;
+    var result = verifySignatureInner(
+        allocator,
+        resolver,
+        sig_header_value,
+        sig_header_raw,
+        headers,
+        body,
+        min_key_bits,
+        body_length_policy,
+        &key_testing,
+    );
+    result.testing = key_testing;
+    return result;
+}
+
+fn verifySignatureInner(
+    allocator: Allocator,
+    resolver: *dns_mod.Resolver,
+    sig_header_value: []const u8,
+    sig_header_raw: []const u8,
+    headers: []const []const u8,
+    body: []const u8,
+    min_key_bits: u32,
+    body_length_policy: BodyLengthPolicy,
+    testing_out: *bool,
 ) VerifyResult {
     // Step 1: Parse the DKIM-Signature. Every outcome is permerror -- we could not
     // evaluate this signature, which is not the claim `fail` makes -- but the reasons
@@ -178,6 +229,38 @@ pub fn verifySignature(
     // Check key type vs algorithm compatibility
     if (!keyTypeMatchesAlgorithm(key_record.key_type, sig.algorithm))
         return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "key type mismatch" };
+
+    // D-11: `s=`, `h=` and `t=` were parsed into the record from the start and
+    // then never consulted, so a key restricted by its owner verified exactly as
+    // though it were unrestricted. Each of these is a MUST on the verifier, and
+    // each is a restriction the *signer* asked for, which is why the answer is
+    // permerror (the key is inapplicable) rather than fail (the signature is bad).
+    //
+    // Ordered as RFC 6376 §6.1.2 orders them, so a record that trips more than one
+    // reports the same reason another implementation would report.
+
+    // §3.6.1: "Verifiers for a given service type MUST ignore this record if the
+    // appropriate type is not listed." We are unambiguously the email service.
+    if (!dkim.keyAllowsEmailService(&key_record))
+        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "key not valid for the email service (s=)" };
+
+    // §6.1.2 step 6, verbatim: "the Verifier MUST ignore the key record and return
+    // PERMFAIL (inappropriate hash algorithm)".
+    if (!dkim.keyAllowsHashAlgorithm(&key_record, sig.algorithm))
+        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "hash algorithm not permitted by the key record (h=)" };
+
+    // §3.6.1 `t=s`: the `i=` domain "MUST NOT be a subdomain of 'd='". This is the
+    // flag's entire purpose -- a domain sets it precisely to stop a signature
+    // claiming an identity below the signing domain -- so ignoring it silently
+    // granted every subdomain identity the operator had asked us to refuse.
+    if (dkim.keyHasFlag(&key_record, "s") and !dkim.auidSatisfiesStrictFlag(&sig))
+        return .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "i= is not exactly d= and the key record sets t=s" };
+
+    // §3.6.1 `t=y`: recorded, never acted on here. See `VerifyResult.testing`.
+    // Set before any of the remaining verdicts so all of them carry it, including
+    // the failures -- the MUST covers a testing key "even should the signature fail
+    // to verify", so a `fail` from a testing key must be as inert as a `pass`.
+    testing_out.* = dkim.keyHasFlag(&key_record, "y");
 
     // RFC 6376 §8.2 lets a verifier decline `l=` outright, and an operator may
     // prefer that to accepting a body whose tail nobody signed. Checked before

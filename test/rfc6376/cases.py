@@ -320,6 +320,136 @@ NEGATIVE_CASES = [
         "zone": FULL_ZONE,
         "expect": {"sig.0.result": "permerror", "sig.0.reason": "from not signed"},
     },
+
+    # -----------------------------------------------------------------------
+    # D-11: key-record restrictions.
+    # -----------------------------------------------------------------------
+    # These mutate the KEY RECORD rather than the message, which the `zone` key
+    # already supports and no earlier case used this way. `securedkim` parsed
+    # h=, s= and t= into its record struct from the first commit and then never
+    # consulted any of them, so a key its owner had restricted verified exactly
+    # as though it were unrestricted.
+    #
+    # Unit tests over the predicates cannot replace these. The predicates could
+    # each be perfect while nothing called them -- which is precisely the state
+    # this code was in -- so what these pin is the wiring: a restricted key,
+    # served over real DNS, reaching the real verify path.
+    #
+    # Each restriction gets a matching positive case. A check that refuses too
+    # much is as broken as one that refuses nothing, and would reject most of
+    # the internet, since almost no real record publishes any of these tags.
+    {
+        "name": "key_h_excludes_signature_hash_permfails",
+        "section": "RFC 6376 6.1.2",
+        "source": "If the \"h=\" tag exists in the public-key record and the hash "
+                  "algorithm implied by the \"a=\" tag in the DKIM-Signature "
+                  "header field is not included in the contents of the \"h=\" "
+                  "tag, the Verifier MUST ignore the key record and return "
+                  "PERMFAIL (inappropriate hash algorithm).",
+        "note": "Key restricted to sha1; the vector signs ed25519-sha256. "
+                "permerror and not fail: the signature is almost certainly "
+                "good, but the key record says it must not be used this way.",
+        "message": "rfc8463-ed25519.eml",
+        "zone": {ED25519_NAME: "v=DKIM1; h=sha1; k=ed25519; "
+                               "p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="},
+        "expect": {"sig.0.result": "permerror",
+                   "sig.0.reason": "hash algorithm not permitted by the key record (h=)"},
+    },
+    {
+        "name": "key_h_includes_signature_hash_passes",
+        "section": "RFC 6376 3.6.1",
+        "source": "h= Acceptable hash algorithms ... A colon-separated list of "
+                  "hash algorithms that might be used.",
+        "note": "The guard on the case above. `ed25519-sha256` hashes with "
+                "SHA-256, so `h=sha256` permits it -- an implementation "
+                "comparing the algorithm's own name against the list would "
+                "reject every Ed25519 signature from a key that published h=.",
+        "message": "rfc8463-ed25519.eml",
+        "zone": {ED25519_NAME: "v=DKIM1; h=sha256; k=ed25519; "
+                               "p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="},
+        "expect": {"sig.0.result": "pass"},
+    },
+    {
+        "name": "key_s_not_email_permfails",
+        "section": "RFC 6376 3.6.1",
+        "source": "Verifiers for a given service type MUST ignore this record "
+                  "if the appropriate type is not listed.",
+        "note": "A key published for some other service. We are unambiguously "
+                "the email service, so this record is not ours to use.",
+        "message": "rfc8463-ed25519.eml",
+        "zone": {ED25519_NAME: "v=DKIM1; s=tlsa; k=ed25519; "
+                               "p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="},
+        "expect": {"sig.0.result": "permerror",
+                   "sig.0.reason": "key not valid for the email service (s=)"},
+    },
+    {
+        "name": "key_s_lists_email_passes",
+        "section": "RFC 6376 3.6.1",
+        "source": "email   electronic mail (not necessarily limited to SMTP)",
+        "note": "`s=` is a colon-separated LIST. Matching the whole tag value "
+                "against \"email\" rather than searching the list would reject "
+                "this, and the default `*` case is covered by every other case "
+                "in this file, all of which omit s= entirely.",
+        "message": "rfc8463-ed25519.eml",
+        "zone": {ED25519_NAME: "v=DKIM1; s=tlsa:email; k=ed25519; "
+                               "p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="},
+        "expect": {"sig.0.result": "pass"},
+    },
+    {
+        "name": "key_t_s_with_exact_i_passes",
+        "section": "RFC 6376 3.6.1",
+        "source": "s  Any DKIM-Signature header fields using the \"i=\" tag MUST "
+                  "have the same domain value on the right-hand side of the "
+                  "\"@\" in the \"i=\" tag and the value of the \"d=\" tag.",
+        "note": "The vector already carries i=@football.example.com against "
+                "d=football.example.com, so it satisfies the strict flag "
+                "unchanged. Without this, an over-strict implementation that "
+                "rejected every t=s key would pass the negative case below.",
+        "message": "rfc8463-ed25519.eml",
+        "zone": {ED25519_NAME: "v=DKIM1; t=s; k=ed25519; "
+                               "p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="},
+        "expect": {"sig.0.result": "pass"},
+    },
+    {
+        "name": "key_t_s_with_subdomain_i_permfails",
+        "section": "RFC 6376 3.6.1",
+        "source": "That is, the \"i=\" domain MUST NOT be a subdomain of \"d=\".",
+        "note": "i= moved to a subdomain, which is the single thing t=s exists "
+                "to refuse. As with from_not_signed_permfails, editing the "
+                "DKIM-Signature breaks the signature too, so what this pins is "
+                "the RESULT CLASS: permerror because the key record forbids the "
+                "identity, not fail because the bytes did not match. Were the "
+                "t=s check absent, this case would report fail and this "
+                "expectation would catch it.",
+        "message": "rfc8463-ed25519.eml",
+        "mutate": [(" d=football.example.com; i=@football.example.com;",
+                    " d=football.example.com; i=@mail.football.example.com;")],
+        "zone": {ED25519_NAME: "v=DKIM1; t=s; k=ed25519; "
+                               "p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="},
+        "expect": {"sig.0.result": "permerror",
+                   "sig.0.reason": "i= is not exactly d= and the key record sets t=s"},
+    },
+    {
+        "name": "key_t_y_still_reports_the_real_result",
+        "section": "RFC 6376 3.6.1",
+        "source": "y  This domain is testing DKIM.  Verifiers MUST NOT treat "
+                  "messages from Signers in testing mode differently from "
+                  "unsigned email, even should the signature fail to verify.  "
+                  "Verifiers MAY wish to track testing mode results to assist "
+                  "the Signer.",
+        "note": "The MUST binds what a verifier DOES about the result, not what "
+                "it reports. Reporting `none` would satisfy the first sentence "
+                "and destroy the second -- the signer published a testing key "
+                "precisely to find out whether it verifies. OpenDKIM resolves "
+                "this the same way: the real result, annotated, with only the "
+                "action suppressed. For us the suppressed action is DMARC "
+                "alignment, since securedmarc consumes this A-R; that half is "
+                "not visible to this suite and is pinned on the DMARC side.",
+        "message": "rfc8463-ed25519.eml",
+        "zone": {ED25519_NAME: "v=DKIM1; t=y; k=ed25519; "
+                               "p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="},
+        "expect": {"sig.0.result": "pass"},
+    },
 ]
 
 

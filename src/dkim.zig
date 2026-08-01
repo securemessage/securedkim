@@ -256,6 +256,90 @@ pub const PublicKeyRecord = struct {
     flags: ?[]const u8 = null,
 };
 
+/// Hash algorithm name for the `h=` key-record comparison (RFC 6376 §3.6.1).
+///
+/// Both algorithms we implement hash with SHA-256, so this is not derived from
+/// the signature algorithm's name: `ed25519-sha256` must compare as `sha256`,
+/// not as itself.
+fn hashNameOf(alg: Algorithm) []const u8 {
+    return switch (alg) {
+        .rsa_sha256, .ed25519_sha256 => "sha256",
+    };
+}
+
+/// Does the key record's `h=` permit this signature's hash algorithm?
+///
+/// RFC 6376 §6.1.2 step 6: "If the 'h=' tag exists in the public-key record and
+/// the hash algorithm implied by the 'a=' tag in the DKIM-Signature header field
+/// is not included in the contents of the 'h=' tag, the Verifier MUST ignore the
+/// key record and return PERMFAIL (inappropriate hash algorithm)."
+///
+/// Absent `h=` "defaults to allowing all algorithms" (§3.6.1), so a record without
+/// the tag permits everything. The tag constrains what a signer *will* use, so a
+/// key published `h=sha256` and used with something else is a signer error, not a
+/// forgery -- which is why this is permerror rather than fail.
+pub fn keyAllowsHashAlgorithm(rec: *const PublicKeyRecord, alg: Algorithm) bool {
+    const list = rec.hash_algorithms orelse return true;
+    const want = hashNameOf(alg);
+    var it = mem.splitScalar(u8, list, ':');
+    while (it.next()) |entry| {
+        // "Unrecognized algorithms MUST be ignored" (§3.6.1) -- ignoring one we do
+        // not know means it simply does not match, which is what a plain compare
+        // already does. Nothing to special-case.
+        if (mem.eql(u8, mem.trim(u8, entry, " \t"), want)) return true;
+    }
+    return false;
+}
+
+/// Does the key record's `s=` cover email?
+///
+/// RFC 6376 §3.6.1: "Verifiers for a given service type MUST ignore this record if
+/// the appropriate type is not listed. Unrecognized service types MUST be ignored."
+/// `*` matches all service types; `email` is the one that matters to a milter.
+///
+/// The default is `*`, so a record without the tag applies. A record published
+/// `s=` for some other service is one the operator has said is not for mail, and
+/// honouring that is the whole point of the tag.
+pub fn keyAllowsEmailService(rec: *const PublicKeyRecord) bool {
+    var it = mem.splitScalar(u8, rec.service_type, ':');
+    while (it.next()) |entry| {
+        const t = mem.trim(u8, entry, " \t");
+        if (mem.eql(u8, t, "*") or mem.eql(u8, t, "email")) return true;
+    }
+    return false;
+}
+
+/// Is `flag` present in the key record's `t=` list?
+///
+/// RFC 6376 §3.6.1: "Unrecognized flags MUST be ignored", so an unknown flag
+/// alongside a known one must not disturb the known one -- hence a membership
+/// test over the list rather than an equality test against the whole value.
+pub fn keyHasFlag(rec: *const PublicKeyRecord, flag: []const u8) bool {
+    const flags = rec.flags orelse return false;
+    var it = mem.splitScalar(u8, flags, ':');
+    while (it.next()) |entry| {
+        if (mem.eql(u8, mem.trim(u8, entry, " \t"), flag)) return true;
+    }
+    return false;
+}
+
+/// Under `t=s`, does this signature's `i=` sit exactly on `d=`?
+///
+/// RFC 6376 §3.6.1: "Any DKIM-Signature header fields using the 'i=' tag MUST have
+/// the same domain value on the right-hand side of the '@' in the 'i=' tag and the
+/// value of the 'd=' tag. That is, the 'i=' domain MUST NOT be a subdomain of 'd='."
+///
+/// Only constrains signatures that carry `i=`; absent the tag there is nothing to
+/// compare, and §3.5's default AUID is `@d=` anyway, which satisfies the rule.
+/// The local-part is irrelevant, so everything up to and including the last `@` is
+/// discarded -- last, not first, because a quoted local-part may itself contain one.
+pub fn auidSatisfiesStrictFlag(sig: *const Signature) bool {
+    const auid = sig.auid orelse return true;
+    const at = mem.lastIndexOfScalar(u8, auid, '@') orelse return false;
+    const auid_domain = auid[at + 1 ..];
+    return std.ascii.eqlIgnoreCase(auid_domain, sig.domain);
+}
+
 /// Parse a DKIM DNS TXT record (tag=value format, same as signature).
 pub fn parsePublicKeyRecord(value: []const u8) !PublicKeyRecord {
     var rec = PublicKeyRecord{};
@@ -430,6 +514,114 @@ test "parse public key record revoked" {
     const value = "v=DKIM1; k=rsa; p=";
     const rec = try parsePublicKeyRecord(value);
     try std.testing.expectEqual(@as(usize, 0), rec.public_key.len);
+}
+
+// --- D-11: key-record restrictions the signer asked for ---------------------
+//
+// All four tags were parsed into `PublicKeyRecord` from the first commit and then
+// never read, so a key its owner had restricted verified exactly as though it were
+// unrestricted. These pin each restriction and, as much as the negative cases, the
+// defaults -- a check that refuses too much is as broken as one that refuses
+// nothing, and would reject most of the internet, which publishes none of these.
+
+test "D-11: h= admits the signature's hash, absent h= admits everything" {
+    // §3.6.1: absent, it "defaults to allowing all algorithms".
+    const none = try parsePublicKeyRecord("v=DKIM1; k=rsa; p=AAAA");
+    try std.testing.expect(keyAllowsHashAlgorithm(&none, .rsa_sha256));
+    try std.testing.expect(keyAllowsHashAlgorithm(&none, .ed25519_sha256));
+
+    const sha256 = try parsePublicKeyRecord("v=DKIM1; h=sha256; k=rsa; p=AAAA");
+    try std.testing.expect(keyAllowsHashAlgorithm(&sha256, .rsa_sha256));
+    // ed25519-sha256 hashes with SHA-256, so `h=sha256` permits it. Comparing the
+    // algorithm's own name would wrongly reject this.
+    try std.testing.expect(keyAllowsHashAlgorithm(&sha256, .ed25519_sha256));
+
+    // §6.1.2 step 6: not listed, so the key record MUST be ignored.
+    const sha1 = try parsePublicKeyRecord("v=DKIM1; h=sha1; k=rsa; p=AAAA");
+    try std.testing.expect(!keyAllowsHashAlgorithm(&sha1, .rsa_sha256));
+
+    // "Unrecognized algorithms MUST be ignored" -- an unknown name alongside a
+    // known one must not disturb the known one.
+    const mixed = try parsePublicKeyRecord("v=DKIM1; h=sha1:whirlpool:sha256; k=rsa; p=AAAA");
+    try std.testing.expect(keyAllowsHashAlgorithm(&mixed, .rsa_sha256));
+    const unknown_only = try parsePublicKeyRecord("v=DKIM1; h=whirlpool; k=rsa; p=AAAA");
+    try std.testing.expect(!keyAllowsHashAlgorithm(&unknown_only, .rsa_sha256));
+}
+
+test "D-11: s= must cover email, and defaults to covering it" {
+    // Default is `*`, which is why the overwhelming majority of real records --
+    // which omit s= entirely -- must keep verifying.
+    const absent = try parsePublicKeyRecord("v=DKIM1; k=rsa; p=AAAA");
+    try std.testing.expect(keyAllowsEmailService(&absent));
+
+    const star = try parsePublicKeyRecord("v=DKIM1; s=*; k=rsa; p=AAAA");
+    try std.testing.expect(keyAllowsEmailService(&star));
+    const email = try parsePublicKeyRecord("v=DKIM1; s=email; k=rsa; p=AAAA");
+    try std.testing.expect(keyAllowsEmailService(&email));
+    const listed = try parsePublicKeyRecord("v=DKIM1; s=tlsa:email; k=rsa; p=AAAA");
+    try std.testing.expect(keyAllowsEmailService(&listed));
+
+    // §3.6.1: "Verifiers for a given service type MUST ignore this record if the
+    // appropriate type is not listed."
+    const other = try parsePublicKeyRecord("v=DKIM1; s=tlsa; k=rsa; p=AAAA");
+    try std.testing.expect(!keyAllowsEmailService(&other));
+}
+
+test "D-11: t= flags are a list, and unrecognized ones are ignored" {
+    const absent = try parsePublicKeyRecord("v=DKIM1; k=rsa; p=AAAA");
+    try std.testing.expect(!keyHasFlag(&absent, "y"));
+    try std.testing.expect(!keyHasFlag(&absent, "s"));
+
+    const y = try parsePublicKeyRecord("v=DKIM1; t=y; k=rsa; p=AAAA");
+    try std.testing.expect(keyHasFlag(&y, "y"));
+    try std.testing.expect(!keyHasFlag(&y, "s"));
+
+    // Both flags, plus one from the future. A substring or whole-value compare
+    // would get at least one of these wrong.
+    const both = try parsePublicKeyRecord("v=DKIM1; t=y:s:x-future; k=rsa; p=AAAA");
+    try std.testing.expect(keyHasFlag(&both, "y"));
+    try std.testing.expect(keyHasFlag(&both, "s"));
+
+    // `t=s` alone must not read as testing mode. Getting this wrong would make
+    // every strict key inert, which is the opposite of what the operator asked for.
+    const s_only = try parsePublicKeyRecord("v=DKIM1; t=s; k=rsa; p=AAAA");
+    try std.testing.expect(!keyHasFlag(&s_only, "y"));
+    try std.testing.expect(keyHasFlag(&s_only, "s"));
+}
+
+test "D-11: t=s requires i= to sit exactly on d=" {
+    // No i= at all: nothing to constrain. §3.5's default AUID is `@d=`.
+    const no_auid = Signature{ .domain = "example.com" };
+    try std.testing.expect(auidSatisfiesStrictFlag(&no_auid));
+
+    const exact = Signature{ .domain = "example.com", .auid = "user@example.com" };
+    try std.testing.expect(auidSatisfiesStrictFlag(&exact));
+
+    // Bare `@d=`, the default spelled out.
+    const bare = Signature{ .domain = "example.com", .auid = "@example.com" };
+    try std.testing.expect(auidSatisfiesStrictFlag(&bare));
+
+    // Domains are case-insensitive.
+    const cased = Signature{ .domain = "Example.COM", .auid = "user@example.com" };
+    try std.testing.expect(auidSatisfiesStrictFlag(&cased));
+
+    // The case the flag exists to refuse: "the 'i=' domain MUST NOT be a
+    // subdomain of 'd='".
+    const sub = Signature{ .domain = "example.com", .auid = "user@mail.example.com" };
+    try std.testing.expect(!auidSatisfiesStrictFlag(&sub));
+
+    // A suffix match rather than an equality check would accept this, and it is
+    // not a subdomain of example.com at all.
+    const lookalike = Signature{ .domain = "example.com", .auid = "user@notexample.com" };
+    try std.testing.expect(!auidSatisfiesStrictFlag(&lookalike));
+
+    // A quoted local-part may contain '@'; the domain is after the LAST one.
+    const quoted = Signature{ .domain = "example.com", .auid = "\"odd@name\"@example.com" };
+    try std.testing.expect(auidSatisfiesStrictFlag(&quoted));
+
+    // An i= with no '@' cannot have the same domain on the right of one.
+    const malformed = Signature{ .domain = "example.com", .auid = "example.com" };
+    try std.testing.expect(!auidSatisfiesStrictFlag(&malformed));
 }
 
 test "generate header value" {
