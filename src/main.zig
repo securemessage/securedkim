@@ -236,7 +236,7 @@ fn runDaemon() !void {
         .pid_file = dkim_cfg.pid_file,
         .user = dkim_cfg.user,
         .worker_threads = dkim_cfg.worker_threads,
-        .max_connections = worker_mod.DEFAULT_MAX_CONNECTIONS,
+        .max_connections = dkim_cfg.max_connections,
         .num_listeners = @intCast(dkim_cfg.listen_addresses.len),
         .spawn_threads = spawnHealthMonitor,
     });
@@ -281,7 +281,7 @@ fn runDaemon() !void {
         callbacks,
         shutdown_pipe[0],
         &g_config_gen,
-        worker_mod.DEFAULT_MAX_CONNECTIONS,
+        dkim_cfg.max_connections,
     );
     defer threads.deinit(allocator);
 
