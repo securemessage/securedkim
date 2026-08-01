@@ -34,7 +34,8 @@ pub const Paths = struct {
 pub const Shorthand = struct {
     domain: ?[]const u8 = null,
     selector: ?[]const u8 = null,
-    signed_headers: []const u8 = "from:to:subject:date:message-id",
+    signed_headers: []const u8 = sign_mod.DEFAULT_SIGNED_HEADERS,
+    oversign_headers: []const u8 = sign_mod.DEFAULT_OVERSIGN_HEADERS,
 };
 
 /// Set once at startup and on reload, read by every worker thereafter.
@@ -209,6 +210,7 @@ pub fn resolve(
                     .domain = d,
                     .selector = g_shorthand.selector orelse "default",
                     .signed_headers = g_shorthand.signed_headers,
+                    .oversign_headers = g_shorthand.oversign_headers,
                 },
                 .key = key,
             };
@@ -230,6 +232,7 @@ pub fn resolve(
                     .domain = row.domain,
                     .selector = row.selector,
                     .signed_headers = g_shorthand.signed_headers,
+                    .oversign_headers = g_shorthand.oversign_headers,
                 },
                 .key = key,
             };

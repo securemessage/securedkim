@@ -205,6 +205,7 @@ fn runDaemon() !void {
         .domain = dkim_cfg.sign_domain,
         .selector = dkim_cfg.sign_selector,
         .signed_headers = dkim_cfg.signed_headers,
+        .oversign_headers = dkim_cfg.oversign_headers,
     });
 
     g_signing = signing.Rcu.init(allocator, signing.free);

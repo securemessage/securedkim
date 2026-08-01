@@ -21,6 +21,7 @@ const connection_mod = securemilter.connection;
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
 
+const sign = @import("sign.zig");
 const verify = @import("verify.zig");
 
 /// Listener mode for DKIM processing.
@@ -99,6 +100,7 @@ pub const DkimConfig = struct {
     sign_selector: ?[]const u8,
     sign_key_file: ?[]const u8,
     signed_headers: []const u8,
+    oversign_headers: []const u8,
     strip_auth_results: bool,
     zmq_endpoint: ?[]const u8,
     zmq_topic: []const u8,
@@ -214,7 +216,11 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
     const dns_retries = global.getInt("DnsRetries", u8, 2);
     const dns_cache_size = global.getInt("DnsCacheSize", u32, 1000);
     const dns_negative_ttl = global.getInt("DnsNegativeTTL", u32, 60);
-    const signed_headers = global.getOrDefault("SignedHeaders", "from:to:subject:date:message-id");
+    const signed_headers = global.getOrDefault("SignedHeaders", sign.DEFAULT_SIGNED_HEADERS);
+
+    // Spelled as OpenDKIM spells it, so a migrated opendkim.conf line works
+    // verbatim. Empty disables oversigning (audit D-12).
+    const oversign_headers = global.getOrDefault("OverSignHeaders", sign.DEFAULT_OVERSIGN_HEADERS);
 
     // Trust boundary: when this is the first milter in the chain, no A-R header
     // claiming our authserv-id can be genuine on arrival (RFC 8601 §5).
@@ -253,6 +259,7 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
         .sign_selector = sign_selector,
         .sign_key_file = sign_key_file,
         .signed_headers = signed_headers,
+        .oversign_headers = oversign_headers,
         .strip_auth_results = strip_auth_results,
         .zmq_endpoint = zmq_endpoint,
         .zmq_topic = zmq_topic,

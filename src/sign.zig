@@ -9,13 +9,34 @@ const header_select = securemilter_crypto.header_select;
 
 const dkim = @import("dkim.zig");
 
+/// The shipped `h=` list. Defined once here and referenced by the settings
+/// parser, the shorthand config and the CLI, all of which used to carry their
+/// own copy of the same string -- four places to change and three to forget.
+pub const DEFAULT_SIGNED_HEADERS = "from:to:subject:date:message-id";
+
+/// Headers oversigned by default (audit D-12).
+///
+/// `from` alone. RFC 6376 §5.4 calls From the one header a signature MUST cover,
+/// and RFC 7489 makes it the identity DMARC aligns against, so an added second
+/// From is the substitution that actually buys an attacker something. The same
+/// section warns against signing "header fields that might have additional
+/// instances added later in the delivery process", which is why this is not a
+/// longer list: oversigning a field that legitimately gains instances in transit
+/// converts ordinary handling into a signature failure. `to`, `cc` and the
+/// MIME fields are all plausible candidates and all carry that risk, so they are
+/// left to the operator.
+pub const DEFAULT_OVERSIGN_HEADERS = "from";
+
 /// Signing parameters provided by config/keytable.
 pub const SigningParams = struct {
     domain: []const u8,
     selector: []const u8,
     algorithm: dkim.Algorithm = .rsa_sha256,
     canonicalization: canon.CanonicalizationPair = .{ .header = .relaxed, .body = .relaxed },
-    signed_headers: []const u8 = "from:to:subject:date:message-id",
+    signed_headers: []const u8 = DEFAULT_SIGNED_HEADERS,
+    /// Names listed one more time than the message contains them, so that adding
+    /// another instance later breaks the signature. Empty disables it.
+    oversign_headers: []const u8 = DEFAULT_OVERSIGN_HEADERS,
     auid: ?[]const u8 = null,
     body_length: ?u64 = null,
     include_timestamp: bool = true,
@@ -52,6 +73,18 @@ pub fn signMessage(
     const bh_b64 = try crypto.base64Encode(allocator, &body_hash);
     defer allocator.free(bh_b64);
 
+    // The `h=` actually emitted and hashed, which is the configured list plus
+    // the oversigning surplus (audit D-12). Computed once and used for both: if
+    // the emitted tag and the hashed tag could differ, the signature would cover
+    // a header set other than the one it claims and no verifier would agree.
+    const effective_h = try header_select.oversignedLineTag(
+        allocator,
+        params.signed_headers,
+        params.oversign_headers,
+        headers,
+    );
+    defer allocator.free(effective_h);
+
     // Build the Signature struct for header generation
     const now = @as(u64, @intCast(std.time.timestamp()));
 
@@ -59,7 +92,7 @@ pub fn signMessage(
         .algorithm = params.algorithm,
         .domain = params.domain,
         .selector = params.selector,
-        .signed_headers = params.signed_headers,
+        .signed_headers = effective_h,
         .canonicalization = params.canonicalization,
         .body_hash = bh_b64,
         .auid = params.auid,
@@ -82,7 +115,13 @@ pub fn signMessage(
     defer allocator.free(dkim_header_line);
 
     // Step 3: Build signed data (canonicalized h= headers + DKIM-Signature template)
-    const signed_data = try buildSigningInput(allocator, params, headers, dkim_header_line);
+    const signed_data = try buildSigningInput(
+        allocator,
+        effective_h,
+        params.canonicalization.header,
+        headers,
+        dkim_header_line,
+    );
     defer allocator.free(signed_data);
 
     // Step 4-5: Sign and base64 encode
@@ -130,9 +169,14 @@ fn buildFullHeader(allocator: Allocator, header_value: []const u8) ![]u8 {
 }
 
 /// Build the data block to be signed: canonicalized headers + DKIM-Signature template.
+/// `h_tag` is the effective list -- the one that will be emitted -- not the
+/// configured one. Taking it as an argument rather than reading it back out of
+/// `params` is what keeps the hashed set and the emitted set the same object
+/// once oversigning can make them differ (audit D-12).
 fn buildSigningInput(
     allocator: Allocator,
-    params: *const SigningParams,
+    h_tag: []const u8,
+    header_canon: canon.Algorithm,
     headers: []const []const u8,
     dkim_header_line: []const u8,
 ) ![]u8 {
@@ -143,17 +187,18 @@ fn buildSigningInput(
     // signer that hashes a repeated `h=` name differently from how a compliant
     // verifier will read it produces a signature nobody else can verify. With
     // the old per-mention lookup this was latent only because the shipped
-    // default names no field twice (audit D-1).
-    var walk = header_select.lineWalker(params.signed_headers, headers);
+    // default names no field twice (audit D-1) -- which is no longer true, since
+    // the default now oversigns `from`.
+    var walk = header_select.lineWalker(h_tag, headers);
     while (walk.next()) |header| {
-        const canonicalized = try canon.canonicalizeHeader(allocator, params.canonicalization.header, header);
+        const canonicalized = try canon.canonicalizeHeader(allocator, header_canon, header);
         defer allocator.free(canonicalized);
         try data.appendSlice(allocator, canonicalized);
         try data.appendSlice(allocator, "\r\n");
     }
 
     // Append the DKIM-Signature header (no trailing CRLF per RFC 6376 §3.7)
-    const dkim_canon = try canon.canonicalizeHeader(allocator, params.canonicalization.header, dkim_header_line);
+    const dkim_canon = try canon.canonicalizeHeader(allocator, header_canon, dkim_header_line);
     defer allocator.free(dkim_canon);
     try data.appendSlice(allocator, dkim_canon);
 
@@ -239,11 +284,6 @@ test "find header reverse order" {
 
 test "build signing input produces deterministic output" {
     const allocator = std.testing.allocator;
-    const params = SigningParams{
-        .domain = "example.com",
-        .selector = "sel",
-        .signed_headers = "from:to",
-    };
     const headers = &[_][]const u8{
         "From: user@example.com",
         "To: rcpt@other.com",
@@ -251,7 +291,7 @@ test "build signing input produces deterministic output" {
     };
     const dkim_line = "DKIM-Signature: v=1; a=rsa-sha256; d=example.com; s=sel; h=from:to; bh=hash; b=";
 
-    const result = try buildSigningInput(allocator, &params, headers, dkim_line);
+    const result = try buildSigningInput(allocator, "from:to", .relaxed, headers, dkim_line);
     defer allocator.free(result);
 
     // Asserted byte for byte, not by substring presence. What is being signed
@@ -271,19 +311,14 @@ test "an oversigned h= hashes the field once, not twice (D-1)" {
     // mention has no instance left to consume, and §3.7 makes that the null
     // input -- nothing at all is added to the hash. The old per-mention lookup
     // returned the same header for both mentions and hashed it twice, so every
-    // message from a signer using OpenDKIM's `OversignHeaders` failed here.
+    // message from a signer using OpenDKIM's `OverSignHeaders` failed here.
     const allocator = std.testing.allocator;
-    const params = SigningParams{
-        .domain = "example.com",
-        .selector = "sel",
-        .signed_headers = "from:from",
-    };
     const headers = &[_][]const u8{
         "From: user@example.com",
         "Subject: Hello",
     };
 
-    const result = try buildSigningInput(allocator, &params, headers, "DKIM-Signature: b=");
+    const result = try buildSigningInput(allocator, "from:from", .relaxed, headers, "DKIM-Signature: b=");
     defer allocator.free(result);
 
     try std.testing.expectEqualStrings(
@@ -294,17 +329,12 @@ test "an oversigned h= hashes the field once, not twice (D-1)" {
 
 test "repeated h= mentions hash successive instances, bottom upward (D-1)" {
     const allocator = std.testing.allocator;
-    const params = SigningParams{
-        .domain = "example.com",
-        .selector = "sel",
-        .signed_headers = "from:from",
-    };
     const headers = &[_][]const u8{
         "From: top@example.com",
         "From: bottom@example.com",
     };
 
-    const result = try buildSigningInput(allocator, &params, headers, "DKIM-Signature: b=");
+    const result = try buildSigningInput(allocator, "from:from", .relaxed, headers, "DKIM-Signature: b=");
     defer allocator.free(result);
 
     // Bottom-most first, then the next one up -- not the same header twice.

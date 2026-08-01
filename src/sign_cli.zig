@@ -59,6 +59,9 @@ const Usage =
     \\                   simple/simple, relaxed/simple, simple/relaxed
     \\  --headers <list> Colon-separated h= list
     \\                   (default: from:to:subject:date:message-id)
+    \\  --oversign <list> Colon-separated names to list once more than the message
+    \\                   contains them, so a later addition breaks the signature
+    \\                   (default: from; empty string disables)
     \\  -l               Include l= covering the whole canonicalized body
     \\  --no-timestamp   Omit t=, so output is byte-stable across runs
     \\  --no-normalize   Do not rewrite bare CR/LF in the file to CRLF
@@ -79,7 +82,8 @@ const Args = struct {
     key_file: ?[]const u8 = null,
     algorithm: dkim.Algorithm = .rsa_sha256,
     canonicalization: canon.CanonicalizationPair = .{ .header = .relaxed, .body = .relaxed },
-    signed_headers: []const u8 = "from:to:subject:date:message-id",
+    signed_headers: []const u8 = sign.DEFAULT_SIGNED_HEADERS,
+    oversign_headers: []const u8 = sign.DEFAULT_OVERSIGN_HEADERS,
     include_length: bool = false,
     include_timestamp: bool = true,
     normalize_eol: bool = true,
@@ -111,6 +115,9 @@ fn parseArgs(allocator: Allocator) !Args {
         } else if (mem.eql(u8, arg, "--headers")) {
             result.signed_headers = try allocator.dupe(u8, it.next() orelse
                 cli.fatal("--headers needs a value"));
+        } else if (mem.eql(u8, arg, "--oversign")) {
+            result.oversign_headers = try allocator.dupe(u8, it.next() orelse
+                cli.fatal("--oversign needs a value"));
         } else if (mem.eql(u8, arg, "-l")) {
             result.include_length = true;
         } else if (mem.eql(u8, arg, "--no-timestamp")) {
@@ -311,6 +318,7 @@ pub fn main() !void {
         .algorithm = args.algorithm,
         .canonicalization = args.canonicalization,
         .signed_headers = args.signed_headers,
+        .oversign_headers = args.oversign_headers,
         .body_length = if (args.include_length) canonical_body.len else null,
         .include_timestamp = args.include_timestamp,
     };
