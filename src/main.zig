@@ -620,24 +620,24 @@ fn doSign(conn: *connection_mod.Connection) u8 {
 
     // Prepend DKIM-Signature header via milter protocol.
     //
-    // `false`, not the negotiated flag, and the one call site where that is
-    // correct: `sign.buildFullHeader` canonicalized `"DKIM-Signature:" ++
-    // header_value` and the signature covers those exact bytes, so whatever
-    // separator was signed is already inside the slice below. Adding one here
-    // would transmit a header that differs from the one we signed, and under
-    // `c=simple` -- which hashes the field verbatim -- every signature we
-    // produce would fail to verify.
+    // The separator is handed to `addHeader` rather than carried inside the
+    // value, which is what makes the transmitted bytes `"DKIM-Signature: " ++
+    // value` under either negotiation: the milter writes the space when it owns
+    // it, the MTA writes it otherwise, and exactly one of them does. Those are
+    // the bytes `signMessage` canonicalized, and under `c=simple` -- which
+    // hashes the field verbatim -- signed and transmitted have to agree
+    // octet for octet or no verifier anywhere accepts the signature.
     //
-    // This depends on the MTA granting `SMFIP_HDR_LEADSPC`: an MTA that declines
-    // it inserts its own space after the colon, and that alone breaks `c=simple`
-    // for messages we sign. Recorded rather than guarded because the fix is not
-    // local to this call -- it is to canonicalize what the MTA will actually
-    // transmit, which means knowing the negotiated flag at signing time.
+    // Passing `false` and leaving the space inside the value agrees only while
+    // the MTA grants `SMFIP_HDR_LEADSPC`. One that declines it puts a space in
+    // front of the one already there, and every `c=simple` signature this
+    // daemon produced would fail everywhere, silently, with the daemon
+    // reporting `sign pass`.
     const hdr_payload = responses.addHeader(
         conn.allocator,
         "DKIM-Signature",
-        sign_result.header["DKIM-Signature:".len..],
-        false,
+        sign_result.value(),
+        conn.negotiated_protocol.header_leading_space,
     ) catch return signInternalError("building the DKIM-Signature header");
     defer conn.allocator.free(hdr_payload);
 

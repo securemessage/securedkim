@@ -48,8 +48,30 @@ pub const SignResult = struct {
     header: []u8,
     allocator: Allocator,
 
+    /// The field name, its colon, and the single space that
+    /// `dkim.generateHeaderValue` emits before its first tag.
+    ///
+    /// Named once because two places depend on it being the same bytes:
+    /// `buildFullHeader` hashes them, and `value` strips them. Under `c=simple`
+    /// the field is hashed verbatim, so what was signed is also what has to
+    /// reach the wire -- a change to one side that missed the other would sign
+    /// one header and transmit another.
+    pub const PREFIX = "DKIM-Signature: ";
+
     pub fn deinit(self: *SignResult) void {
         self.allocator.free(self.header);
+    }
+
+    /// The value alone, without the field name or the separator.
+    ///
+    /// For the milter, which sends name and value as separate protocol fields
+    /// and lets `responses.addHeader` place the separator according to what the
+    /// MTA negotiated. Removing only the colon would leave the space inside the
+    /// value, and an MTA that declined `SMFIP_HDR_LEADSPC` then adds one of its
+    /// own in front of it: two spaces transmitted where one was signed.
+    pub fn value(self: *const SignResult) []const u8 {
+        std.debug.assert(mem.startsWith(u8, self.header, PREFIX));
+        return self.header[PREFIX.len..];
     }
 };
 
@@ -280,6 +302,41 @@ test "find header reverse order" {
     };
     const found = findHeader(headers, "from").?;
     try std.testing.expectEqualStrings("From: gamma@c.com", found);
+}
+
+test "the signed line and the transmitted value share one separator" {
+    const allocator = std.testing.allocator;
+
+    // `PREFIX` is only the right split while `generateHeaderValue` opens with a
+    // single space before its first tag, so that is asserted here rather than
+    // assumed: `buildFullHeader` concatenates "DKIM-Signature:" with this, and
+    // the result is the octet string the signature covers.
+    const sig = dkim.Signature{
+        .domain = "example.com",
+        .selector = "sel",
+        .signed_headers = "from",
+        .body_hash = "aGFzaA==",
+    };
+    const generated = try dkim.generateHeaderValue(allocator, &sig);
+    defer allocator.free(generated);
+    try std.testing.expect(generated.len > 0 and generated[0] == ' ');
+
+    const signed_line = try buildFullHeader(allocator, generated);
+    defer allocator.free(signed_line);
+    try std.testing.expect(mem.startsWith(u8, signed_line, SignResult.PREFIX));
+
+    // What the milter hands to `addHeader`. Reassembling it with the separator
+    // has to reproduce the signed line exactly -- under `c=simple` a verifier
+    // hashes the transmitted field verbatim, so any difference here is a
+    // signature that fails everywhere while this daemon reports success.
+    var result = SignResult{ .header = try allocator.dupe(u8, signed_line), .allocator = allocator };
+    defer result.deinit();
+
+    try std.testing.expect(!mem.startsWith(u8, result.value(), " "));
+
+    const reassembled = try std.fmt.allocPrint(allocator, "DKIM-Signature: {s}", .{result.value()});
+    defer allocator.free(reassembled);
+    try std.testing.expectEqualStrings(signed_line, reassembled);
 }
 
 test "build signing input produces deterministic output" {
