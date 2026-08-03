@@ -618,11 +618,26 @@ fn doSign(conn: *connection_mod.Connection) u8 {
     ) catch return signInternalError("signing the message");
     defer sign_result.deinit();
 
-    // Prepend DKIM-Signature header via milter protocol
+    // Prepend DKIM-Signature header via milter protocol.
+    //
+    // `false`, not the negotiated flag, and the one call site where that is
+    // correct: `sign.buildFullHeader` canonicalized `"DKIM-Signature:" ++
+    // header_value` and the signature covers those exact bytes, so whatever
+    // separator was signed is already inside the slice below. Adding one here
+    // would transmit a header that differs from the one we signed, and under
+    // `c=simple` -- which hashes the field verbatim -- every signature we
+    // produce would fail to verify.
+    //
+    // This depends on the MTA granting `SMFIP_HDR_LEADSPC`: an MTA that declines
+    // it inserts its own space after the colon, and that alone breaks `c=simple`
+    // for messages we sign. Recorded rather than guarded because the fix is not
+    // local to this call -- it is to canonicalize what the MTA will actually
+    // transmit, which means knowing the negotiated flag at signing time.
     const hdr_payload = responses.addHeader(
         conn.allocator,
         "DKIM-Signature",
         sign_result.header["DKIM-Signature:".len..],
+        false,
     ) catch return signInternalError("building the DKIM-Signature header");
     defer conn.allocator.free(hdr_payload);
 
@@ -713,7 +728,7 @@ fn addArHeader(
             .reason = null,
             .properties = properties[0..prop_count],
         },
-    });
+    }, conn.negotiated_protocol.header_leading_space);
 }
 
 // =============================================================================
