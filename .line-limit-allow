@@ -231,6 +231,69 @@
 #   `lint -- --update` here would have raised it to 637 silently, which is the
 #   accretion the gate exists to catch. It is the next item, and until it is
 #   addressed this repo's gate stays red -- which is the correct state.
+#   RESOLVED the same day by the entry immediately below, which is that work.
+
+# 2026-08-04, verify.zig 637 -> 738. THE FILE GOT LONGER ON PURPOSE.
+#
+#   `verifySignatureInner` was 255 lines -- the single longest function in the
+#   project and the last of the F6 arrow offenders. It is now five: four named
+#   RFC 6376 SS6.1 steps and a 99-line orchestrator that reads as the RFC's own
+#   numbered sequence. Longest function in the file is now that orchestrator,
+#   and most of it is the SS6.1.2 comment explaining why a failed DNS query and
+#   an absent key record return different results.
+#
+#     parseAndValidate   44   step 1, and the checks that reject outright
+#     collectKeyRecords  53   step 3, the D-20 rotation cycling
+#     checkBodyHash      59   steps 4-5, plus the SS8.2 l= policy refusal
+#     tryKeyRecords      72   step 8, the irreducible per-key operation
+#
+#   THE +101 IS THE COST OF NAMING THEM: four signatures, four doc comments, a
+#   `StepResult` union and a `Candidates` struct. This is the same trade stage 3
+#   recorded three times and the plan states as its own premise -- "naming a
+#   concept costs a type declaration, a signature and a doc comment, more lines
+#   than the nesting it replaces". Trimming the explanations to get back under
+#   637 would spend the readability this was done to buy. At 738 this is the
+#   second largest file in the suite -- behind securedmarc/src/main.zig at 784,
+#   which stage 4.2 will split, after which this becomes the largest. Recorded
+#   plainly rather than disguised.
+#
+#   NOT SPLIT INTO SEPARATE FILES, and the reason is the one the plan gives for
+#   securearc/src/chain.zig: every function here implements one clause of one RFC
+#   procedure, and the helpers below them -- computeBodyHash, buildSignedData,
+#   verifyWithKey -- are the mechanics those clauses call. Splitting would put a
+#   rule and its verification in different files.
+#
+#   ONE HAZARD FOUND AND AVOIDED WHILE DOING IT, worth recording because the
+#   obvious extraction is wrong. `dkim.parsePublicKeyRecord` does not allocate:
+#   it slices every field straight out of the TXT record text. So the natural
+#   "fetch the key records" function -- DNS lookup and collection loop together
+#   -- would run `dns_result.deinit()` on return and hand back an array of
+#   records pointing into freed memory. The lookup therefore stays in
+#   `verifySignatureInner` and only the loop moved; `Candidates` says so at its
+#   definition. Same class as the `doSeal` substitution stage 3.2 caught by
+#   reading `chain.zig` instead of assuming.
+#
+#   A second thing the split made explicit: `tryKeyRecords` ends in `failure.?`,
+#   which is only sound because `records` is non-empty. That was three statements
+#   up in the same function before and is now a precondition across a boundary,
+#   so it is written into the doc comment.
+#
+#   AN EARLIER PROPOSAL WAS WITHDRAWN. Moving `BodyLengthPolicy` and
+#   `DEFAULT_MAX_KEY_RECORDS` into settings.zig looked like fixing a backwards
+#   dependency, since settings.zig imports verify.zig only to name them. It is
+#   the wrong direction: `BodyLengthPolicy` is a parameter type of
+#   `verifySignature`, so verify.zig would have had to import settings.zig to
+#   declare its own signature, and check.zig -- the RFC conformance harness,
+#   which imports verify.zig and nothing else -- would have been dragged into
+#   depending on the daemon's config parser. settings -> verify is correct
+#   layering: the config layer translates operator text into the vocabulary of
+#   the module that consumes it.
+#
+#   Verified unchanged: unit 71/71, RFC 6376/8463 26/26, and the dkimpy
+#   differential 204/204 agree with 0 disagreements. NOTE FOR WHOEVER RUNS IT
+#   NEXT: the differential needs `python3.12`, not `python3` -- the default is
+#   3.11 and py312-dkimpy is not importable from it, which makes the harness
+#   look absent rather than mis-invoked.
 
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
@@ -246,4 +309,4 @@
 # An empty list below means every file meets the goal.
 418 src/main.zig
 501 src/flow.zig
-454 src/verify.zig
+738 src/verify.zig
