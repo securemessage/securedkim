@@ -178,6 +178,60 @@
 #   NO OBLIGATION TO UNDO. Neither change created a seam; the extraction already took
 #   the one main.zig had.
 #
+# 2026-08-04, STAGE 4.1: main.zig 831 -> 418, and a new flow.zig at 501.
+#
+#   The message flow moved to `flow.zig` -- onBody, the end-of-message pipeline,
+#   doVerify, doSign, and the A-R/event/utility helpers that only they call.
+#   This is the decomposition securearc has had since R1 and securespf took at
+#   stage 4.3, and it is the second half of 4.1: the `settings.zig` half landed
+#   as SS11.48, which is why main.zig was 831 here and not the 1155 the plan
+#   estimated from.
+#
+#   NOT A PURE MOVE, AND SAYING SO. Repo functions 104 -> 106. The two are
+#   `msgCtx`, which gathers the globals the flow reads at the one point per
+#   message where they are known to agree, and `onEom`, now a wrapper in
+#   main.zig over `flow.doEom` -- the callback signature is fixed by
+#   worker.Callbacks and cannot carry a context. `onBody` needed none of them
+#   and is registered as `flow.onBody` directly. Unit tests 70 -> 71; the +1 is
+#   a test the extraction earned, see below.
+#
+#   flow.zig's MsgCtx DELIBERATELY DIVERGES from securearc's, which holds
+#   `*Resolver` and `*Publisher` directly. This one holds accessors. securearc
+#   validates every message so its resolver is always used; this daemon has a
+#   whole `sign_only` mode that reaches no DNS at all, and doSign returns early
+#   for a message with no envelope sender or no signing-table entry. Eager
+#   fields would build a DNS resolver with its TTL cache and open a ZMQ socket
+#   on a worker thread that is only ever signing. Same reasoning, and the same
+#   choice, as securespf/src/flow.zig.
+#
+#   501 IS RECORDED RATHER THAN SPLIT FURTHER, and 418 likewise. doVerify (140)
+#   and doSign (116) are the bulk of flow.zig and each runs one RFC 6376
+#   procedure end to end -- SS6.1 verification and SS3.7 signing. Cutting either in
+#   half would put a rule and its error handling in different files, which is
+#   the reason the plan gives for leaving securearc/src/chain.zig alone. main.zig
+#   at 418 is 18 over the goal and is NOT being trimmed to reach it: what is
+#   left is the globals with their audit rationale, the bootstrap, and the
+#   reload, and deleting explanation to cross a threshold is what SS11.31 is
+#   about. Both should fall further at stage 5, which dedupes the tools.
+#
+#   One test was written because the move made it possible: `modeFor` took a
+#   module global, so nothing could set it from a test, and its out-of-range
+#   fallback is exactly what made A-2 a bypass. It takes the slice now and the
+#   fallback is asserted -- including that an empty mode list yields
+#   verify_only and never a signing mode.
+#
+#   `auth_results`, `auth_stamp`, `escape`, `codec` and `responses` were used
+#   only by the moved functions and are removed from main.zig. `listener_mod`
+#   went with them but was ALREADY DEAD at HEAD -- confirmed with `git show`,
+#   not assumed, and not claimed as a result of this pass.
+#
+#   verify.zig IS LEFT BREACHING ON PURPOSE. It is 637 against a ceiling of
+#   454, it has been over since 2026-07-29 (`79238740`, the RFC 8463 suite that
+#   found D-18/D-19), and this file does not accept it. Running
+#   `lint -- --update` here would have raised it to 637 silently, which is the
+#   accretion the gate exists to catch. It is the next item, and until it is
+#   addressed this repo's gate stays red -- which is the correct state.
+
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -190,5 +244,6 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-792 src/main.zig
+418 src/main.zig
+501 src/flow.zig
 454 src/verify.zig
