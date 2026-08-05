@@ -295,6 +295,19 @@
 #   3.11 and py312-dkimpy is not importable from it, which makes the harness
 #   look absent rather than mis-invoked.
 
+# main.zig 418 -> 419. ONE LINE: `.umask = dkim_cfg.umask,` in the bootstrap call.
+#
+#   The socket-permission work (UMask, and User accepting user:group). All of the
+#   substance is in securemilter-lib's new `credentials.zig`, which is where the
+#   `user:group` parse, the `getgrnam` lookup and the umask wrapper live; the four
+#   daemons each forward one field. `settings.zig` took the other three lines of
+#   it -- field, doc, `getMode` call -- and stayed under the goal.
+#
+#   Nothing to split for one line, and no seam this touches. Recording it rather
+#   than quietly bumping the number, because a one-line rise recorded four times
+#   is how a ceiling stops meaning anything, and the next reader should be able
+#   to see that these four lines were one change and not four accretions.
+#
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -307,6 +320,6 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-418 src/main.zig
 501 src/flow.zig
+419 src/main.zig
 738 src/verify.zig

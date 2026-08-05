@@ -230,6 +230,7 @@ fn runDaemon() !void {
         .foreground = dkim_cfg.foreground,
         .pid_file = dkim_cfg.pid_file,
         .user = dkim_cfg.user,
+        .umask = dkim_cfg.umask,
         .worker_threads = dkim_cfg.worker_threads,
         .max_connections = dkim_cfg.max_connections,
         .num_listeners = @intCast(dkim_cfg.listen_addresses.len),

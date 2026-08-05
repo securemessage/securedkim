@@ -138,13 +138,20 @@ def securedkim_sign(sign_bin, message, keys, *, selector, domain, algorithm, can
         with open(msg_path, "wb") as f:
             f.write(message)
 
+        # 0600, and created that way rather than chmod'ed afterwards.
+        #
+        # securedkim-sign refuses a private key with any group or other bit set,
+        # which is the same rule the daemon applies to its signing key. A plain
+        # open() here produced 0644 and the harness stopped being able to sign at
+        # all. Writing it correctly is the fix rather than relaxing the tool: a
+        # test fixture that hands the signer a world-readable private key is not
+        # modelling any deployment worth testing.
         key_path = os.path.join(d, "key")
-        if algorithm == "ed25519-sha256":
-            with open(key_path, "w") as f:
-                f.write(keys.ed25519[0])
-        else:
-            with open(key_path, "wb") as f:
-                f.write(keys.rsa[2048][0])
+        pem = (keys.ed25519[0].encode() if algorithm == "ed25519-sha256"
+               else keys.rsa[2048][0])
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(pem)
 
         cmd = [sign_bin, "-d", domain, "-s", selector, "-k", key_path,
                "-a", algorithm, "-c", canon,
