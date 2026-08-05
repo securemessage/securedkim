@@ -32,6 +32,11 @@ const Allocator = mem.Allocator;
 const securemilter = @import("securemilter");
 const cli = securemilter.cli.Tool("securedkim-check");
 const dns_mod = securemilter.dns;
+
+/// The one message-file parser in the suite. Not a copy of it: this tool exists
+/// to predict the daemon, so a checker that models the message its own way is
+/// measuring itself (refactor plan stage 5.2).
+const msgfile = securemilter.msgfile;
 const crypto = @import("securemilter_crypto").crypto;
 
 const verify = @import("verify.zig");
@@ -74,121 +79,6 @@ const Usage =
 /// Largest message accepted. Generous for a conformance suite whose cases are a
 /// few kilobytes, and bounded so a stray argument cannot exhaust memory.
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
-
-/// The daemon's own header type, not a copy of it. This tool exists to predict
-/// the daemon, and `had_space` plus `render` are exactly the part a copy would
-/// have silently omitted (audit D-23).
-const Header = securemilter.connection.Header;
-const splitLeadingSpace = securemilter.connection.splitLeadingSpace;
-
-const Message = struct {
-    headers: []const Header,
-    body: []const u8,
-    arena: std.heap.ArenaAllocator,
-
-    fn deinit(self: *Message) void {
-        self.arena.deinit();
-    }
-};
-
-/// Split an RFC 5322 message into header fields and a body.
-///
-/// Folded values keep their line breaks. That is not a convenience: DKIM
-/// `relaxed` header canonicalization is defined as an operation *on* the folded
-/// form (RFC 6376 §3.4.2, "Unfold all header field continuation lines"), and the
-/// milter receives values from Postfix with folding intact, so unfolding here
-/// would test the canonicalizer against input it never sees in production.
-///
-/// Line endings are normalised to CRLF first. A message arrives over SMTP with
-/// CRLF and both canonicalizations in §3.4 are specified in terms of it; a file
-/// on disk carries bare LF. Converting here rather than tolerating LF further
-/// down keeps the run testing the same byte sequence a real message produces.
-/// **If cases fail with a body-hash mismatch, check this first.**
-fn parseMessage(allocator: Allocator, raw: []const u8, normalize_eol: bool) !Message {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const a = arena.allocator();
-
-    const text = if (normalize_eol) try toCrlf(a, raw) else raw;
-
-    const sep = mem.indexOf(u8, text, "\r\n\r\n");
-    const header_block = if (sep) |s| text[0..s] else text;
-    const body = if (sep) |s| text[s + 4 ..] else "";
-
-    var headers: std.ArrayListUnmanaged(Header) = .{};
-
-    var field_start: ?usize = null;
-    var i: usize = 0;
-    while (i <= header_block.len) {
-        const line_end = mem.indexOfPos(u8, header_block, i, "\r\n") orelse header_block.len;
-        const line = header_block[i..line_end];
-        const is_continuation = line.len > 0 and (line[0] == ' ' or line[0] == '\t');
-
-        if (!is_continuation and field_start != null) {
-            try appendField(a, &headers, header_block[field_start.?..i]);
-            field_start = null;
-        }
-        if (line.len > 0 and !is_continuation) field_start = i;
-
-        if (line_end >= header_block.len) break;
-        i = line_end + 2;
-    }
-    if (field_start) |s| try appendField(a, &headers, header_block[s..]);
-
-    return .{
-        .headers = try headers.toOwnedSlice(a),
-        .body = body,
-        .arena = arena,
-    };
-}
-
-/// Record one complete field, trailing CRLF trimmed, split at the first colon.
-///
-/// **The single space after the colon is split off, not dropped.** A milter
-/// receives header values with one leading space already removed by the MTA;
-/// `securedkim` now negotiates `SMFIP_HDR_LEADSPC` and recovers the bit saying
-/// whether there was one, so `simple` — which hashes the field verbatim — can
-/// rebuild it exactly (audit D-23).
-///
-/// **One SP, never a TAB**, as measured against Postfix and sendmail in §11.40.
-/// This line used to strip a leading TAB too, which no MTA does. Continuation
-/// lines keep their own leading whitespace, which is also what the MTA delivers.
-fn appendField(
-    a: Allocator,
-    headers: *std.ArrayListUnmanaged(Header),
-    field_raw: []const u8,
-) !void {
-    const field = mem.trimRight(u8, field_raw, "\r\n");
-    if (field.len == 0) return;
-    const colon = mem.indexOfScalar(u8, field, ':') orelse return;
-    const split = splitLeadingSpace(field[colon + 1 ..]);
-    try headers.append(a, .{
-        .name = field[0..colon],
-        .value = split.value,
-        .had_space = split.had_space,
-    });
-}
-
-/// Normalise CR, LF and CRLF to CRLF.
-fn toCrlf(a: Allocator, raw: []const u8) ![]const u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
-    try out.ensureTotalCapacity(a, raw.len + raw.len / 8 + 2);
-    var i: usize = 0;
-    while (i < raw.len) {
-        const c = raw[i];
-        if (c == '\r') {
-            try out.appendSlice(a, "\r\n");
-            i += if (i + 1 < raw.len and raw[i + 1] == '\n') 2 else 1;
-        } else if (c == '\n') {
-            try out.appendSlice(a, "\r\n");
-            i += 1;
-        } else {
-            try out.append(a, c);
-            i += 1;
-        }
-    }
-    return out.toOwnedSlice(a);
-}
 
 const Args = struct {
     file: ?[]const u8 = null,
@@ -285,7 +175,7 @@ pub fn main() !void {
         cli.fatal("could not read the message file");
     defer allocator.free(raw);
 
-    var msg = parseMessage(allocator, raw, args.normalize_eol) catch
+    var msg = msgfile.parseMessage(allocator, raw, args.normalize_eol) catch
         cli.fatal("could not parse the message");
     defer msg.deinit();
 
@@ -305,16 +195,9 @@ pub fn main() !void {
     defer resolver.deinit();
 
     // The header list the verifier sees: every field, in order, as the milter
-    // would have accumulated them.
-    var header_strings: std.ArrayListUnmanaged([]const u8) = .{};
-    defer {
-        for (header_strings.items) |s| allocator.free(s);
-        header_strings.deinit(allocator);
-    }
-    for (msg.headers) |hdr| {
-        const full = try hdr.render(allocator);
-        try header_strings.append(allocator, full);
-    }
+    // would have accumulated them. Rendered by the parser rather than here, so
+    // this tool and `securedkim-sign` cannot disagree about the separator.
+    const header_strings = try msg.rendered();
 
     var count: usize = 0;
     var any_pass = false;
@@ -336,7 +219,7 @@ pub fn main() !void {
             &resolver,
             hdr.value,
             sig_header_raw,
-            header_strings.items,
+            header_strings,
             msg.body,
             min_key_bits,
             args.body_length_policy,

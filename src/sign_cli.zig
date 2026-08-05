@@ -31,6 +31,13 @@ const Allocator = mem.Allocator;
 
 const securemilter = @import("securemilter");
 const cli = securemilter.cli.Tool("securedkim-sign");
+
+/// The one message-file parser in the suite, shared with `securedkim-check` and
+/// with securearc's two tools. This command emits signatures another
+/// implementation must verify, so it has to model the message exactly as the
+/// daemon does -- a private copy is a signature over a message that never
+/// existed (refactor plan stage 5.2).
+const msgfile = securemilter.msgfile;
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
 const canon = securemilter_crypto.canon;
@@ -138,104 +145,6 @@ fn parseArgs(allocator: Allocator) !Args {
     return result;
 }
 
-/// Normalise CR, LF and CRLF to CRLF. See `check.zig` for why this is optional.
-fn toCrlf(a: Allocator, raw: []const u8) ![]const u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
-    try out.ensureTotalCapacity(a, raw.len + raw.len / 8 + 2);
-    var i: usize = 0;
-    while (i < raw.len) {
-        const c = raw[i];
-        if (c == '\r') {
-            try out.appendSlice(a, "\r\n");
-            i += if (i + 1 < raw.len and raw[i + 1] == '\n') 2 else 1;
-        } else if (c == '\n') {
-            try out.appendSlice(a, "\r\n");
-            i += 1;
-        } else {
-            try out.append(a, c);
-            i += 1;
-        }
-    }
-    return out.toOwnedSlice(a);
-}
-
-/// The message split into reconstructed header lines and a raw body.
-const Message = struct {
-    /// Full field lines, folding intact, rebuilt as the milter would see them.
-    headers: []const []const u8,
-    body: []const u8,
-    arena: std.heap.ArenaAllocator,
-
-    fn deinit(self: *Message) void {
-        self.arena.deinit();
-    }
-};
-
-fn parseMessage(allocator: Allocator, raw: []const u8, normalize_eol: bool) !Message {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const a = arena.allocator();
-
-    const text = if (normalize_eol) try toCrlf(a, raw) else raw;
-
-    const sep = mem.indexOf(u8, text, "\r\n\r\n");
-    const header_block = if (sep) |s| text[0..s] else text;
-    const body = if (sep) |s| text[s + 4 ..] else "";
-
-    var headers: std.ArrayListUnmanaged([]const u8) = .{};
-
-    var field_start: ?usize = null;
-    var i: usize = 0;
-    while (i <= header_block.len) {
-        const line_end = mem.indexOfPos(u8, header_block, i, "\r\n") orelse header_block.len;
-        const line = header_block[i..line_end];
-        const is_continuation = line.len > 0 and (line[0] == ' ' or line[0] == '\t');
-
-        if (!is_continuation and field_start != null) {
-            try appendField(a, &headers, header_block[field_start.?..i]);
-            field_start = null;
-        }
-        if (line.len > 0 and !is_continuation) field_start = i;
-
-        if (line_end >= header_block.len) break;
-        i = line_end + 2;
-    }
-    if (field_start) |s| try appendField(a, &headers, header_block[s..]);
-
-    return .{
-        .headers = try headers.toOwnedSlice(a),
-        .body = body,
-        .arena = arena,
-    };
-}
-
-/// Rebuild one field the way the milter receives it, then re-emit it.
-///
-/// The round trip through name and value is the point, not an oversight: the
-/// daemon signs what the MTA hands it, so signing the file's original octets
-/// instead would produce signatures the daemon cannot produce.
-///
-/// It now round-trips through `Header`, which carries whether a space followed
-/// the colon, so the re-emitted field is byte-identical to the original instead
-/// of having its separator normalised to one space (audit D-23). One SP is split
-/// off, never a TAB, matching what Postfix and sendmail were measured to do.
-fn appendField(
-    a: Allocator,
-    headers: *std.ArrayListUnmanaged([]const u8),
-    field_raw: []const u8,
-) !void {
-    const field = mem.trimRight(u8, field_raw, "\r\n");
-    if (field.len == 0) return;
-    const colon = mem.indexOfScalar(u8, field, ':') orelse return;
-    const split = securemilter.connection.splitLeadingSpace(field[colon + 1 ..]);
-    const hdr = securemilter.connection.Header{
-        .name = field[0..colon],
-        .value = split.value,
-        .had_space = split.had_space,
-    };
-    try headers.append(a, try hdr.render(a));
-}
-
 /// Load a signing key, choosing the format from the algorithm.
 ///
 /// RSA keys are PEM. An Ed25519 key is the base64 of its 32-byte seed, which is
@@ -299,9 +208,15 @@ pub fn main() !void {
         cli.fatal("could not read the message file");
     defer allocator.free(raw);
 
-    var msg = parseMessage(allocator, raw, args.normalize_eol) catch
+    var msg = msgfile.parseMessage(allocator, raw, args.normalize_eol) catch
         cli.fatal("could not parse the message");
     defer msg.deinit();
+
+    // Signed as the milter would have received them, not as the file spells
+    // them: the daemon signs what the MTA hands it, so signing the file's own
+    // octets would produce signatures the daemon cannot produce. `render`
+    // preserves the separator verbatim, which is what `c=simple` hashes (D-23).
+    const header_lines = msg.rendered() catch cli.fatal("out of memory");
 
     var key = try loadKey(allocator, args.key_file.?, args.algorithm);
     defer key.deinit();
@@ -334,7 +249,7 @@ pub fn main() !void {
         allocator,
         &params,
         &key,
-        msg.headers,
+        header_lines,
         crypto.sha256(canonical_body),
     ) catch cli.fatal("signing failed");
     defer result.deinit();
@@ -345,6 +260,6 @@ pub fn main() !void {
     // reading the file must see the message it was signed over.
     cli.out(result.header);
     cli.out("\r\n");
-    cli.out(if (args.normalize_eol) toCrlf(msg.arena.allocator(), raw) catch
+    cli.out(if (args.normalize_eol) msgfile.toCrlf(msg.arena.allocator(), raw) catch
         cli.fatal("out of memory") else raw);
 }
