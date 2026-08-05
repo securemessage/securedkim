@@ -139,11 +139,25 @@ fn extractRsaPublicKey(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     // 0, not the RFC floor: this tool exists to tell an operator what is in a
     // key file, and refusing to load a weak key would leave them with an error
     // and no diagnosis. It warns instead, which is the more useful answer.
-    const key = try crypto.loadRsaKeyFile(path, 0);
+    // `.permit_any` for the same reason as the 0 above: refusing to open a
+    // badly-permissioned key would stop this tool doing the one thing an
+    // operator ran it for. It reports the mode instead -- which is more use than
+    // a refusal, because checking a key is the whole purpose of the command.
+    const key = try crypto.loadRsaKeyFile(path, 0, .permit_any);
     defer {
         var k = key;
         k.deinit();
     }
+
+    if (crypto.keyFileMode(path)) |mode| {
+        if (mode & 0o077 != 0) {
+            std.debug.print(
+                "warning: {s} is mode {o}, readable beyond its owner.\n" ++
+                    "         securedkim will refuse to load it. chmod 600 to fix.\n",
+                .{ path, mode },
+            );
+        }
+    } else |_| {}
 
     const bits = crypto.signingKeyBits(&key);
     if (bits < crypto.RFC8301_MIN_RSA_BITS) {

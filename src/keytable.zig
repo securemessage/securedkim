@@ -93,7 +93,11 @@ pub const KeyTable = struct {
     pub fn loadKeys(self: *KeyTable, min_bits: u32, failed_path: *[]const u8) !void {
         for (self.entries) |*entry| {
             if (entry.key != null) continue;
-            entry.key = crypto.loadRsaKeyFile(entry.key_path, min_bits) catch |err| {
+            // `.require_safe` is fixed here rather than passed in, unlike
+            // `min_bits`: a KeyTable is only ever loaded by the daemon to sign
+            // with, so there is no second caller with a different answer. A
+            // parameter would be a knob with one possible setting.
+            entry.key = crypto.loadRsaKeyFile(entry.key_path, min_bits, .require_safe) catch |err| {
                 failed_path.* = entry.key_path;
                 return err;
             };

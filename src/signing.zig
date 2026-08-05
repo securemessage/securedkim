@@ -157,12 +157,18 @@ pub fn build(allocator: Allocator, cfg: Paths) !*Assets {
     // itself is not optional: RFC 8301 §3.2 says signers MUST use at least 1024
     // bits, and mail signed below it fails DKIM at every conformant verifier.
     if (cfg.key_file) |path| {
-        var key = crypto.loadRsaKeyFile(path, crypto.RFC8301_MIN_RSA_BITS) catch |err| {
+        var key = crypto.loadRsaKeyFile(path, crypto.RFC8301_MIN_RSA_BITS, .require_safe) catch |err| {
             if (err == error.RsaKeyTooSmall) {
                 log.err(
                     "signing key {s} is below the RFC 8301 minimum of {d} bits: refusing to sign with it",
                     .{ path, crypto.RFC8301_MIN_RSA_BITS },
                 );
+            } else if (err == error.KeyFilePermissionsTooOpen) {
+                log.err("signing key {s} is mode {o}, {s}", .{
+                    path,
+                    crypto.keyFileMode(path) catch 0,
+                    crypto.KEY_PERMISSIONS_ADVICE,
+                });
             }
             return err;
         };

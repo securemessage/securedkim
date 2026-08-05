@@ -243,8 +243,15 @@ fn appendField(
 /// drive both implementations in a differential run.
 fn loadKey(allocator: Allocator, path: []const u8, algorithm: dkim.Algorithm) !crypto.SigningKey {
     switch (algorithm) {
-        .rsa_sha256 => return crypto.loadRsaKeyFile(path, crypto.RFC8301_MIN_RSA_BITS) catch
-            cli.fatal("could not load the RSA private key"),
+        // Same standard as the daemon: this command emits real signatures with a
+        // real domain key, so a key anyone can read is refused here too rather
+        // than being a daemon-only rule that the CLI quietly undercuts.
+        .rsa_sha256 => return crypto.loadRsaKeyFile(path, crypto.RFC8301_MIN_RSA_BITS, .require_safe) catch |err| {
+            if (err == error.KeyFilePermissionsTooOpen) {
+                cli.fatal("the RSA private key is readable beyond its owner; chmod 600 it");
+            }
+            cli.fatal("could not load the RSA private key");
+        },
         .ed25519_sha256 => {
             // Three buffers hold the private seed on the way in -- the file text,
             // its base64 decoding, and the fixed-size copy handed to the loader --
