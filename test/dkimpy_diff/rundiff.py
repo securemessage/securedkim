@@ -38,8 +38,13 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "rfc6376"))
+# One DNS fake serves every conformance suite in the tree; securemilter-lib's
+# test/dnsfake.py records why it is not four any more. This file had already
+# been borrowing the RFC 6376 suite's copy rather than duplicating it, which is
+# the same argument one directory further out.
+sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "securemilter-lib", "test"))
 
-from dkimdns import DkimDns          # noqa: E402  -- shared, not duplicated
+from dnsfake import DnsFake, TxtZone  # noqa: E402
 import corpus                        # noqa: E402
 import oracle                        # noqa: E402
 
@@ -60,7 +65,7 @@ def securedkim_verify(check_bin, signed, key_record, port, min_key_bits=None):
         tf.write(signed)
         path = tf.name
     try:
-        with DkimDns({DNS_NAME: key_record}, port):
+        with DnsFake(TxtZone({DNS_NAME: key_record}), port=port):
             # --no-normalize matters: the corpus is CRLF-canonical by
             # construction, and its bare CR and LF octets are deliberate body
             # *data*. Without this the checker rewrites them to CRLF before the

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Drive the RFC 8463 Appendix A vectors and derived cases against `securedkim-check`.
 
-Each case brings its own DNS zone, served on a loopback port by
-`dkimdns.DkimDns`, so the daemon's own resolver does the lookups. Nothing inside
+Each case brings its own DNS zone, served on a loopback port by the shared DNS
+fake, so the daemon's own resolver does the lookups. Nothing inside
 `securedkim` is stubbed: the checker calls the same `verify.verifySignature` the
 milter's `onEom` calls, with the same header list shape.
 
@@ -23,7 +23,14 @@ import subprocess
 import sys
 import tempfile
 
-from dkimdns import DkimDns
+# One DNS fake serves every conformance suite in the tree; securemilter-lib's
+# test/dnsfake.py records why it is not four any more. Reachable because
+# build.zig.zon already depends on ../securemilter-lib by path, so the six
+# repositories are checked out side by side.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "..", "..", "securemilter-lib", "test"))
+
+from dnsfake import SERVFAIL, DnsFake, TxtZone   # noqa: E402
 from cases import ALL_CASES
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -74,7 +81,7 @@ def resolve_zone(case):
     zone = case.get("zone")
     if zone == "SERVFAIL":
         from cases import ED25519_NAME, RSA_NAME
-        return {ED25519_NAME: DkimDns.SERVFAIL, RSA_NAME: DkimDns.SERVFAIL}
+        return {ED25519_NAME: SERVFAIL, RSA_NAME: SERVFAIL}
     return zone
 
 
@@ -92,7 +99,7 @@ def run_case(case, check_bin, port, verbose):
         msg_path = tf.name
 
     try:
-        with DkimDns(resolve_zone(case), port, verbose=verbose) as dns:
+        with DnsFake(TxtZone(resolve_zone(case)), port=port, verbose=verbose) as dns:
             cmd = [check_bin, "-n", "127.0.0.1", "-p", str(port)]
             cmd += case.get("args", [])
             cmd.append(msg_path)

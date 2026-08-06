@@ -180,11 +180,19 @@ case would pass by testing nothing.
 The first full run reported 11 failures with reasons like `key revoked` on names
 where a perfectly good key was published. That was the harness.
 
-`DkimDns.__init__` asked `isinstance(v, (list, type(self.SERVFAIL)))` to decide
+The DNS fake's constructor asked `isinstance(v, (list, type(SERVFAIL)))` to decide
 whether a value was already a list. `SERVFAIL` is a plain `object()`, so
 `type(SERVFAIL)` is `object` and **the test matched everything** — single strings
 were stored unwrapped, and `for value in values` iterated them one character at a
 time, serving a TXT record per character.
+
+That normalisation now lives in `securemilter-lib/test/dnsfake.py`, shared by every
+conformance suite in the tree, and it is pinned by name in `dnsfake_test.py`. Its
+teeth were measured on 2026-08-05 by reintroducing exactly this bug: **this suite
+dropped to 9 of 26 and the DMARC suite to 10 of 28, while the SPF suite stayed at a
+clean 203 of 203** — it uses the other zone class and cannot see the fault at all.
+The ARC validation suite did not so much fail as stall, each case spending seconds
+in resolver retries against the oversized malformed answers.
 
 Recorded because this is the second time on this project that a harness defect
 presented as a pile of product defects (the first was `c=simple/*` in the ARC
