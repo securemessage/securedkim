@@ -1,3 +1,30 @@
+# 2026-08-05, EVERY NUMBER BELOW PREDATES A CHANGE TO WHAT IS COUNTED. Read the
+#   figures in the older notes as historical; they do not describe these files now.
+#
+#   Until today `prod_lines` charged a comment sitting above ordinary code and
+#   freed one only above a `test` -- while the checker's own header stated the rule
+#   as "comments and tests never count". The code now does what the header always
+#   said it did. Across the six packages that moved the counted total from 21,353
+#   to 12,408 -- 41% of what was being measured was comment text -- and the count
+#   of files over the goal from 15 to 2, with no code removed anywhere.
+#
+#   So a ceiling quoted below is a comment-INCLUSIVE number and cannot be compared
+#   against one measured today. The reasoning in those notes stands unchanged; only
+#   their figures are on the old scale. This package now has NO entries at all:
+#   verify.zig read 738 on the old scale and 399 on this one, flow.zig 501 and 293,
+#   main.zig 419 and 248.
+#
+#   Note what that means for the 2026-07-29 entry below about gaming the metric.
+#   Nothing about that judgement changes -- moving tests out of main.zig to shrink
+#   a number was gaming it, and the fix was to stop counting tests wherever they
+#   live. Today's change is the same correction applied to the other half of the
+#   same rule, made deliberately and in the open rather than by relocating code.
+#
+#   THE CONSOLIDATION WORK IS NO LONGER JUSTIFIED BY LENGTH. Thirteen files stopped
+#   being flagged without losing a line of code. What still justifies it is
+#   duplication -- four copies of one tag scanner, two of one tool -- which this
+#   gate has never been able to see.
+#
 # 2026-07-29, CORRECTED THEN FIXED: an earlier version of this warning said only
 #   `zig build lint -- --update` erased the comments here. That was too narrow. The
 #   ORDINARY gate run rewrote the file too, on its self-tightening path, so every
@@ -320,6 +347,3 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-501 src/flow.zig
-419 src/main.zig
-738 src/verify.zig
