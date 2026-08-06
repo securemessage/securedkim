@@ -214,17 +214,15 @@ pub fn main() !void {
         const sig_header_raw = try hdr.render(allocator);
         defer allocator.free(sig_header_raw);
 
-        const result = verify.verifySignature(
-            allocator,
-            &resolver,
-            hdr.value,
-            sig_header_raw,
-            header_strings,
-            msg.body,
-            min_key_bits,
-            args.body_length_policy,
-            args.max_key_records,
-        );
+        const result = verify.verifySignature(allocator, &resolver, .{
+            .sig_header_value = hdr.value,
+            .sig_header_raw = sig_header_raw,
+            .headers = header_strings,
+            .body = msg.body,
+            .min_key_bits = min_key_bits,
+            .body_length_policy = args.body_length_policy,
+            .max_key_records = args.max_key_records,
+        });
 
         emitSig(count, "result", result.result.toString());
         emitSig(count, "domain", result.domain);

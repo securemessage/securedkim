@@ -224,17 +224,15 @@ fn doVerify(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
         const sig_header_raw = hdr.render(conn.allocator) catch continue;
         defer conn.allocator.free(sig_header_raw);
 
-        const result = verify.verifySignature(
-            conn.allocator,
-            resolver,
-            hdr.value,
-            sig_header_raw,
-            header_strings.items,
-            body_data,
-            ctx.min_key_bits,
-            ctx.body_length_policy,
-            ctx.max_key_records,
-        );
+        const result = verify.verifySignature(conn.allocator, resolver, .{
+            .sig_header_value = hdr.value,
+            .sig_header_raw = sig_header_raw,
+            .headers = header_strings.items,
+            .body = body_data,
+            .min_key_bits = ctx.min_key_bits,
+            .body_length_policy = ctx.body_length_policy,
+            .max_key_records = ctx.max_key_records,
+        });
 
         // D-17: `verify.zig` computes a precise reason for every outcome and this is
         // where it stopped -- only the weak-key case was logged, and the A-R carries

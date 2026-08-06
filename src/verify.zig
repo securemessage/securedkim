@@ -111,16 +111,58 @@ pub const VerifyResult = struct {
 ///
 /// `max_key_records` bounds how many TXT records at the selector we are willing
 /// to try (audit D-20). See `DEFAULT_MAX_KEY_RECORDS`.
+pub const Request = struct {
+    /// The DKIM-Signature field's **value** — everything after the colon, with
+    /// the leading space already resolved per `Header.had_space` (D-23). This is
+    /// what gets parsed as a tag-value list.
+    sig_header_value: []const u8,
+    /// The **whole field** as it arrived, name and colon included, rendered from
+    /// the same `Header` (D-23). This is what gets canonicalized into the signed
+    /// data, because a signature covers its own field.
+    ///
+    /// The two above are both `[]const u8` and were adjacent positional
+    /// parameters until 2026-08-06, so transposing them type-checked. **Measured
+    /// rather than assumed, because the first draft of this comment guessed
+    /// wrong:** swapping them takes RFC 6376 from 26/26 to **4/26**, and all 22
+    /// failures are `permerror` with reason `malformed signature` — the leading
+    /// `DKIM-Signature:` makes `parseAndValidate` reject the tag list outright,
+    /// so the mistake never reaches the crypto.
+    ///
+    /// **That makes this a readability fix, not a safety one**, and the entry is
+    /// worded that way deliberately. Unlike `worker.Options`, where transposing
+    /// two `posix.fd_t` produced a running daemon that behaved wrongly in
+    /// silence, this transposition is caught by the first conformance run. The
+    /// struct earns its place by making nine positional arguments legible at the
+    /// call site; it is not preventing a silent defect, and claiming otherwise
+    /// would be the same unverified-justification error the `worker.zig` ceiling
+    /// entry records.
+    sig_header_raw: []const u8,
+    /// Every header field of the message, in arrival order, as the milter saw
+    /// them. `h=` selects from these; it does not get to reorder them.
+    headers: []const []const u8,
+    /// The raw body. Not a hash — see the note above on why.
+    body: []const u8,
+    /// Already reconciled with the RFC 8301 floor by `crypto.resolveMinRsaBits`.
+    min_key_bits: u32,
+    /// Whether to honour `l=` or refuse the signature outright.
+    body_length_policy: BodyLengthPolicy,
+    /// TXT records to try at the selector (D-20). `DEFAULT_MAX_KEY_RECORDS` is
+    /// the value config falls back to, not a value this struct supplies.
+    max_key_records: u8,
+
+    // NONE OF THE THREE ABOVE HAS A DEFAULT, and that is deliberate. Each is an
+    // operator policy that both call sites already read from configuration, so
+    // a default here could only ever be reached by a caller that forgot one --
+    // which is precisely L-2, where `MaxConnections` was honoured by one daemon
+    // and silently replaced with a constant by three others. A struct makes
+    // omission possible in a way nine positional parameters did not; leaving
+    // these required is what keeps that from being a regression.
+};
+
 pub fn verifySignature(
     allocator: Allocator,
     resolver: *dns_mod.Resolver,
-    sig_header_value: []const u8,
-    sig_header_raw: []const u8,
-    headers: []const []const u8,
-    body: []const u8,
-    min_key_bits: u32,
-    body_length_policy: BodyLengthPolicy,
-    max_key_records: u8,
+    req: Request,
 ) VerifyResult {
     // `t=y` is discovered midway -- the key record has to be fetched and parsed
     // first -- but it belongs on every verdict reached after that point, and this
@@ -131,18 +173,7 @@ pub fn verifySignature(
     // convention `chain.zig` and `sealbuild.zig` already use), and it is stamped
     // here exactly once, on whatever comes back.
     var key_testing = false;
-    var result = verifySignatureInner(
-        allocator,
-        resolver,
-        sig_header_value,
-        sig_header_raw,
-        headers,
-        body,
-        min_key_bits,
-        body_length_policy,
-        max_key_records,
-        &key_testing,
-    );
+    var result = verifySignatureInner(allocator, resolver, req, &key_testing);
     result.testing = key_testing;
     return result;
 }
@@ -466,16 +497,10 @@ fn tryKeyRecords(
 fn verifySignatureInner(
     allocator: Allocator,
     resolver: *dns_mod.Resolver,
-    sig_header_value: []const u8,
-    sig_header_raw: []const u8,
-    headers: []const []const u8,
-    body: []const u8,
-    min_key_bits: u32,
-    body_length_policy: BodyLengthPolicy,
-    max_key_records: u8,
+    req: Request,
     testing_out: *bool,
 ) VerifyResult {
-    const sig = switch (parseAndValidate(sig_header_value)) {
+    const sig = switch (parseAndValidate(req.sig_header_value)) {
         .reject => |verdict| return verdict,
         .ok => |parsed| parsed,
     };
@@ -503,7 +528,7 @@ fn verifySignatureInner(
     };
     defer dns_result.deinit();
 
-    const cap = @min(@as(usize, max_key_records), MAX_KEY_RECORDS_CEILING);
+    const cap = @min(@as(usize, req.max_key_records), MAX_KEY_RECORDS_CEILING);
     const candidates = switch (collectKeyRecords(&dns_result, &sig, cap)) {
         .reject => |verdict| return verdict,
         .ok => |found| found,
@@ -518,13 +543,13 @@ fn verifySignatureInner(
     // the one that matters is the one the verdict rests on.
     testing_out.* = dkim.keyHasFlag(&candidates.records[0], "y");
 
-    const unsigned_bytes = switch (checkBodyHash(allocator, body, &sig, body_length_policy)) {
+    const unsigned_bytes = switch (checkBodyHash(allocator, req.body, &sig, req.body_length_policy)) {
         .reject => |verdict| return verdict,
         .ok => |uncovered| uncovered,
     };
 
     // Step 6: Build the signed data block (canonicalized headers + DKIM-Signature with empty b=)
-    const signed_data = buildSignedData(allocator, sig, sig_header_raw, headers) catch
+    const signed_data = buildSignedData(allocator, sig, req.sig_header_raw, req.headers) catch
         return .{ .result = .temperror, .domain = sig.domain, .selector = sig.selector, .reason = "canonicalization failed" };
     defer allocator.free(signed_data);
 
@@ -543,7 +568,7 @@ fn verifySignatureInner(
         candidates.records[0..candidates.usable],
         signed_data,
         sig_decoded,
-        min_key_bits,
+        req.min_key_bits,
         unsigned_bytes,
         testing_out,
     );
