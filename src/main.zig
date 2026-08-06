@@ -270,15 +270,14 @@ fn runDaemon() !void {
     const shutdown_pipe = try posix.pipe();
     defer posix.close(shutdown_pipe[0]);
 
-    var threads = try securemilter.pool.spawnPoolWithReload(
-        allocator,
-        dkim_cfg.worker_threads,
-        dkim_cfg.listen_addresses,
-        callbacks,
-        shutdown_pipe[0],
-        &g_config_gen,
-        dkim_cfg.max_connections,
-    );
+    var threads = try securemilter.pool.spawnPool(allocator, .{
+        .num_workers = dkim_cfg.worker_threads,
+        .addresses = dkim_cfg.listen_addresses,
+        .callbacks = callbacks,
+        .shutdown_pipe_rd = shutdown_pipe[0],
+        .config_gen = &g_config_gen,
+        .max_connections = dkim_cfg.max_connections,
+    });
     defer threads.deinit(allocator);
 
     // Bound and serving: release the parent blocked in `daemonize` (X-16).
