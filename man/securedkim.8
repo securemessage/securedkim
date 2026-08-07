@@ -211,6 +211,24 @@ is always held to the 1024-bit floor irrespective of this setting, and the
 daemon refuses to start if it is smaller: RFC 8301 binds signers to the same
 minimum, so mail signed below it fails DKIM at every conformant verifier.
 Read at startup only.
+.It Cm MaxKeyRecords
+How many TXT key records at a selector to try before failing a signature.
+Default: 3; values above 8 are capped at 8.
+.Pp
+A domain rotating keys legitimately publishes two records at one selector, and
+RRset order is unspecified and commonly rotated by resolvers, so taking only
+the first record could verify a message on one lookup and fail it on the next.
+Cycling the usable records, as RFC 6376 \[sc]6.1.2 step 4 permits, removes that
+intermittency.
+The bound exists because the record count is the zone owner's choice and each
+record tried costs another public-key verification.
+.Pp
+.Nm securedkim-check
+accepts the same bound with its
+.Cm --max-key-records
+flag.
+.Pp
+Read at startup only.
 .It Cm BodyLengthTag
 What a verified signature's
 .Cm l=

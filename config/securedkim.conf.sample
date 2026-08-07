@@ -114,6 +114,21 @@ SignedHeaders   = from:to:subject:date:message-id
 # mail signed below it fails DKIM at every conformant verifier.
 # MinimumKeyBits = 1024
 
+# How many TXT key records to try at a selector before failing a signature.
+# Default: 3. Values above 8 are capped at 8.
+#
+# A domain rotating keys legitimately publishes two records at one selector,
+# and RRset order is unspecified and commonly rotated by resolvers. Taking only
+# the first record meant the same message could verify on one lookup and fail
+# on the next -- intermittent dkim=fail for a correctly configured domain,
+# feeding intermittent DMARC failures. Cycling the usable records, as RFC 6376
+# 6.1.2 step 4 permits, removes that intermittency. The bound exists because
+# the record count is the zone owner's choice and each record tried costs
+# another public-key verification.
+#
+# Read at startup only; SIGHUP does not pick up a change.
+# MaxKeyRecords = 3
+
 # What a signature's l= tag means: honor or refuse. Default: honor.
 #
 # l= says how many octets of the canonicalized body the signature covers, so that
