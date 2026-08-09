@@ -34,8 +34,8 @@ pub fn build(b: *std.Build) void {
 
     // securedkim-check: verify every DKIM-Signature on a message and print each
     // result. Exists so the RFC 6376 / RFC 8463 conformance suite and the dkimpy
-    // differential harness can drive the shipped verifier, the way
-    // securespf-check and securearc-check do.
+    // differential harness (interop/dkimpy-diff/ in engineering-docs) can drive
+    // the shipped verifier, the way securespf-check and securearc-check do.
     const check_mod = b.createModule(.{
         .root_source_file = b.path("src/check.zig"),
         .target = target,

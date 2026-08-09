@@ -43,10 +43,13 @@ matching public key DNS records, and an explicit statement of what must happen.
 `dkimpy` and other implementations test against it.
 
 `extract-vectors.py` regenerates the `.eml` files straight from the published RFC,
-so their provenance is checkable rather than asserted:
+so their provenance is checkable rather than asserted. It lives in the
+engineering-docs repository (`securemilter/tools/`) — a provenance tool, not part
+of the suite — and defaults to this `messages/` directory through the sibling
+checkouts:
 
 ```
-$ python3 extract-vectors.py --check
+$ python3 ../../../../engineering-docs/securemilter/tools/extract-vectors.py --check
   ok       rfc8463-both.eml (1088 bytes)
   ok       rfc8463-ed25519.eml (644 bytes)
   ok       rfc8463-rsa.eml (723 bytes)
