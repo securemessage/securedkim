@@ -46,6 +46,9 @@ jobs:
       - name: Build
         run: cd securedkim && zig build
 
+      - name: Lint
+        run: cd securedkim && zig build lint
+
       - name: Unit tests
         run: cd securedkim && zig build test
 
