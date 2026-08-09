@@ -11,6 +11,7 @@ const daemon_mod = securemilter.daemon;
 const bootstrap_mod = securemilter.bootstrap;
 const negotiate = securemilter.milter.negotiate;
 const dns_mod = securemilter.dns;
+const deadline_mod = securemilter.deadline;
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
 const zmq = securemilter.zmq;
@@ -114,6 +115,10 @@ var g_max_key_records: u8 = verify.DEFAULT_MAX_KEY_RECORDS;
 /// 6376 §8.2 at its word and ignore such signatures; see the man page.
 var g_body_length_policy: verify.BodyLengthPolicy = .honor;
 
+/// Wall-clock bound on verifying one message's signatures (X-21). Set once at
+/// startup alongside `g_max_key_records`; 0 disables.
+var g_max_evaluation_ms: i64 = deadline_mod.DEFAULT_MS;
+
 fn usageError() error{InvalidArgument} {
     log.err("usage: securedkim -c <config-file>", .{});
     return error.InvalidArgument;
@@ -186,6 +191,7 @@ fn runDaemon() !void {
     g_strip_policy = .{ .own_methods = &.{"dkim"}, .strip_all = dkim_cfg.strip_auth_results };
     g_min_key_bits = dkim_cfg.min_key_bits.bits;
     g_max_key_records = dkim_cfg.max_key_records;
+    g_max_evaluation_ms = dkim_cfg.max_evaluation_ms;
     g_body_length_policy = dkim_cfg.body_length_policy;
 
     // Say so rather than silently disagreeing with the config file. An operator
@@ -327,6 +333,7 @@ fn msgCtx() flow.MsgCtx {
         .min_key_bits = g_min_key_bits,
         .body_length_policy = g_body_length_policy,
         .max_key_records = g_max_key_records,
+        .max_evaluation_ms = g_max_evaluation_ms,
         .resolver = getResolver,
         .publisher = getPublisher,
     };

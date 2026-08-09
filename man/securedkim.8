@@ -229,6 +229,15 @@ accepts the same bound with its
 flag.
 .Pp
 Read at startup only.
+.It Cm MaxEvaluationMs
+The wall-clock ceiling in milliseconds for evaluating one message, shared by
+every DNS lookup the verdict needs.
+Default: 20000.
+0 disables it.
+.Pp
+Exhausting the budget yields temperror, never fail: the message was not
+judged, and the sender retries.
+A slow resolver, not a hostile sender, is what it guards against.
 .It Cm BodyLengthTag
 What a verified signature's
 .Cm l=

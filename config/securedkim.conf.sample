@@ -129,6 +129,16 @@ SignedHeaders   = from:to:subject:date:message-id
 # Read at startup only; SIGHUP does not pick up a change.
 # MaxKeyRecords = 3
 
+# --- Evaluation time budget (X-21) ---
+#
+# MaxEvaluationMs is the wall-clock ceiling in milliseconds for evaluating one
+# message, shared by every DNS lookup the verdict needs. Exhausting it gives
+# temperror, never fail: the message was not judged, and the sender retries.
+# A slow resolver, not a hostile sender, is what it guards against.
+#
+# 0 disables it. Takes effect at startup; SIGHUP does not pick up a change.
+# MaxEvaluationMs = 20000
+
 # What a signature's l= tag means: honor or refuse. Default: honor.
 #
 # l= says how many octets of the canonicalized body the signature covers, so that

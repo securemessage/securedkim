@@ -18,6 +18,7 @@ const config_mod = securemilter.config;
 const listener_mod = securemilter.listener;
 const connection_mod = securemilter.connection;
 const worker_mod = securemilter.worker;
+const deadline_mod = securemilter.deadline;
 
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
@@ -122,6 +123,11 @@ pub const DkimConfig = struct {
     body_length_policy: verify.BodyLengthPolicy,
     /// Key records tried at one selector before giving up (audit D-20).
     max_key_records: u8,
+    /// Wall-clock bound on verifying one message's signatures, in ms; 0
+    /// disables (X-21). The MaxSignatures and MaxKeyRecords caps bound the
+    /// count of the work; this bounds the time, which on a slow resolver is
+    /// the dimension that starves the worker pool.
+    max_evaluation_ms: i64,
 };
 
 pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !DkimConfig {
@@ -249,6 +255,11 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
     // public-key verification.
     const max_key_records = global.getInt("MaxKeyRecords", u8, verify.DEFAULT_MAX_KEY_RECORDS);
 
+    // X-21: shared spelling and default with securespf's limit of the same
+    // name -- an operator tuning one daemon must not find another counting
+    // differently.
+    const max_evaluation_ms = global.getInt(deadline_mod.OPTION_NAME, i64, deadline_mod.DEFAULT_MS);
+
     // Trust boundary: when this is the first milter in the chain, no A-R header
     // claiming our authserv-id can be genuine on arrival (RFC 8601 §5).
     const strip_auth_results = global.getBool("StripAuthResults", false);
@@ -296,6 +307,7 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
         .min_key_bits = min_key_bits,
         .body_length_policy = body_length_policy,
         .max_key_records = max_key_records,
+        .max_evaluation_ms = max_evaluation_ms,
     };
 }
 

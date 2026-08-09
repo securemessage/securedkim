@@ -23,6 +23,7 @@ const escape = securemilter.escape;
 const codec = securemilter.milter.codec;
 const responses = securemilter.milter.responses;
 const dns_mod = securemilter.dns;
+const deadline_mod = securemilter.deadline;
 const zmq = securemilter.zmq;
 const log = securemilter.log;
 const header_scrub = securemilter.header_scrub;
@@ -56,6 +57,10 @@ pub const MsgCtx = struct {
     min_key_bits: u32,
     body_length_policy: verify.BodyLengthPolicy,
     max_key_records: u8,
+    /// Wall-clock bound on verifying one message's signatures (X-21); 0
+    /// disables. No default: it must come from configuration, because a
+    /// silently-supplied constant is the L-2 mechanism.
+    max_evaluation_ms: i64,
     resolver: *const fn () *dns_mod.Resolver,
     publisher: *const fn () *zmq.Publisher,
 };
@@ -213,11 +218,27 @@ fn doVerify(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     // measured as D-4).
     const resolver = ctx.resolver();
 
+    // X-21: one deadline for the whole message, set before the first signature
+    // is checked. MaxSignatures bounds how many, MaxKeyRecords bounds the
+    // fetches per selector -- this bounds the seconds, which is the dimension
+    // a slow-but-working resolver would otherwise spend without limit. Expiry
+    // is temperror, never fail: the signatures we did not reach were not
+    // judged.
+    const deadline = deadline_mod.Deadline.fromNow(ctx.max_evaluation_ms);
+
     // Find DKIM-Signature headers and verify each
     var found_any = false;
     for (conn.headers.items) |hdr| {
         if (!std.ascii.eqlIgnoreCase(hdr.name, "DKIM-Signature")) continue;
         found_any = true;
+
+        if (deadline.expired()) {
+            log.warn("dkim: evaluation deadline exceeded; remaining signatures not verified", .{});
+            addArHeader(conn, ctx, "dkim", "temperror", "", "", false) catch |err|
+                return auth_stamp.deferCode(err, "dkim");
+            publishEvent(ctx, conn.allocator, "verify", "temperror", "", "");
+            break;
+        }
 
         // The signature covers its own field, so under `c=simple` this separator
         // must be the one that arrived (audit D-23).

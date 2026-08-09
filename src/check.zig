@@ -32,6 +32,7 @@ const Allocator = mem.Allocator;
 const securemilter = @import("securemilter");
 const cli = securemilter.cli.Tool("securedkim-check");
 const dns_mod = securemilter.dns;
+const deadline_mod = securemilter.deadline;
 
 /// The one message-file parser in the suite. Not a copy of it: this tool exists
 /// to predict the daemon, so a checker that models the message its own way is
@@ -54,6 +55,8 @@ const Usage =
     \\  -b <bits>        Minimum RSA key bits accepted (default: RFC 8301 floor)
     \\  --max-key-records <n>
     \\                   Key records tried at one selector (default: 3)
+    \\  -m <ms>            Wall-clock budget for the whole evaluation (default:
+    \\                   20000, the daemon's MaxEvaluationMs; 0 disables)
     \\  --refuse-l       Report `policy` for signatures carrying l= instead of
     \\                   honouring it (RFC 6376 §8.2 sanctions either)
     \\  --no-normalize   Do not rewrite bare CR/LF in the file to CRLF. Use when
@@ -86,6 +89,8 @@ const Args = struct {
     port: u16 = 53,
     min_key_bits: ?u32 = null,
     max_key_records: u8 = verify.DEFAULT_MAX_KEY_RECORDS,
+    /// The daemon's MaxEvaluationMs, for the same reason -b exists here (X-21).
+    max_evaluation_ms: i64 = deadline_mod.DEFAULT_MS,
     body_length_policy: verify.BodyLengthPolicy = .honor,
     /// Rewrite bare CR and bare LF to CRLF while reading the file.
     ///
@@ -127,6 +132,12 @@ fn parseArgs(allocator: Allocator) !Args {
             const raw = it.next() orelse cli.fatal("--max-key-records needs a value");
             result.max_key_records = std.fmt.parseInt(u8, raw, 10) catch
                 cli.fatal("invalid --max-key-records");
+        } else if (mem.eql(u8, arg, "-m")) {
+            const raw = it.next() orelse cli.fatal("-m needs a value");
+            result.max_evaluation_ms = std.fmt.parseInt(i64, raw, 10) catch
+                cli.fatal("-m must be a number of milliseconds");
+            if (result.max_evaluation_ms < 0)
+                cli.fatal("-m must be 0 (disabled) or a positive number of milliseconds");
         } else if (mem.eql(u8, arg, "--refuse-l")) {
             result.body_length_policy = .refuse;
         } else if (mem.eql(u8, arg, "--no-normalize")) {
@@ -203,11 +214,20 @@ pub fn main() !void {
     var any_pass = false;
     var first: ?verify.Result = null;
 
+    // X-21: the daemon's MaxEvaluationMs applies here too -- the tool must
+    // answer the question the daemon answers, budget included.
+    const deadline = deadline_mod.Deadline.fromNow(args.max_evaluation_ms);
+
     // Every signature is reported, not just the first to pass. RFC 8463's own
     // example message carries two independent signatures and states each must
     // stand alone; an overall verdict would let one mask the other.
     for (msg.headers) |hdr| {
         if (!std.ascii.eqlIgnoreCase(hdr.name, "DKIM-Signature")) continue;
+
+        if (deadline.expired()) {
+            emit("note", "evaluation deadline exceeded; remaining signatures not verified");
+            break;
+        }
 
         // Rendered, not fabricated: the signature covers its own field, so under
         // `c=simple` this separator is hashed verbatim (audit D-23).
