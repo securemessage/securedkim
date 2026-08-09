@@ -1,15 +1,7 @@
-//! The end-of-message pipeline: what this daemon does with a message once the
-//! MTA has handed over all of it.
+//! End-of-message DKIM verification and signing pipeline.
 //!
-//! Stage 4.1 of the refactor plan, and the same decomposition `securearc` and
-//! `securespf` already carry -- `settings.zig` holds how the daemon is
-//! configured (§11.48), this file holds what it does per message, and `main.zig`
-//! keeps the globals, the bootstrap and the reload.
-//!
-//! Everything here reads its configuration from a `MsgCtx` passed by the caller
-//! rather than from a module global, so the functions in this file are callable
-//! from a test without a running daemon. `main.zig` owns the globals and builds
-//! the context; nothing in this file reaches back for them.
+//! `MsgCtx` supplies the per-message configuration and accessors; `main.zig`
+//! owns daemon lifecycle and global state.
 
 const std = @import("std");
 const mem = std.mem;
@@ -36,19 +28,10 @@ const settings = @import("settings.zig");
 const Mode = settings.Mode;
 const modeLabel = settings.modeLabel;
 
-/// Everything the message flow reads, gathered at the one point per message
-/// where it is all still known to agree.
+/// Per-message inputs for the DKIM flow.
 ///
-/// THE RESOLVER AND PUBLISHER ARE ACCESSORS, NOT POINTERS, and that is
-/// deliberate -- `securearc`'s `MsgCtx` holds its `*Resolver` and `*Publisher`
-/// directly and this one must not. Both of `main.zig`'s getters build lazily
-/// into thread-local storage, and this daemon has whole modes that never touch
-/// either: a `sign_only` listener reaches no DNS at all, and `doSign` returns
-/// before publishing for a message with no envelope sender or no signing-table
-/// entry. Taking them eagerly would construct a DNS resolver with its TTL cache,
-/// and open a ZMQ socket, on a worker thread that is only signing -- a real
-/// behaviour change, which is not something to smuggle into a pass that claims
-/// to move code. Same reasoning as `securespf/src/flow.zig`.
+/// Resolver and publisher accessors preserve lazy per-thread initialization for
+/// listener modes that do not use them.
 pub const MsgCtx = struct {
     authserv_id: []const u8,
     strip_policy: header_scrub.StripPolicy,
@@ -57,26 +40,16 @@ pub const MsgCtx = struct {
     min_key_bits: u32,
     body_length_policy: verify.BodyLengthPolicy,
     max_key_records: u8,
-    /// Wall-clock bound on verifying one message's signatures (X-21); 0
-    /// disables. No default: it must come from configuration, because a
-    /// silently-supplied constant is the L-2 mechanism.
+    /// Signature-validation deadline in milliseconds; zero disables it.
     max_evaluation_ms: i64,
     resolver: *const fn () *dns_mod.Resolver,
     publisher: *const fn () *zmq.Publisher,
 };
 
 pub fn onBody(conn: *connection_mod.Connection, data: []const u8) u8 {
-    // Accumulate the body so it can be hashed at end-of-message.
-    //
-    // A rejection here is not fatal to the SMTP transaction and must not be
-    // silently discarded either: the connection latches the overflow, and
-    // end-of-message declines to verify or sign rather than hashing a body the
-    // MTA is not delivering (audit X-4). Continue so the MTA finishes the
-    // transaction normally; each further chunk is now a cheap no-op.
-    //
-    // Only the chunk that trips the limit is logged. A large message arrives as
-    // thousands of chunks, and one log line each would make an oversized message
-    // a log-flooding tool in its own right.
+    // Keep the full body for end-of-message processing. On overflow, the
+    // connection latches the condition and later skips signing and verification.
+    // Log only the first rejected chunk to avoid per-chunk log amplification.
     const already_tripped = conn.body_overflow;
     conn.appendBody(data) catch |e| {
         if (!already_tripped) {
@@ -100,9 +73,7 @@ pub fn onBody(conn: *connection_mod.Connection, data: []const u8) u8 {
 pub fn doEom(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     const start_ns = std.time.nanoTimestamp();
 
-    // Drop forged results before producing our own, so nothing downstream can
-    // read a dkim= verdict this daemon did not issue. Runs before signing too:
-    // outbound mail must not carry results claiming our own authserv-id.
+    // Remove forged results for this authserv-id before adding DKIM results.
     _ = header_scrub.stripAuthResults(conn, ctx.authserv_id, ctx.strip_policy);
 
     const mode = modeFor(ctx.modes, conn.listener_index);
@@ -117,10 +88,7 @@ pub fn doEom(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     };
     const elapsed_ms = @divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000);
     const queue_id = conn.macros.queue_id orelse "-";
-    // Via the accessor, not the macro: {client_addr} is absent from Postfix's
-    // default milter_connect_macros, so reading it directly logs "unknown" for
-    // every connection on a stock MTA. The accessor falls back to the address
-    // SMFIC_CONNECT carried. Here the placeholder is display-only.
+    // Use the accessor because it falls back to the SMFIC_CONNECT address.
     const client_addr = conn.clientAddr() orelse "unknown";
     const mail_from = stripAngleBrackets(conn.mail_from_raw orelse "<>");
     const peer = conn.getPeerDisplay();
@@ -142,13 +110,9 @@ pub fn doEom(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     return result;
 }
 
-/// Mode for the socket a connection arrived on (audit A-2).
+/// Return the mode for a connection's listener.
 ///
-/// Every worker binds every configured address, so the index the worker
-/// records on a connection indexes the same list `parseDkimConfig` built and
-/// the lookup is always in range. Bounds-checked rather than asserted anyway:
-/// an out-of-range index is a wiring bug, and the safe fallback is the mode
-/// that only reads. Signing on a guess is how A-2 became a bypass.
+/// An invalid index falls back to verification-only mode.
 fn modeFor(modes: []const Mode, listener_index: usize) Mode {
     if (listener_index < modes.len) return modes[listener_index];
     log.err(
@@ -159,10 +123,7 @@ fn modeFor(modes: []const Mode, listener_index: usize) Mode {
 }
 
 fn doVerify(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
-    // A truncated copy cannot be verified. Reporting dkim=fail would be a lie
-    // about the signature and dkim=none a lie about the message, so this is
-    // temperror: the result is unknown for a local, transient reason, which is
-    // exactly what RFC 6376 6.1 reserves TEMPFAIL for.
+    // An incomplete local copy cannot be verified, so report `dkim=temperror`.
     if (conn.contentTruncated()) {
         addArHeader(conn, ctx, "dkim", "temperror", "", "", false) catch |err|
             return auth_stamp.deferCode(err, "dkim");
@@ -170,10 +131,7 @@ fn doVerify(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
         return @intFromEnum(responses.Code.@"continue");
     }
 
-    // Refuse a signature flood before spending anything on it. Each signature
-    // costs an uncached DNS lookup plus an RSA verify, so the work is the
-    // attack: 300 of them measured 355x the cost of a normal message and
-    // stalled every worker (audit D-4). Counting is O(headers) with no I/O.
+    // Enforce the signature cap before DNS lookups and cryptographic work.
     const max_sigs = conn.limits.max_signatures;
     if (max_sigs != 0) {
         const sig_count = conn.countHeadersCapped("DKIM-Signature", max_sigs);
@@ -190,13 +148,8 @@ fn doVerify(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
         }
     }
 
-    // The body is passed to each signature rather than hashed once here. `c=`
-    // chooses the canonicalization and `l=` chooses how much of the body is
-    // covered, both per signature, so one hash cannot serve them all. This used
-    // to hash every body with `simple` regardless of what the signature asked,
-    // which meant no `c=*/relaxed` signature could verify -- that is what almost
-    // everything on the internet sends, Gmail included.
-    // `contentTruncated` above already established the body is whole.
+    // Each signature canonicalizes and optionally truncates the body differently,
+    // so it receives the complete body rather than a shared hash.
     const body_data = conn.getBody() orelse return @intFromEnum(responses.Code.@"continue");
 
     // Build header list from accumulated headers
@@ -211,19 +164,11 @@ fn doVerify(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
         for (header_strings.items) |s| conn.allocator.free(s);
     }
 
-    // One resolver for every signature in this message, not one each. Hoisted
-    // out of the loop deliberately: signatures in a flood overwhelmingly repeat
-    // the same `s=`/`d=` pair, and sharing the cache across them is what turns
-    // that flood from N key fetches into one (audit X-3, and the amplification
-    // measured as D-4).
+    // Share one resolver and its cache across all message signatures.
     const resolver = ctx.resolver();
 
-    // X-21: one deadline for the whole message, set before the first signature
-    // is checked. MaxSignatures bounds how many, MaxKeyRecords bounds the
-    // fetches per selector -- this bounds the seconds, which is the dimension
-    // a slow-but-working resolver would otherwise spend without limit. Expiry
-    // is temperror, never fail: the signatures we did not reach were not
-    // judged.
+    // One deadline covers all signatures; an expiry yields `temperror` because
+    // remaining signatures were not evaluated.
     const deadline = deadline_mod.Deadline.fromNow(ctx.max_evaluation_ms);
 
     // Find DKIM-Signature headers and verify each
@@ -255,17 +200,8 @@ fn doVerify(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
             .max_key_records = ctx.max_key_records,
         });
 
-        // D-17: `verify.zig` computes a precise reason for every outcome and this is
-        // where it stopped -- only the weak-key case was logged, and the A-R carries
-        // no reason, so `dkim=fail` reached the postmaster with the distinction gone.
-        // A body-hash mismatch (transport or canonicalization) and a signature
-        // mismatch (key, header set, or forgery) have opposite responses. Diagnosing
-        // D-15/D-16 meant reimplementing the hash in Python to recover a fact this
-        // daemon already had.
-        //
-        // No line for a pass: it is the common case and would bury the rest. `reason`
-        // is one of our own literals so it is not escaped; `domain` is the signature's
-        // sender-chosen `d=` and is (audit X-5).
+        // Log non-pass diagnostic reasons. The domain is sender-controlled and
+        // must be escaped; reasons are internal literals.
         if (result.reason) |reason| {
             if (result.result != .pass) {
                 log.info("{f}: dkim={s} ({s})", .{
@@ -285,12 +221,7 @@ fn doVerify(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
             }
         }
 
-        // A pass that covers part of a body is a weaker claim than a pass that
-        // covers all of it, and `dkim=pass` alone cannot express the difference.
-        // Said out loud because RFC 6376 §8.2's attack is precisely that the
-        // unsigned tail can "completely replace the original content in the end
-        // recipient's eyes" while the signature still validates. The domain is
-        // sender-chosen, hence escaped (audit X-5).
+        // Warn when `l=` leaves trailing body bytes unsigned.
         if (result.unsigned_body_bytes > 0) {
             log.warn(
                 "{f}: dkim=pass covers only the first l= octets, {d} trailing body octets are unsigned (RFC 6376 8.2)",
@@ -313,11 +244,7 @@ fn doVerify(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
 }
 
 fn doSign(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
-    // Never sign a message this daemon does not hold in full. A signature is a
-    // claim about specific bytes; over a truncated copy it is a false claim, and
-    // every recipient would compute dkim=fail on mail we vouched for. Leaving it
-    // unsigned is a deliverability cost, signing it wrongly is a correctness one
-    // paid by everyone downstream (audit X-4).
+    // Do not sign an incomplete local copy of the message.
     if (conn.contentTruncated()) {
         const peer = conn.getPeerDisplay();
         log.warn(

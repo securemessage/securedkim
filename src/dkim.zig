@@ -80,16 +80,8 @@ pub const Signature = struct {
 /// Whitespace around tags and values is ignored.
 /// FWS within base64 values (b=, bh=) is stripped.
 pub fn parseSignature(value: []const u8) !Signature {
-    // RFC 6376 §3.2, before any tag is interpreted: the grammar, plus "Tags with
-    // duplicate names MUST NOT occur within a single tag-list; if a tag name does
-    // occur more than once, the entire tag-list is invalid" (audit D-6). The loop
-    // below was last-wins, so `d=a.com; d=b.com` bound b.com here and a.com in an
-    // implementation taking the first -- two verifiers reading a different signing
-    // domain out of identical bytes, which is what the MUST exists to prevent.
-    //
-    // THE VALIDATOR ALREADY EXISTED: `securearc` has called `sig_header.validateTagList`
-    // on the AMS and AS since it landed, and only this parser was never wired to it.
-    // Same shape as X-17.
+    // Validate RFC 6376 tag-list syntax, including the prohibition on duplicate
+    // tags, before interpreting any tag.
     try sig_header.validateTagList(value);
 
     var sig = Signature{};
@@ -114,13 +106,8 @@ pub fn parseSignature(value: []const u8) !Signature {
         } else if (mem.eql(u8, tag, "bh")) {
             sig.body_hash = val;
         } else if (mem.eql(u8, tag, "c")) {
-            // Propagated, not defaulted (audit D-14). An ABSENT `c=` still means
-            // `simple/simple`; the fallback for an UNPARSEABLE one was that same
-            // value, quietly rewriting a signature naming an algorithm we cannot
-            // perform into one we can. The hash then mismatched and the verdict was
-            // `dkim=fail` -- an accusation of forgery for something never tested.
-            // RFC 6376 §6.1.1 requires ignoring such a signature: permerror. Same
-            // correction A-5 made in `securearc`.
+            // An absent `c=` defaults to `simple/simple`; an invalid value must
+            // remain a parse error rather than silently selecting that default.
             sig.canonicalization = try canon.parseCanonicalization(val);
         } else if (mem.eql(u8, tag, "d")) {
             sig.domain = val;
@@ -267,39 +254,23 @@ fn hashNameOf(alg: Algorithm) []const u8 {
     };
 }
 
-/// Does the key record's `h=` permit this signature's hash algorithm?
+/// Whether the key record's `h=` permits the signature hash algorithm.
 ///
-/// RFC 6376 §6.1.2 step 6: "If the 'h=' tag exists in the public-key record and
-/// the hash algorithm implied by the 'a=' tag in the DKIM-Signature header field
-/// is not included in the contents of the 'h=' tag, the Verifier MUST ignore the
-/// key record and return PERMFAIL (inappropriate hash algorithm)."
-///
-/// Absent `h=` "defaults to allowing all algorithms" (§3.6.1), so a record without
-/// the tag permits everything. The tag constrains what a signer *will* use, so a
-/// key published `h=sha256` and used with something else is a signer error, not a
-/// forgery -- which is why this is permerror rather than fail.
+/// An absent `h=` permits all algorithms (RFC 6376 §3.6.1).
 pub fn keyAllowsHashAlgorithm(rec: *const PublicKeyRecord, alg: Algorithm) bool {
     const list = rec.hash_algorithms orelse return true;
     const want = hashNameOf(alg);
     var it = mem.splitScalar(u8, list, ':');
     while (it.next()) |entry| {
-        // "Unrecognized algorithms MUST be ignored" (§3.6.1) -- ignoring one we do
-        // not know means it simply does not match, which is what a plain compare
-        // already does. Nothing to special-case.
+        // Unknown algorithms do not match the implemented hash names.
         if (mem.eql(u8, mem.trim(u8, entry, " \t"), want)) return true;
     }
     return false;
 }
 
-/// Does the key record's `s=` cover email?
+/// Whether the key record's `s=` permits the email service.
 ///
-/// RFC 6376 §3.6.1: "Verifiers for a given service type MUST ignore this record if
-/// the appropriate type is not listed. Unrecognized service types MUST be ignored."
-/// `*` matches all service types; `email` is the one that matters to a milter.
-///
-/// The default is `*`, so a record without the tag applies. A record published
-/// `s=` for some other service is one the operator has said is not for mail, and
-/// honouring that is the whole point of the tag.
+/// `*` and `email` match; an absent `s=` defaults to `*`.
 pub fn keyAllowsEmailService(rec: *const PublicKeyRecord) bool {
     var it = mem.splitScalar(u8, rec.service_type, ':');
     while (it.next()) |entry| {
@@ -309,11 +280,7 @@ pub fn keyAllowsEmailService(rec: *const PublicKeyRecord) bool {
     return false;
 }
 
-/// Is `flag` present in the key record's `t=` list?
-///
-/// RFC 6376 §3.6.1: "Unrecognized flags MUST be ignored", so an unknown flag
-/// alongside a known one must not disturb the known one -- hence a membership
-/// test over the list rather than an equality test against the whole value.
+/// Whether `flag` is present in the key record's `t=` list.
 pub fn keyHasFlag(rec: *const PublicKeyRecord, flag: []const u8) bool {
     const flags = rec.flags orelse return false;
     var it = mem.splitScalar(u8, flags, ':');
@@ -323,16 +290,9 @@ pub fn keyHasFlag(rec: *const PublicKeyRecord, flag: []const u8) bool {
     return false;
 }
 
-/// Under `t=s`, does this signature's `i=` sit exactly on `d=`?
+/// Under `t=s`, whether an explicit `i=` has the exact `d=` domain.
 ///
-/// RFC 6376 §3.6.1: "Any DKIM-Signature header fields using the 'i=' tag MUST have
-/// the same domain value on the right-hand side of the '@' in the 'i=' tag and the
-/// value of the 'd=' tag. That is, the 'i=' domain MUST NOT be a subdomain of 'd='."
-///
-/// Only constrains signatures that carry `i=`; absent the tag there is nothing to
-/// compare, and §3.5's default AUID is `@d=` anyway, which satisfies the rule.
-/// The local-part is irrelevant, so everything up to and including the last `@` is
-/// discarded -- last, not first, because a quoted local-part may itself contain one.
+/// An absent `i=` uses the compliant default AUID. The domain follows the final `@`.
 pub fn auidSatisfiesStrictFlag(sig: *const Signature) bool {
     const auid = sig.auid orelse return true;
     const at = mem.lastIndexOfScalar(u8, auid, '@') orelse return false;
@@ -448,9 +408,7 @@ test "parse signature unsupported version" {
     try std.testing.expectError(error.UnsupportedVersion, parseSignature(value));
 }
 
-// D-6. The `d=` case is the one that matters: last-wins here and first-wins in
-// another implementation means two verifiers read a different signing domain out of
-// identical bytes, and `d=` is what DMARC aligns against.
+// D-6 regression: duplicate tags must invalidate the entire signature.
 test "D-6: a duplicate tag invalidates the whole signature" {
     try std.testing.expectError(error.DuplicateTagName, parseSignature(
         "v=1; a=rsa-sha256; d=a.com; d=b.com; s=sel; h=from; bh=x; b=y",
@@ -466,15 +424,11 @@ test "D-6: a duplicate tag invalidates the whole signature" {
         try std.testing.expectError(error.DuplicateTagName, parseSignature(value));
     }
 
-    // Case-sensitively distinct, per §3.2's "Tags MUST be interpreted in a
-    // case-sensitive manner" -- `S=` is an unrecognised tag, not a second `s=`,
-    // so this is NOT a duplicate and must still parse.
+    // Tag names are case-sensitive, so `S=` is not a duplicate `s=`.
     _ = try parseSignature("v=1; a=rsa-sha256; d=a.com; s=sel; S=x; h=from; bh=x; b=y");
 }
 
-// D-14. An absent `c=` still defaults to simple/simple; it is only the UNPARSEABLE
-// one that must now propagate. Both halves asserted, because collapsing them was
-// the defect.
+// D-14 regression: absent and invalid `c=` values have distinct handling.
 test "D-14: an unparseable c= is refused, an absent one still defaults" {
     try std.testing.expectError(error.InvalidCanonicalization, parseSignature(
         "v=1; a=rsa-sha256; c=nonsense/nonsense; d=a.com; s=sel; h=from; bh=x; b=y",
@@ -516,13 +470,7 @@ test "parse public key record revoked" {
     try std.testing.expectEqual(@as(usize, 0), rec.public_key.len);
 }
 
-// --- D-11: key-record restrictions the signer asked for ---------------------
-//
-// All four tags were parsed into `PublicKeyRecord` from the first commit and then
-// never read, so a key its owner had restricted verified exactly as though it were
-// unrestricted. These pin each restriction and, as much as the negative cases, the
-// defaults -- a check that refuses too much is as broken as one that refuses
-// nothing, and would reject most of the internet, which publishes none of these.
+// --- D-11: public-key record restrictions -------------------------------------
 
 test "D-11: h= admits the signature's hash, absent h= admits everything" {
     // §3.6.1: absent, it "defaults to allowing all algorithms".
@@ -532,8 +480,7 @@ test "D-11: h= admits the signature's hash, absent h= admits everything" {
 
     const sha256 = try parsePublicKeyRecord("v=DKIM1; h=sha256; k=rsa; p=AAAA");
     try std.testing.expect(keyAllowsHashAlgorithm(&sha256, .rsa_sha256));
-    // ed25519-sha256 hashes with SHA-256, so `h=sha256` permits it. Comparing the
-    // algorithm's own name would wrongly reject this.
+    // `ed25519-sha256` also uses SHA-256, so `h=sha256` permits it.
     try std.testing.expect(keyAllowsHashAlgorithm(&sha256, .ed25519_sha256));
 
     // §6.1.2 step 6: not listed, so the key record MUST be ignored.
@@ -549,8 +496,7 @@ test "D-11: h= admits the signature's hash, absent h= admits everything" {
 }
 
 test "D-11: s= must cover email, and defaults to covering it" {
-    // Default is `*`, which is why the overwhelming majority of real records --
-    // which omit s= entirely -- must keep verifying.
+    // An absent `s=` defaults to `*`.
     const absent = try parsePublicKeyRecord("v=DKIM1; k=rsa; p=AAAA");
     try std.testing.expect(keyAllowsEmailService(&absent));
 
@@ -576,8 +522,7 @@ test "D-11: t= flags are a list, and unrecognized ones are ignored" {
     try std.testing.expect(keyHasFlag(&y, "y"));
     try std.testing.expect(!keyHasFlag(&y, "s"));
 
-    // Both flags, plus one from the future. A substring or whole-value compare
-    // would get at least one of these wrong.
+    // Flags are matched as individual list entries.
     const both = try parsePublicKeyRecord("v=DKIM1; t=y:s:x-future; k=rsa; p=AAAA");
     try std.testing.expect(keyHasFlag(&both, "y"));
     try std.testing.expect(keyHasFlag(&both, "s"));

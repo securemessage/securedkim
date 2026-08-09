@@ -7,16 +7,10 @@ const process = std.process;
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;
 
-// These three are a deliberate copy of `securemilter.cli`, which this tool cannot
-// import: its build.zig takes only `securemilter_crypto`, and pulling in the whole
-// milter library to share three functions is a worse trade than the duplication.
-// Keep them in step with securemilter-lib/src/cli.zig.
+// This standalone tool depends only on `securemilter_crypto`; keep these helpers
+// aligned with `securemilter.cli`.
 
-/// Write all of `data`, looping because a short write is legal.
-///
-/// This ignored the byte count until 2026-07-29, as seven of the nine tools did.
-/// `write(2)` may transfer fewer bytes than requested and report how many, so
-/// discarding that silently truncates output.
+/// Write all of `data`, handling permitted short writes.
 fn writeOut(data: []const u8) void {
     var written: usize = 0;
     while (written < data.len) {
@@ -38,33 +32,16 @@ const c = @cImport({
     @cInclude("openssl/rsa.h");
 });
 
-/// RSA size RFC 8301 §3.2 recommends for signers, as distinct from the 1024-bit
-/// floor below which a verifier must reject (`crypto.RFC8301_MIN_RSA_BITS`).
-/// Between the two is legal but worth saying out loud, so this warns and the floor
-/// refuses.
+/// RFC 8301-recommended RSA signing-key size, above the verification minimum.
 const RSA_RECOMMENDED_BITS = 2048;
 
-/// Create the private key file: mode 0600 **at creation**, and refusing to replace
-/// one that is already there (audit D-8).
-///
-/// Both halves matter and both were missing from the RSA branch. The mode has to be
-/// set by the `open` that creates the file, not by a later `chmod`, because the key
-/// is written in between and an fd opened during that window stays readable
-/// afterwards. `O_EXCL` stops a generate from silently destroying a signing key that
-/// is in use, and stops the create from following a symlink planted at a predictable
-/// output path.
-///
-/// Shared by both algorithms so the two cannot drift again -- the Ed25519 branch had
-/// the mode right and the exclusivity wrong, which is precisely how the pair of them
-/// ended up half-correct in different ways.
+/// Create a new private-key file with mode 0600 and no replacement path.
 fn createKeyFile(allocator: std.mem.Allocator, output_path: []const u8) fs.File {
     return fs.cwd().createFile(output_path, .{
         .mode = 0o600,
         .exclusive = true,
     }) catch |err| {
-        // Reported through `fatal` like every other operator error in this tool.
-        // Returning the error from `main` instead printed a Zig stack trace, which
-        // tells an operator who typo'd a path nothing they can act on.
+        // Report file-creation errors through the tool's standard fatal path.
         if (err == error.PathAlreadyExists) {
             const msg = std.fmt.allocPrint(
                 allocator,
@@ -143,16 +120,8 @@ pub fn main() !void {
     const out = output_path orelse return fatal("-o <output-path> is required");
 
     if (mem.eql(u8, algorithm, "rsa")) {
-        // Refused, not clamped (audit D-9). RFC 8301 §3.2 makes a verifier reject
-        // signatures from RSA keys below 1024 bits, so `-b 512` produced a key whose
-        // every signature fails everywhere -- mail that leaves looking signed and
-        // arrives failing DKIM, which is worse than not signing at all. Generating it
-        // silently was the defect; quietly rounding it up would be a different one,
-        // because the operator asked for something specific and would not learn that
-        // they got something else.
-        //
-        // C-3 (§11.10) already stopped the daemons LOADING such a key. This is the
-        // other end of the same rule: stop creating one.
+        // Reject keys below the RFC 8301 verifier minimum; do not silently clamp
+        // the requested size.
         if (bits < crypto.RFC8301_MIN_RSA_BITS) {
             const msg = std.fmt.allocPrint(
                 allocator,

@@ -1,20 +1,7 @@
-//! `securedkim-check` — verify every DKIM-Signature on a message file and print
-//! the results, so an external conformance suite can drive the shipped verifier.
-//!
-//! Exists for the same reason `securespf-check` and `securearc-check` do: RFC
-//! conformance is a V1 release gate, and a gate is only meaningful if the thing
-//! under test is the code that ships.
-//!
-//! Two oracles need this interface, and they need different things from it:
-//!
-//!  - The **RFC 8463 Appendix A** message carries an Ed25519-SHA256 and an
-//!    RSA-SHA256 signature over the same body, and the RFC states that "either
-//!    signature would be valid if the other were not present". Reporting only an
-//!    overall verdict would let one good signature hide the other's failure, so
-//!    every signature is reported individually, in header order.
-//!  - **Differential testing against `dkimpy`** compares per-signature verdicts
-//!    on messages `dkimpy` signed, where the whole point is which signature
-//!    disagreed and why.
+//! `securedkim-check`: verify each DKIM-Signature, print per-signature results.
+//! RFC 8463 Appendix A needs individual results (one good signature must not hide
+//! another's failure); differential testing against `dkimpy` compares per-signature
+//! verdicts. Uses the same `verify.verifySignature` and header format as the milter.
 //!
 //! It deliberately calls the same `verify.verifySignature` the milter calls, with
 //! the same header list shape — `"Name: value"` with folding intact and the

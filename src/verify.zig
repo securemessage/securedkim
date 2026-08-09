@@ -67,21 +67,9 @@ pub const VerifyResult = struct {
     /// RFC 6376 §8.2: appended content "to completely replace the original
     /// content in the end recipient's eyes" is the attack this enables.
     unsigned_body_bytes: u64 = 0,
-    /// The key record carried `t=y`: the signing domain is testing DKIM.
-    ///
-    /// Deliberately NOT folded into `result`. RFC 6376 §3.6.1 requires that
-    /// verifiers "MUST NOT treat messages from Signers in testing mode differently
-    /// from unsigned email, even should the signature fail to verify" -- but it
-    /// also says "Verifiers MAY wish to track testing mode results to assist the
-    /// Signer", and reporting `none` would throw away the very information the
-    /// signer published the key to obtain. OpenDKIM resolves this the same way,
-    /// reporting the real result and annotating it, suppressing only the action.
-    ///
-    /// The MUST therefore binds whoever *acts* on this, not the verdict itself.
-    /// For us that is DMARC alignment, because `securedmarc` consumes our A-R and
-    /// an aligned pass from a testing key would let it do precisely what the MUST
-    /// forbids. OpenDKIM never faces that half: its scope is DKIM only and
-    /// `opendmarc` is a separate program.
+    /// Testing mode: `t=y` in key record. NOT folded into `result` (RFC 6376 §3.6.1:
+    /// must not treat testing messages differently, but MAY track for signer assistance).
+    /// Reported separately so DMARC alignment (audit A-12) does not apply testing passes.
     testing: bool = false,
 };
 
@@ -120,22 +108,10 @@ pub const Request = struct {
     /// the same `Header` (D-23). This is what gets canonicalized into the signed
     /// data, because a signature covers its own field.
     ///
-    /// The two above are both `[]const u8` and were adjacent positional
-    /// parameters until 2026-08-06, so transposing them type-checked. **Measured
-    /// rather than assumed, because the first draft of this comment guessed
-    /// wrong:** swapping them takes RFC 6376 from 26/26 to **4/26**, and all 22
-    /// failures are `permerror` with reason `malformed signature` — the leading
-    /// `DKIM-Signature:` makes `parseAndValidate` reject the tag list outright,
-    /// so the mistake never reaches the crypto.
-    ///
-    /// **That makes this a readability fix, not a safety one**, and the entry is
-    /// worded that way deliberately. Unlike `worker.Options`, where transposing
-    /// two `posix.fd_t` produced a running daemon that behaved wrongly in
-    /// silence, this transposition is caught by the first conformance run. The
-    /// struct earns its place by making nine positional arguments legible at the
-    /// call site; it is not preventing a silent defect, and claiming otherwise
-    /// would be the same unverified-justification error the `worker.zig` ceiling
-    /// entry records.
+    /// Transposing `sig_header_value` and `sig_header_raw` is caught by conformance
+    /// (RFC 6376 drops from 26/26 to 4/26: `permerror`, `malformed signature`). This is
+    /// a readability fix (nine positional arguments become legible), not a silent-defect
+    /// guard; `worker.Options` is the case where transposition produced silent failure.
     sig_header_raw: []const u8,
     /// Every header field of the message, in arrival order, as the milter saw
     /// them. `h=` selects from these; it does not get to reorder them.
@@ -150,13 +126,10 @@ pub const Request = struct {
     /// the value config falls back to, not a value this struct supplies.
     max_key_records: u8,
 
-    // NONE OF THE THREE ABOVE HAS A DEFAULT, and that is deliberate. Each is an
-    // operator policy that both call sites already read from configuration, so
-    // a default here could only ever be reached by a caller that forgot one --
-    // which is precisely L-2, where `MaxConnections` was honoured by one daemon
-    // and silently replaced with a constant by three others. A struct makes
-    // omission possible in a way nine positional parameters did not; leaving
-    // these required is what keeps that from being a regression.
+    // No defaults: each is an operator policy read from config. A default here
+    // would only be reached by a caller that forgot it (audit L-2: `MaxConnections`
+    // honoured by one daemon, silently replaced by three others). Required fields
+    // prevent regression.
 };
 
 pub fn verifySignature(

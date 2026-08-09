@@ -28,13 +28,7 @@ pub const KeyTableEntry = struct {
     selector: []const u8,
     key_path: []const u8,
 
-    /// The key at `key_path`, loaded by `loadKeys` once the table is parsed.
-    ///
-    /// It lives on the row rather than in a parallel array beside the table
-    /// (D-24). A parallel array would have to stay index-aligned with
-    /// `entries`, and D-7 was precisely a lookup that assumed an alignment
-    /// nobody enforced. Here the row that supplies `d=` and `s=` carries the
-    /// key that signs them, so the two cannot be paired wrongly.
+    /// Key at `key_path`, loaded by `loadKeys` after parsing.
     key: ?crypto.SigningKey = null,
 };
 
@@ -79,24 +73,13 @@ pub const KeyTable = struct {
         self.allocator.free(self.entries);
     }
 
-    /// Load the key named by every row, holding each to `min_bits`.
+    /// Load every row's key with the specified minimum size.
     ///
-    /// **Every row or none.** A row whose key will not load is a row that would
-    /// silently stop signing a domain, which is the whole of D-24 — so it fails
-    /// the load and names the file. That has no availability cost on reload:
-    /// `buildSigningAssets` is all-or-nothing, so a failed SIGHUP keeps the
-    /// previous working table rather than applying a half-broken one. At startup
-    /// it is the difference between refusing to run and running unsigned.
-    ///
-    /// The caller reports the error; this returns the offending path through
-    /// `failed_path` so the message can name it.
+    /// The caller receives the failing path; reload remains all-or-nothing.
     pub fn loadKeys(self: *KeyTable, min_bits: u32, failed_path: *[]const u8) !void {
         for (self.entries) |*entry| {
             if (entry.key != null) continue;
-            // `.require_safe` is fixed here rather than passed in, unlike
-            // `min_bits`: a KeyTable is only ever loaded by the daemon to sign
-            // with, so there is no second caller with a different answer. A
-            // parameter would be a knob with one possible setting.
+            // KeyTable keys always sign mail, so safe file permissions are required.
             entry.key = crypto.loadRsaKeyFile(entry.key_path, min_bits, .require_safe) catch |err| {
                 failed_path.* = entry.key_path;
                 return err;
@@ -104,26 +87,9 @@ pub const KeyTable = struct {
         }
     }
 
-    /// Find all key entries for a given signing-entry name.
-    /// Returns a slice of matching entries (may be multiple for multi-sign).
+    /// Find all adjacent entries for a signing-entry name.
     ///
-    /// Returns the run of ADJACENT matching rows. `parseKeyTable` groups rows by
-    /// signing entry precisely so that run is all of them — but this does not
-    /// assume it did, because the cost of being wrong is asymmetric. Every element
-    /// returned has been compared, so a table grouped by nobody yields too FEW
-    /// keys, never one belonging to somebody else (D-7).
-    ///
-    /// The previous version took the index of the first match and the count of all
-    /// matches and returned that many rows from there, which is only correct when
-    /// the matches are contiguous. Given
-    ///
-    ///     example.com  example.com:rsa:/k/rsa
-    ///     other.org    other.org:sel:/k/other
-    ///     example.com  example.com:ed:/k/ed
-    ///
-    /// it returned example.com's first key followed by **other.org's** — one
-    /// domain's signing key offered under another's name — and silently dropped
-    /// the row that was actually asked for.
+    /// `parseKeyTable` groups matching rows; this scan returns only verified matches.
     pub fn lookup(self: *const KeyTable, signing_entry: []const u8) []const KeyTableEntry {
         const first = for (self.entries, 0..) |entry, i| {
             if (mem.eql(u8, entry.signing_entry, signing_entry)) break i;
@@ -223,23 +189,9 @@ pub fn parseKeyTable(allocator: Allocator, content: []const u8) !KeyTable {
     };
 }
 
-/// Bring rows sharing a signing entry together, preserving file order.
+/// Group rows by signing entry while preserving their file order.
 ///
-/// This is what makes `lookup` COMPLETE. A hand-maintained table accumulates
-/// appends and edits, so rows for one signing entry drift apart; grouping them
-/// once here costs a parse rather than a lookup, and the lookup runs per message.
-///
-/// **Stable on purpose.** Multi-sign emits one signature per row, so the order
-/// within a group decides which signature is added first. Reordering rows that
-/// share an entry would silently change the output of a table nobody edited.
-///
-/// The comparison MUST match `lookup`'s. If grouping said two rows were the same
-/// entry and the lookup disagreed, grouping would scatter rows the lookup then
-/// could not find — the defect back again by a longer route.
-///
-/// Quadratic in the number of rows, which is affordable exactly once per load:
-/// `MAX_TABLE_BYTES` caps a table at 1 MiB, and this runs at startup and on
-/// SIGHUP, never on the message path.
+/// This load-time quadratic pass keeps multi-sign lookup complete and ordered.
 fn groupBySigningEntry(items: []KeyTableEntry) void {
     var group_start: usize = 0;
     while (group_start < items.len) {
@@ -248,8 +200,7 @@ fn groupBySigningEntry(items: []KeyTableEntry) void {
         while (j < items.len) : (j += 1) {
             if (!mem.eql(u8, items[j].signing_entry, items[group_start].signing_entry)) continue;
             if (j != insert) {
-                // Shift the run right rather than swapping: a swap would drag an
-                // unrelated row backwards past its own group and lose file order.
+                // Shift rather than swap to preserve file order.
                 const moved = items[j];
                 var k = j;
                 while (k > insert) : (k -= 1) items[k] = items[k - 1];
