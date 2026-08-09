@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: FreeBSD
+    steps:
+      - name: Checkout securedkim
+        uses: actions/checkout@v4
+        with:
+          path: securedkim
+
+      - name: Checkout securemilter-lib (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: securemessage/securemilter-lib
+          path: securemilter-lib
+
+      - name: Checkout securemilter-crypto (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: securemessage/securemilter-crypto
+          path: securemilter-crypto
+
+      - name: Checkout rfc-suites (conformance framework, pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: securemessage/rfc-suites
+          path: rfc-suites
+          ref: v0.1.0
+          token: ${{ secrets.FORGE_TOKEN }}
+
+      - name: PHP ext-yaml
+        run: php -m | grep -qi '^yaml$' || doas pkg install -y php84-pecl-yaml
+
+      - name: Build
+        run: cd securedkim && zig build
+
+      - name: Unit tests
+        run: cd securedkim && zig build test
+
+      - name: RFC 6376/8463 conformance (DKIM)
+        run: |
+          cd securedkim && php ../rfc-suites/suites/rfc6376-dkim/run.php \
+            --adapter test/adapter-securedkim.yaml \
+            --bin zig-out/bin/securedkim-check

@@ -1,0 +1,8 @@
+# Adapter: SecureMilter securedkim
+# {bin} is zig-out/bin/securedkim-check; per-case flags splice before the
+# message path at {case_args}.
+name: securedkim
+suite: rfc6376-dkim
+argv: ["{bin}", "-n", "{dns_addr}", "-p", "{dns_port}", "{case_args}", "{msg_file}"]
+verdict:
+  kind: kv
