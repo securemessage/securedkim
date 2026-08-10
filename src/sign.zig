@@ -146,10 +146,7 @@ pub fn signMessage(
     };
 }
 
-/// Compute the canonicalized body hash for a message body.
-///
-/// This is a convenience wrapper: feed the full body through the
-/// BodyCanonicalizer with the given algorithm, then SHA-256 hash it.
+/// Canonicalize a message body and return its SHA-256 hash.
 pub fn computeBodyHash(allocator: Allocator, body: []const u8, algorithm: canon.Algorithm) ![32]u8 {
     var bc = canon.BodyCanonicalizer.init(allocator, algorithm);
     defer bc.deinit();

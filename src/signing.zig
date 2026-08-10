@@ -238,8 +238,7 @@ fn d24SeedOf(key: *const crypto.SigningKey) [32]u8 {
 test "D-24: a sender matched by the KeyTable is signed with that row's key" {
     const saved = g_shorthand;
     defer g_shorthand = saved;
-    // Shorthand configured for a.example, table for b.example. This is the
-    // migration-shaped config that produced d=b.example signed with a's key.
+    // Shorthand and table configuration deliberately select different domains.
     g_shorthand = .{ .domain = "a.example", .selector = "sela" };
 
     var st_rows = [_]keytable.SigningTableEntry{

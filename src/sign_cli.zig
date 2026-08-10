@@ -197,11 +197,6 @@ pub fn main() !void {
     var key = try loadKey(allocator, args.key_file.?, args.algorithm);
     defer key.deinit();
 
-    // No key/algorithm cross-check here: `loadKey` switches on `-a` and can only
-    // return the matching kind, and a file in the wrong format fails inside it --
-    // an Ed25519 seed is not a valid PEM, and PEM text is not 32 base64 octets.
-    // (`crypto.Algorithm` and `dkim.Algorithm` are separate enums in any case.)
-
     // The body hash and any l= must both describe the *canonicalized* body, so the
     // canonicalization is done once here and its length is what l= reports.
     var bc = canon.BodyCanonicalizer.init(allocator, args.canonicalization.body);

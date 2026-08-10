@@ -1,9 +1,6 @@
-//! `securedkim-testkey`: does the DKIM key in DNS match the key on disk.
+//! DKIM-specific wrapper for the shared `securemilter.testkey` tool.
 //!
-//! The tool itself is `securemilter.testkey`, shared with `securearc-testkey`.
-//! This file is the 18 lines the two copies actually differed in: a name, a
-//! usage text, and the daemon to name when a key's permissions are wrong
-//! (refactor plan stage 5.1).
+//! It supplies SecureDKIM's name, usage text, and daemon identifier.
 
 const securemilter = @import("securemilter");
 const securemilter_crypto = @import("securemilter_crypto");
