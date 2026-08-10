@@ -235,6 +235,7 @@ fn runDaemon() !void {
         .worker_threads = dkim_cfg.worker_threads,
         .max_connections = dkim_cfg.max_connections,
         .num_listeners = @intCast(dkim_cfg.listen_addresses.len),
+        .listen_addresses = dkim_cfg.listen_addresses,
         .spawn_threads = spawnHealthMonitor,
     });
     defer boot.deinit();
