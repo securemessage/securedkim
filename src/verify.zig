@@ -21,11 +21,8 @@ pub const Result = enum {
     permerror,
     neutral,
     none,
-    /// RFC 8601 §2.7.1: "the message was signed but the signature or signatures
-    /// were not acceptable to the verifier". Distinct from `fail`, which asserts
-    /// the signature did not validate: `policy` says this verifier declined to
-    /// evaluate a signature that might well be good. Used when a signature
-    /// carries `l=` and the operator has chosen to refuse those.
+    /// The verifier declined this signature by policy, rather than finding it
+    /// invalid; used when `l=` signatures are refused.
     policy,
 
     pub fn toString(self: Result) []const u8 {
@@ -59,13 +56,9 @@ pub const VerifyResult = struct {
     domain: []const u8,
     selector: []const u8,
     reason: ?[]const u8 = null,
-    /// Octets of the canonicalized body this signature does not cover, which is
-    /// non-zero only when the signature carries `l=` and it is being honoured.
+    /// Canonicalized body octets not covered when `l=` is honoured.
     ///
-    /// Reported because `pass` over part of a body is a weaker claim than `pass`
-    /// over all of it, and nothing downstream can tell the difference otherwise.
-    /// RFC 6376 §8.2: appended content "to completely replace the original
-    /// content in the end recipient's eyes" is the attack this enables.
+    /// Partial coverage is weaker than a full-body pass and must remain visible.
     unsigned_body_bytes: u64 = 0,
     /// Testing mode: `t=y` in key record. NOT folded into `result` (RFC 6376 §3.6.1:
     /// must not treat testing messages differently, but MAY track for signer assistance).
@@ -84,14 +77,8 @@ pub const VerifyResult = struct {
 /// 6. Reconstruct signed header block (canonicalized headers per h= list)
 /// 7. Verify signature over the header block
 ///
-/// Takes the raw body rather than a hash of it. The body hash is not a property
-/// of the message: `c=` chooses the canonicalization and `l=` chooses how much of
-/// the body is covered, both per signature, and one message may carry several
-/// signatures that disagree on both. A hash computed once by the caller can only
-/// be right for signatures that happen to share the caller's assumptions -- which
-/// is how this daemon came to hash every body with `simple` canonicalization no
-/// matter what the signature asked for, and so could not verify the near-universal
-/// `c=relaxed/relaxed`.
+/// Takes raw body, not a precomputed hash: each signature's `c=` and `l=` may
+/// require different canonicalization and coverage.
 ///
 /// `min_key_bits` is the smallest RSA modulus this verifier will accept, already
 /// reconciled with the RFC 8301 floor by `crypto.resolveMinRsaBits`. It is a
@@ -137,33 +124,17 @@ pub fn verifySignature(
     resolver: *dns_mod.Resolver,
     req: Request,
 ) VerifyResult {
-    // `t=y` is discovered midway -- the key record has to be fetched and parsed
-    // first -- but it belongs on every verdict reached after that point, and this
-    // function has around ten of them. Setting it at each `return` would be ten
-    // chances to miss one, and the one missed would be a testing key quietly
-    // contributing a DMARC pass. So the work happens in `verifySignatureInner`,
-    // which reports the flag through an out-parameter (the `reason: *?[]const u8`
-    // convention `chain.zig` and `sealbuild.zig` already use), and it is stamped
-    // here exactly once, on whatever comes back.
+    // Apply the discovered `t=y` flag once so every post-key verdict carries it.
     var key_testing = false;
     var result = verifySignatureInner(allocator, resolver, req, &key_testing);
     result.testing = key_testing;
     return result;
 }
 
-/// Key records tried at one selector before we give up (audit D-20).
+/// Key records to try at one selector (audit D-20).
 ///
-/// RFC 6376 §6.1.2 step 4: "If the query for the public key returns multiple key
-/// records, the Verifier can choose one of the key records or may cycle through
-/// the key records ... at the discretion of the implementer. The order of the key
-/// records is unspecified." §3.6.2.2 tells the *signer* not to publish more than
-/// one, but a verifier that trusts that breaks during a rotation: both the old and
-/// the new record are live for as long as caches hold them, and taking only the
-/// first meant every message signed with the other key failed.
-///
-/// Three, not unbounded, because the count is chosen by whoever publishes the
-/// zone. Each additional record costs one more public-key verification of an
-/// attacker-supplied signature, which is the same per-signature work D-4 caps.
+/// RFC 6376 §6.1.2 permits cycling during key rotation; the bound limits
+/// attacker-controlled public-key verification work.
 pub const DEFAULT_MAX_KEY_RECORDS: u8 = 3;
 
 /// Ceiling on the configured value, so the cap cannot itself become the amplifier.
