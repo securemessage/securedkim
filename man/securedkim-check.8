@@ -1,0 +1,161 @@
+.\" Copyright (c) 2026 Daniel Morante
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd July 27, 2026
+.Dt SECUREDKIM-CHECK 8
+.Os
+.Sh NAME
+.Nm securedkim-check
+.Nd command-line DKIM signature verification tool
+.Sh SYNOPSIS
+.Nm
+.Op Fl f Ar message-file
+.Op Fl n Ar nameserver
+.Op Fl p Ar port
+.Op Fl b Ar bits
+.Op Fl -max-key-records Ar count
+.Op Fl m Ar ms
+.Op Fl -refuse-l
+.Op Fl -no-normalize
+.Ar message-file
+.Sh DESCRIPTION
+.Nm
+verifies every DKIM-Signature header on an RFC 5322 message file and prints
+the result of each as
+.Dq key=value
+lines on standard output.
+It calls the same
+.Fn verifySignature
+.Xr securedkim 8
+calls, with the same header list shape, so a result from
+.Nm
+is a statement about the shipped verifier rather than about a separate
+implementation written to pass tests.
+.Pp
+Every signature is reported, not just the first to pass: RFC 8463's own
+example message carries two independent signatures, and one valid signature
+must not hide another's failure.
+This is also what makes
+.Nm
+suitable for differential testing against other DKIM implementations.
+.Sh OPTIONS
+.Bl -tag -width indent
+.It Fl f Ar message-file
+Message file to verify.
+May also be given positionally.
+Required.
+.It Fl n Ar nameserver
+DNS nameserver IP address.
+Default:
+.Dq 127.0.0.1 .
+.It Fl p Ar port
+DNS nameserver port.
+Default: 53.
+.It Fl b Ar bits
+Minimum RSA key bits accepted from a signer's DNS key record.
+Default: the RFC 8301 floor (1024).
+Reconciled with that floor exactly as
+.Xr securedkim 8
+does: a value below 1024 is silently raised, so this flag cannot make
+.Nm
+accept a signature the shipped daemon would reject.
+.It Fl -max-key-records Ar count
+Key records to try at one selector before giving up.
+Default: 3.
+.It Fl m Ar ms
+Wall-clock budget for the whole evaluation, in milliseconds.
+Default: 20000, matching the daemon's
+.Cm MaxEvaluationMs .
+0 disables the limit.
+.It Fl -refuse-l
+Report
+.Dq policy
+for a signature carrying
+.Cm l=
+instead of honouring it.
+RFC 6376 \[sc]8.2 sanctions either treatment; the daemon's default is to
+honour
+.Cm l= ,
+matching this tool's default.
+.It Fl -no-normalize
+Do not rewrite a bare CR or LF in the file to CRLF while reading it.
+.Nm
+rewrites by default so that an
+.Pa .eml
+file edited on a Unix host, which is usually LF-only, can still be verified
+under DKIM's CRLF canonicalization.
+Use this flag when the file is already CRLF-canonical and a bare CR or LF is
+body
+.Em data
+that canonicalization must not touch \(em the milter itself never applies
+this rewrite, because it receives body octets verbatim over the milter
+protocol.
+.It Fl h
+Display usage information.
+.El
+.Sh OUTPUT
+.Bl -tag -width "sig.<n>.unsigned" -compact
+.It Cm signatures
+Count of DKIM-Signature fields found.
+.It Cm sig.<n>.result
+.Dq pass , Dq fail , Dq temperror , Dq permerror , Dq neutral , or Dq policy .
+.It Cm sig.<n>.domain
+The signature's
+.Cm d=
+tag.
+.It Cm sig.<n>.selector
+The signature's
+.Cm s=
+tag.
+.It Cm sig.<n>.reason
+Failure detail, when the verifier supplied one.
+.It Cm sig.<n>.testing
+Present with value
+.Dq true
+when the signing key carries
+.Cm t=y .
+.It Cm sig.<n>.unsigned
+Octets of body the signature does not cover, when
+.Cm l=
+is honoured.
+.It Cm result
+.Dq pass
+if any signature passed, else the first signature's result, else
+.Dq none .
+.El
+.Sh EXIT STATUS
+.Bl -tag -width indent -compact
+.It 0
+A verdict was reached and printed to standard output, including
+.Dq fail .
+.It 2
+The tool could not run: the message file could not be read or parsed, an
+option was invalid, or memory was exhausted.
+.El
+.Sh EXAMPLES
+Verify every signature on a message:
+.Bd -literal -offset indent
+securedkim-check message.eml
+.Ed
+.Pp
+Verify against a conformance suite's own zone, treating
+.Cm l=
+as disqualifying:
+.Bd -literal -offset indent
+securedkim-check -n 127.0.0.1 -p 5353 --refuse-l message.eml
+.Ed
+.Sh SEE ALSO
+.Xr securedkim 8 ,
+.Xr securedkim-sign 8 ,
+.Xr securedkim-genkey 8 ,
+.Xr securedkim-testkey 8
+.Sh STANDARDS
+.Rs
+.%T DomainKeys Identified Mail (DKIM) Signatures
+.%R RFC 6376
+.Re
+.Rs
+.%T Use of RSA-SHA-256 and Ed25519-SHA-256 in DKIM
+.%R RFC 8463
+.Re
+.Sh AUTHORS
+.An Daniel Morante

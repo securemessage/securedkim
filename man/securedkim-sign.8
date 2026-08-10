@@ -1,0 +1,163 @@
+.\" Copyright (c) 2026 Daniel Morante
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd July 27, 2026
+.Dt SECUREDKIM-SIGN 8
+.Os
+.Sh NAME
+.Nm securedkim-sign
+.Nd command-line DKIM signing tool
+.Sh SYNOPSIS
+.Nm
+.Fl d Ar domain
+.Fl s Ar selector
+.Fl k Ar keyfile
+.Op Fl a Ar algorithm
+.Op Fl c Ar canon
+.Op Fl -headers Ar list
+.Op Fl -oversign Ar list
+.Op Fl l
+.Op Fl -no-timestamp
+.Op Fl -no-normalize
+.Ar message-file
+.Sh DESCRIPTION
+.Nm
+signs an RFC 5322 message file with the same signing code path
+.Xr securedkim 8
+uses, and writes the signed message \(em a new DKIM-Signature header
+prepended to the original file, unchanged \(em to standard output.
+.Pp
+The original file is emitted rather than a reconstruction of it, because the
+point of
+.Nm
+is to produce a signature another implementation can verify, and a verifier
+reading the output must see exactly the message that was signed.
+.Sh OPTIONS
+.Bl -tag -width indent
+.It Fl d Ar domain
+Signing domain
+.Pq Cm d= .
+Required.
+.It Fl s Ar selector
+Selector
+.Pq Cm s= .
+Required.
+.It Fl k Ar keyfile
+Private key file.
+Required.
+PEM format for
+.Cm rsa-sha256 ;
+for
+.Cm ed25519-sha256 ,
+a file holding the base64 encoding of the 32-byte seed, which is what
+.Xr securedkim-genkey 8
+emits.
+An RSA key is held to the RFC 8301 1024-bit floor and refused if its
+permissions are readable beyond its owner, exactly as
+.Cm SignKeyFile
+is in
+.Xr securedkim 8 .
+.It Fl a Ar algorithm
+Signing algorithm:
+.Dq rsa-sha256
+(default) or
+.Dq ed25519-sha256 .
+.It Fl c Ar canon
+Canonicalization, as
+.Ar header Ns / Ns Ar body :
+.Dq relaxed/relaxed
+(default),
+.Dq simple/simple ,
+.Dq relaxed/simple ,
+or
+.Dq simple/relaxed .
+.It Fl -headers Ar list
+Colon-separated
+.Cm h=
+list.
+Default:
+.Dq from:to:subject:date:message-id .
+.It Fl -oversign Ar list
+Colon-separated names to list once more than the message contains them, so
+that a later addition of one of those headers breaks the signature.
+Default:
+.Dq from .
+An empty string disables oversigning.
+.It Fl l
+Include
+.Cm l=
+covering the whole canonicalized body.
+.It Fl -no-timestamp
+Omit
+.Cm t= ,
+so output is byte-stable across runs.
+.It Fl -no-normalize
+Do not rewrite a bare CR or LF in the file to CRLF while reading it.
+On by default for the same reason
+.Xr securedkim-check 8 Ap s
+flag of the same name is: an
+.Pa .eml
+file edited on a Unix host is usually LF-only, and DKIM is defined over CRLF.
+.It Fl h , Fl -help
+Display usage information.
+Note that
+.Fl h
+is help here, not the
+.Cm h=
+list \(em
+.Nm opendkim
+and
+.Nm dkimpy
+spell the
+.Cm h=
+list
+.Fl h ,
+so this tool uses the long
+.Fl -headers
+instead of letting
+.Fl h
+quietly mean something else.
+.El
+.Sh EXIT STATUS
+.Bl -tag -width indent -compact
+.It 0
+The message was signed and written to standard output.
+.It 2
+The tool could not run: bad arguments, an unreadable or unparsable message
+file, a key that could not be loaded, or a canonicalization or signing
+failure.
+.El
+.Sh EXAMPLES
+Sign a message with an RSA key, default headers:
+.Bd -literal -offset indent
+securedkim-sign -d example.com -s 2026 -k /usr/local/etc/securedkim/example.key \e
+    message.eml > signed.eml
+.Ed
+.Pp
+Sign with Ed25519 and a fixed timestamp, for byte-reproducible output:
+.Bd -literal -offset indent
+securedkim-sign -a ed25519-sha256 -d example.com -s ed2026 -k ed-key.seed \e
+    --no-timestamp message.eml
+.Ed
+.Pp
+Sign with
+.Cm l=
+and oversigning disabled:
+.Bd -literal -offset indent
+securedkim-sign -d example.com -s 2026 -k example.key -l --oversign "" message.eml
+.Ed
+.Sh SEE ALSO
+.Xr securedkim 8 ,
+.Xr securedkim-check 8 ,
+.Xr securedkim-genkey 8 ,
+.Xr securedkim-testkey 8
+.Sh STANDARDS
+.Rs
+.%T DomainKeys Identified Mail (DKIM) Signatures
+.%R RFC 6376
+.Re
+.Rs
+.%T Use of RSA-SHA-256 and Ed25519-SHA-256 in DKIM
+.%R RFC 8463
+.Re
+.Sh AUTHORS
+.An Daniel Morante

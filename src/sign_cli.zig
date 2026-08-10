@@ -54,7 +54,7 @@ const Usage =
     \\tools here. opendkim and dkimpy spell the h= list -h, so this uses the long
     \\--headers rather than letting -h quietly mean something different.
     \\
-    \\Exit status is 0 on success, 1 on any error, with a message on stderr.
+    \\Exit status is 0 on success, 2 on any error, with a message on stderr.
     \\
 ;
 
