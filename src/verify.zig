@@ -95,10 +95,11 @@ pub const Request = struct {
     /// the same `Header` (D-23). This is what gets canonicalized into the signed
     /// data, because a signature covers its own field.
     ///
-    /// Transposing `sig_header_value` and `sig_header_raw` is caught by conformance
-    /// (RFC 6376 drops from 26/26 to 4/26: `permerror`, `malformed signature`). This is
-    /// a readability fix (nine positional arguments become legible), not a silent-defect
-    /// guard; `worker.Options` is the case where transposition produced silent failure.
+    /// Named fields, not positional arguments: transposing `sig_header_value` and
+    /// `sig_header_raw` fails loudly under conformance testing (RFC 6376 drops from
+    /// 26/26 to 4/26, reporting `permerror`/`malformed signature`), but a caller
+    /// that mixes up two positional string arguments elsewhere would not get that
+    /// warning for free.
     sig_header_raw: []const u8,
     /// Every header field of the message, in arrival order, as the milter saw
     /// them. `h=` selects from these; it does not get to reorder them.
@@ -187,8 +188,7 @@ fn keyRecordRejection(
 /// procedure with a specific result. An error union cannot express that: the
 /// domain, the selector and the reason string are all part of the answer, and
 /// `VerifyResult` is what the caller needs. So each step returns one of these and
-/// `verifySignatureInner` unwraps it -- the same value-or-early-return shape
-/// stage 3.2 gave `doSeal`'s `cv=` decision.
+/// `verifySignatureInner` unwraps it.
 fn StepResult(comptime T: type) type {
     return union(enum) {
         ok: T,
@@ -340,12 +340,10 @@ fn checkBodyHash(
         } },
     };
 
-    // Bound to a name so it can be freed. Nesting this call inside
-    // `base64Decode` leaked it on every signature verified: `conn.allocator` is
-    // the worker's allocator, not a per-message arena, so nothing reclaimed it
-    // when the message ended and a busy daemon grew without limit. The b= path,
-    // now in `verifySignatureInner`, always had the `defer`; only this one was
-    // missed.
+    // Bound to a name so it can be freed. This allocates from the worker's
+    // allocator, not a per-message arena, so a call site missing this `defer`
+    // would grow a busy daemon without limit rather than being reclaimed when
+    // the message ends.
     const bh_stripped = dkim.stripWhitespace(allocator, sig.body_hash) catch
         return .{ .reject = .{ .result = .permerror, .domain = sig.domain, .selector = sig.selector, .reason = "invalid bh= encoding" } };
     defer allocator.free(bh_stripped);
@@ -363,9 +361,8 @@ fn checkBodyHash(
 /// Step 8: try the candidate records against this one signed-data block (D-20).
 ///
 /// REQUIRES A NON-EMPTY `records`, and returns `failure.?` on the strength of it.
-/// `collectKeyRecords` guarantees it by rejecting `usable == 0` with its own
-/// verdict; that invariant used to be three statements up in the same function
-/// and now crosses a boundary, so it is stated rather than left to be noticed.
+/// `collectKeyRecords` guarantees this by rejecting `usable == 0` with its own
+/// verdict before this function is ever reached.
 fn tryKeyRecords(
     allocator: Allocator,
     sig: *const dkim.Signature,
@@ -618,10 +615,10 @@ fn buildSignedData(
 
     // Each `h=` entry selects one header instance, walking up from the bottom
     // when a name is repeated, and selecting nothing once the instances run out
-    // (RFC 6376 §5.4.2 and §3.7). This used to resolve every mention to the same
-    // bottom-most header, so an oversigned message -- `h=from:from` over one
-    // `From:`, which is what OpenDKIM's `OversignHeaders` produces -- hashed that
-    // header twice where its signer hashed it once, and failed (audit D-1).
+    // (RFC 6376 §5.4.2 and §3.7). Resolving every mention to the same bottom-most
+    // header instead would hash an oversigned field twice -- `h=from:from` over
+    // one `From:`, which is what OpenDKIM's `OversignHeaders` produces -- where
+    // its signer hashed it once, failing every such message (audit D-1).
     var walk = header_select.lineWalker(sig.signed_headers, headers);
     while (walk.next()) |header| {
         const canonicalized = try canon.canonicalizeHeader(allocator, sig.canonicalization.header, header);
@@ -672,10 +669,10 @@ fn verifyWithKey(
             const pub_key_der = try crypto.base64Decode(allocator, key_record.public_key);
             defer allocator.free(pub_key_der);
 
-            // The size check lives inside the load so it cannot be skipped. Note
-            // that the errors are deliberately *not* collapsed into one here:
-            // the caller distinguishes an undersized key from an unparseable
-            // one, and squashing them was how the old code lost that.
+            // The size check lives inside the load so it cannot be skipped. The
+            // errors are deliberately not collapsed into one here: the caller
+            // distinguishes an undersized key from an unparseable one, and
+            // squashing them would lose that distinction.
             const evp_pkey = crypto.loadRsaPublicKeyDer(pub_key_der, min_key_bits, null) catch |err| switch (err) {
                 error.RsaKeyTooSmall, error.NotRsaPublicKey => return err,
                 else => return error.InvalidPublicKey,
@@ -746,9 +743,8 @@ test "find header case insensitive reverse order" {
 
 test "body canonicalization follows the signature, not a fixed choice" {
     // A body whose two canonicalizations differ: a line with trailing spaces and
-    // a run of internal spaces. Plain one-line bodies canonicalize identically
-    // under both algorithms, which is why hardcoding `simple` went unnoticed for
-    // so long -- every message the lab ever verified had one.
+    // a run of internal spaces. A plain one-line body would canonicalize
+    // identically under both algorithms and could not catch a hardcoded choice.
     const allocator = std.testing.allocator;
     const body = "Trailing spaces here.   \r\nInternal    run.\r\n";
 

@@ -272,9 +272,7 @@ fn doSign(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     // Build the header list that will be signed.
     //
     // One defer for both the strings and the list, registered before the loop, so
-    // an early return below cannot leak the strings appended so far. The previous
-    // arrangement put the string-freeing defer *after* the loop, which was safe
-    // only because nothing in the loop returned.
+    // an early return below cannot leak the strings appended so far.
     var header_strings: std.ArrayList([]const u8) = .{};
     defer {
         for (header_strings.items) |s| conn.allocator.free(s);
@@ -369,8 +367,8 @@ fn publishEvent(
     selector: []const u8,
 ) void {
     // `domain` and `selector` are the signature's own `d=` and `s=` tags, so both
-    // are sender-chosen. A `"` in `d=` used to end the JSON string early and
-    // leave the remainder of the payload to be reinterpreted, which is exactly
+    // are sender-chosen: an unescaped `"` in `d=` would end the JSON string early
+    // and let the remainder of the payload be reinterpreted, which is exactly
     // what the x5b probe sends (audit X-5). `action` and `result_str` are ours.
     const json = std.fmt.allocPrint(allocator,
         \\{{"action":"{s}","result":"{s}","domain":"{f}","selector":"{f}"}}
@@ -460,13 +458,11 @@ test "get sending domain" {
     try std.testing.expect(getSendingDomain("postmaster") == null);
 }
 
-// X-9: this wrapper must stay fallible.
-//
-// It previously returned `u8` and swallowed all three failure points, and all
-// four call sites discarded the result with `_ =`. A message could be delivered
-// with no `dkim=` field while this daemon reported success, and `securedmarc`
-// then evaluated DMARC without it. Asserting the type is what makes a revert a
-// build failure rather than a silent behaviour change.
+// X-9: this wrapper must stay fallible. Swallowing a stamping failure would
+// deliver a message with no `dkim=` field while this daemon reported success,
+// and `securedmarc` would then evaluate DMARC without it. Asserting the type
+// is what makes a regression a build failure rather than a silent behaviour
+// change.
 test "the Authentication-Results wrapper cannot swallow failures" {
     comptime {
         const ret = @typeInfo(@TypeOf(addArHeader)).@"fn".return_type.?;
@@ -482,10 +478,6 @@ test "the Authentication-Results wrapper cannot swallow failures" {
 }
 
 // The mode lookup's out-of-range fallback is the safe one (audit A-2).
-//
-// `modeFor` took a module global before this file existed, which is why it had
-// no test: nothing could set `g_modes` from a test. It takes the slice now, so
-// the fallback that made A-2 a bypass is finally assertable.
 test "an out-of-range listener index falls back to verify, never to signing" {
     const modes = [_]Mode{ .sign_only, .both };
     try std.testing.expectEqual(Mode.sign_only, modeFor(&modes, 0));

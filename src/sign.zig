@@ -334,9 +334,9 @@ test "build signing input produces deterministic output" {
 test "an oversigned h= hashes the field once, not twice (D-1)" {
     // `h=from:from` over a message with one From. RFC 6376 §5.4.2: the second
     // mention has no instance left to consume, and §3.7 makes that the null
-    // input -- nothing at all is added to the hash. The old per-mention lookup
-    // returned the same header for both mentions and hashed it twice, so every
-    // message from a signer using OpenDKIM's `OverSignHeaders` failed here.
+    // input -- nothing at all is added to the hash. A per-mention lookup that
+    // returns the same header for both mentions would hash it twice, breaking
+    // every message from a signer using OpenDKIM's `OverSignHeaders`.
     const allocator = std.testing.allocator;
     const headers = &[_][]const u8{
         "From: user@example.com",

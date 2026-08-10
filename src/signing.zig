@@ -290,8 +290,9 @@ test "D-24: a KeyTable-only config resolves a key instead of declining" {
         .sign_key = null,
     };
 
-    // Previously null, which the caller turned into a silent `continue`: the
-    // documented multi-domain configuration signed nothing and logged nothing.
+    // A null result here would let the caller silently `continue`, so the
+    // documented multi-domain configuration (KeyTable with no shorthand key)
+    // must still resolve rather than signing nothing with no log line.
     const choice = resolve(&assets, "b.example", "user@b.example").?;
     try std.testing.expectEqualStrings("b.example", choice.params.domain);
     try std.testing.expectEqual(D24_TABLE_SEED, d24SeedOf(choice.key));
