@@ -18,6 +18,17 @@ AuthservID      = mail.example.com
 # Number of worker threads. 0 = auto-detect CPU count.
 WorkerThreads   = 0
 
+# Maximum simultaneous connections accepted by each worker thread.
+# Default: 256.
+# MaxConnections = 256
+
+# Syslog logging.
+Syslog          = yes
+SyslogFacility  = mail
+
+# Logging verbosity: err, warn, info, debug.
+# LogLevel      = info
+
 # PID file location.
 PidFile         = /var/run/securedkim/securedkim.pid
 
@@ -55,8 +66,21 @@ DnsNameserver   = 127.0.0.1
 DnsTimeout      = 5
 DnsRetries      = 2
 
+# Maximum entries in the per-worker DNS cache, and the TTL in seconds applied
+# to negative answers (NXDOMAIN, SERVFAIL) so a lookup that just failed is not
+# retried on every message.
+# DnsCacheSize    = 1000
+# DnsNegativeTTL  = 60
+
 # Headers to include in DKIM signature.
 SignedHeaders   = from:to:subject:date:message-id
+
+# Headers to oversign: listed one more time than the message contains them, so
+# that a mailing list or forwarder adding another instance later breaks the
+# signature rather than silently going unnoticed (audit D-12). Spelled as
+# OpenDKIM spells it, so a migrated opendkim.conf line works verbatim. Default:
+# from. Empty disables oversigning.
+# OverSignHeaders = from
 
 # --- Resource limits on attacker-controlled message content ---
 #
@@ -158,6 +182,9 @@ SignedHeaders   = from:to:subject:date:message-id
 
 # ZMQ event publishing endpoint (optional).
 # ZmqEndpoint   = tcp://events.internal:5555
+
+# ZeroMQ topic prefix events are published under. Default: dkim.
+# ZmqTopic      = dkim
 
 # Each listener has its own Mode: sign, verify, or both. A listener that omits
 # Mode inherits a [global] Mode if one is set, otherwise verify. An unrecognised
