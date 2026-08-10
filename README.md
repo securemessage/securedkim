@@ -171,6 +171,24 @@ Verify DNS record matches local key:
 securedkim-testkey -s 2026 -d example.com -k /path/to/key.pem
 ```
 
+### securedkim-check
+
+Verify every DKIM-Signature on a message file, calling the same verification code path the daemon uses; prints a `sig.<n>.*` result per signature:
+
+```sh
+securedkim-check message.eml
+securedkim-check -n 127.0.0.1 -p 5353 --refuse-l message.eml
+```
+
+### securedkim-sign
+
+Sign a message file, calling the same signing code path the daemon uses; writes the signed message to stdout:
+
+```sh
+securedkim-sign -d example.com -s 2026 -k /path/to/key.pem message.eml > signed.eml
+securedkim-sign -a ed25519-sha256 -d example.com -s ed2026 -k ed-key.seed --no-timestamp message.eml
+```
+
 ## Signals
 
 - **SIGHUP** — Reload configuration and key tables
