@@ -64,18 +64,17 @@ threadlocal var tl_publisher: ?zmq.Publisher = null;
 
 // Thread-local DNS resolver (audit X-3).
 //
-// This one was the worst of the four: the resolver was built and destroyed
-// inside the loop over `DKIM-Signature` headers, so the cost scaled with the
-// number of signatures a sender chose to attach rather than with the number of
-// messages. That is the mechanism behind D-4's measured 355x amplification --
-// 300 signatures meant 300 resolvers and 300 uncached key fetches, ~5 seconds of
-// wall time, and with `WorkerThreads=2` two such messages stalled every DKIM
-// worker. A per-worker cache does not remove the per-signature RSA verify, but
-// it does collapse repeated `selector._domainkey.domain` lookups -- including
-// the identical-selector floods -- to one query.
+// A resolver built and destroyed per `DKIM-Signature` header would scale DNS
+// cost with the number of signatures a sender chooses to attach rather than
+// with the number of messages: a flood of signatures under one selector would
+// then cost one uncached key fetch per signature, stalling every worker with
+// enough of them in flight (audit D-4). A per-worker cache does not remove the
+// per-signature RSA verify, but it does collapse repeated
+// `selector._domainkey.domain` lookups -- including identical-selector floods
+// -- to one query.
 //
 // Per worker thread so it needs no lock, matching the publisher above.
-// `g_allocator`, not `conn.allocator`, because it now outlives the connection --
+// `g_allocator`, not `conn.allocator`, because this outlives the connection --
 // the same allocator either way, since the pool is handed `g_allocator`.
 threadlocal var tl_resolver: ?dns_mod.Resolver = null;
 
@@ -151,12 +150,12 @@ fn runDaemon() !void {
         return err;
     };
     // These three owned slices become process-lifetime globals, so freeing them
-    // is not about reclaiming memory — the process is ending either way. It is
-    // so that a startup failure prints its reason AND NOTHING ELSE. Every config
-    // error used to be followed by three `error(gpa): ... leaked` lines, which is
-    // how a reader learns to scroll past GPA output; this suite has had real
-    // leaks (X-2) that looked exactly like those three. `reloadConfig` already
-    // frees the same slices for the real reason, that SIGHUP repeats.
+    // here is not about reclaiming memory -- the process is ending either way.
+    // It is so a startup failure prints its reason AND NOTHING ELSE: a GPA leak
+    // report after every fatal error is how a reader learns to scroll past GPA
+    // output, at which point a real leak (audit X-2) looks like just more of the
+    // same noise. `reloadConfig` already frees the same slices for the real
+    // reason, that SIGHUP repeats.
     //
     // Registered before the worker pool is built, so it runs after the join at
     // the end of this function and never while a worker can still read them.
@@ -346,10 +345,10 @@ fn onEom(conn: *connection_mod.Connection) u8 {
 /// Main-thread reload callback: re-reads SigningTable, KeyTable and signing
 /// key, and publishes them as a single new snapshot.
 ///
-/// All or nothing. The previous code updated each of the three in place as it
-/// managed to read them, so a run where only the KeyTable parsed left the
-/// daemon signing with a new table and an old key. Building the whole set
-/// first means a failure anywhere leaves the running configuration untouched.
+/// All or nothing: updating each of the three in place as it is read would let
+/// a run where only the KeyTable parsed leave the daemon signing with a new
+/// table and an old key. Building the whole set first means a failure anywhere
+/// leaves the running configuration untouched.
 ///
 /// The superseded set is retired, not freed: workers may be signing with it
 /// right now. It is reclaimed once every worker has been seen at a quiescent
@@ -426,8 +425,7 @@ fn onWorkerReload() void {
 
 // THIS LIST IS LOAD-BEARING AND NOTHING ENFORCES IT. The test root is this file,
 // and Zig only analyses what it references, so a module missing from here compiles,
-// looks tested, and never executes. `securemilter-lib/src/pool.zig` sat in exactly
-// that state for the life of the project (§11.47). Add every new module.
+// looks tested, and never executes. Add every new module.
 test {
     _ = canon;
     _ = dkim;

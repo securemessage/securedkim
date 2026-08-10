@@ -170,8 +170,8 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
 
     // Owned slice, borrowed contents -- and unlike the ArrayLists above it does
     // not unwind itself, so it needs its own `errdefer`. Every `try` below this
-    // line depends on that; `BodyLengthTag` was one such `try` until its
-    // validation moved to the top of this function.
+    // line depends on that, which is why `BodyLengthTag` is validated at the top
+    // of this function instead of here.
     const dns_nameservers = try global.getCsvList(allocator, "DnsNameserver", "127.0.0.1");
     errdefer allocator.free(dns_nameservers);
     const dns_timeout = global.getInt("DnsTimeout", u32, 5) * 1000;
@@ -353,12 +353,10 @@ test "a typo cannot silently invert a verify listener into a signing one" {
     ));
 }
 
-// The implicit listener binds loopback, never 0.0.0.0.
-//
-// Until 2026-07-29 it bound 0.0.0.0 and NOTHING TESTED IT, in any of the four
-// daemons -- a config-less run silently offered an unauthenticated signing oracle
-// on every interface. The milter protocol has no authentication, so a reachable
-// sign-mode port lets anyone have arbitrary mail signed as the configured domain.
+// The implicit listener binds loopback, never 0.0.0.0: a config-less run must
+// not silently offer an unauthenticated signing oracle on every interface. The
+// milter protocol has no authentication, so a reachable sign-mode port lets
+// anyone have arbitrary mail signed as the configured domain.
 //
 // Pinned per daemon rather than once in the library because each hardcodes its own
 // fallback, so one of them can regress alone.
@@ -406,12 +404,12 @@ test "an explicit 0.0.0.0 socket is still honoured" {
     }
 }
 
-// L-2: `MaxConnections` was read by `securespf` and ignored here, so an operator
-// who set it on this daemon got 256 and no diagnostic. The value has two
-// consumers -- the accept-path cap in `worker.handleAccept` and the
-// RLIMIT_NOFILE calculation in `daemon.calculateFdNeed` -- and wiring only one of
-// them would raise the fd budget without raising the limit that budget was sized
-// for, or the reverse.
+// L-2: `MaxConnections` must be honoured here the same way every other daemon
+// honours it, silently ignoring the option would give an operator no diagnostic
+// for a value that appears to do nothing. The value has two consumers -- the
+// accept-path cap in `worker.handleAccept` and the RLIMIT_NOFILE calculation in
+// `daemon.calculateFdNeed` -- and wiring only one of them would raise the fd
+// budget without raising the limit that budget was sized for, or the reverse.
 test "L-2: MaxConnections is honoured, and defaults when absent" {
     {
         var cfg = try config_mod.parse(std.testing.allocator,
@@ -441,10 +439,11 @@ test "L-2: MaxConnections is honoured, and defaults when absent" {
     }
 }
 
-// A-2 regression, and the reason this instance is worse than securearc's: with
-// one shared `mode`, declaring the signing listener last put the INBOUND socket
-// into sign mode. A spoof of our own domain arriving from the internet then
-// matched the signing table and was handed a valid signature under our own key.
+// A-2: each listener must keep its own mode rather than sharing one. With a
+// single shared mode, declaring the signing listener last would put the
+// INBOUND socket into sign mode -- a spoof of our own domain arriving from the
+// internet would then match the signing table and be handed a valid signature
+// under our own key.
 test "each listener keeps its own mode" {
     const dkim_cfg = try parseForTest(
         \\[global]
@@ -467,7 +466,7 @@ test "each listener keeps its own mode" {
 }
 
 // The dangerous ordering specifically: signing declared first, verify second.
-// The old parser left BOTH in verify mode here, so outbound mail went unsigned.
+// Declaration order must not affect which listener signs.
 test "signing listener declared first still signs" {
     const dkim_cfg = try parseForTest(
         \\[global]

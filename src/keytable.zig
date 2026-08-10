@@ -353,10 +353,10 @@ test "D-7: rows for one signing entry are found with another entry between them"
 
     const results = table.lookup("example.com");
 
-    // Soundness first, because it is the worse half. The old lookup took the index
-    // of the FIRST match and the count of ALL matches and returned that many rows
-    // from there -- so this returned example.com's first key and then other.org's,
-    // which is a different domain's signing key handed out under our name.
+    // Soundness first, because it is the worse half: a lookup that takes the index
+    // of the first match and a count of all matches, and returns that many rows
+    // from there, would span into another signing entry's rows whenever they are
+    // not adjacent -- handing out a different domain's signing key under our name.
     for (results) |r| try std.testing.expectEqualStrings("example.com", r.signing_entry);
 
     // Completeness, and in file order: multi-sign order decides which signature is

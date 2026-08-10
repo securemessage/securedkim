@@ -173,13 +173,9 @@ fn generateRsa(
     defer c.EVP_PKEY_free(pkey);
 
     // Own the descriptor here and hand it to OpenSSL, rather than letting OpenSSL
-    // open the path (audit D-8). This was `BIO_new_file(path, "w")` -- an `fopen`, so
-    // the file appeared 0666 & ~umask and the key was written into it before the
-    // trailing `chmod(0600)` landed. See `createKeyFile` for the rest.
-    //
-    // It also disposes of an unchecked `@memcpy` into a 4096-byte `path_buf`: `-o`
-    // longer than that wrote past the end of it, a check `loadRsaKeyFile` has and
-    // this did not.
+    // open the path (audit D-8): `createKeyFile` creates it 0600 up front, so the
+    // key is never written into a file that briefly existed at 0666 & ~umask, and
+    // there is no fixed-size path buffer for an overlong `-o` to overrun.
     const file = createKeyFile(allocator, output_path);
     defer file.close();
 
