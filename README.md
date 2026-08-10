@@ -20,10 +20,9 @@ High-performance DKIM signing and verification milter for Postfix, implementing 
 # Build
 zig build
 
-# Create user and directories
-pw useradd _dkim -d /nonexistent -s /usr/sbin/nologin
+# Create directories (mailnull is the shared FreeBSD milter account other
+# milters already run as -- no dedicated user needed)
 mkdir -p /var/run/securedkim /usr/local/etc/securedkim
-chown _dkim:_dkim /var/run/securedkim
 
 # Generate DKIM key
 securedkim-genkey -s 2026 -d example.com -o /usr/local/etc/securedkim/example.key
@@ -34,13 +33,13 @@ securedkim-testkey -s 2026 -d example.com -k /usr/local/etc/securedkim/example.k
 
 # Set permissions
 chmod 0600 /usr/local/etc/securedkim/example.key
-chown _dkim:_dkim /usr/local/etc/securedkim/example.key
+chown mailnull:mailnull /usr/local/etc/securedkim/example.key
 
 # Write config
 cat > /usr/local/etc/securedkim/securedkim.conf << 'EOF'
 [global]
 AuthservID      = mail.example.com
-User            = _dkim
+User            = mailnull
 PidFile         = /var/run/securedkim/securedkim.pid
 DnsNameserver   = 127.0.0.1
 
