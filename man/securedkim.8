@@ -55,6 +55,9 @@ Default: no.
 Number of worker threads.
 0 means auto-detect CPU count.
 Default: 0.
+.It Cm MaxConnections
+Maximum simultaneous connections per worker.
+Default: 256.
 .It Cm PidFile
 Path to the PID file.
 Default:
@@ -117,6 +120,16 @@ Default: 60.
 Colon-separated list of headers to include in signatures.
 Default:
 .Dq from:to:subject:date:message-id .
+.It Cm OverSignHeaders
+Colon-separated list of headers to oversign: listed one more time than the
+message contains them, so that a mailing list or forwarder adding another
+instance later breaks the signature rather than silently going unnoticed.
+Spelled as OpenDKIM spells it, so a migrated
+.Pa opendkim.conf
+line works verbatim.
+Default:
+.Dq from .
+Empty disables oversigning.
 .It Cm MaxBodyBytes
 Largest message body buffered in order to hash it.
 Accepts an optional
@@ -343,20 +356,14 @@ Any other value is a configuration error and
 refuses to start.
 .Pp
 Each listener is independent.
-Releases before this one held a single daemon-wide mode that every
-.Ql [listener:...]
-section overwrote in turn, so the last section in the file decided the mode for
-every socket.
-This mattered most when a
-.Dq sign
-section appeared below a
-.Dq verify
-section, as in the sample configuration: the public inbound socket then ran in
-sign mode, and inbound mail whose author domain matched the signing
-configuration was given a signature under this host's own key.
 Check the
 .Ql listener[N] mode=...
-lines logged at startup against the intended configuration after upgrading.
+lines logged at startup against the intended configuration, particularly when
+a
+.Dq sign
+section appears below a
+.Dq verify
+section as in the sample configuration.
 .It Cm SigningTable
 Path to signing table file mapping sender patterns to signing identities.
 Required for sign mode with multi-domain support.

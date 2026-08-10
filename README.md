@@ -70,10 +70,13 @@ securedkim -c /usr/local/etc/securedkim/securedkim.conf
 | Option | Default | Description |
 |--------|---------|-------------|
 | `AuthservID` | `localhost` | Authentication-Results header identifier |
+| `StripAuthResults` | `no` | Remove pre-existing Authentication-Results headers claiming our `AuthservID`; enable only on the first milter in the chain (RFC 8601 §5) |
 | `WorkerThreads` | `0` (auto) | Worker thread count (0 = CPU count) |
+| `MaxConnections` | `256` | Max simultaneous connections per worker |
 | `PidFile` | `/var/run/securedkim/securedkim.pid` | PID file path |
 | `Foreground` | `no` | Run in foreground (no daemonize) |
 | `User` | *(none)* | Drop privileges to this user |
+| `UMask` | *(inherited)* | File-creation mask (octal) for the PID file and any unix-domain listener |
 | `Syslog` | `yes` | Enable syslog output |
 | `SyslogFacility` | `mail` | Syslog facility |
 | `LogLevel` | `info` | Log level: err, warn, info, debug |
@@ -83,6 +86,15 @@ securedkim -c /usr/local/etc/securedkim/securedkim.conf
 | `DnsCacheSize` | `1000` | Per-worker DNS cache max entries |
 | `DnsNegativeTTL` | `60` | Negative cache TTL in seconds |
 | `SignedHeaders` | `from:to:subject:date:message-id` | Headers to sign (colon-separated) |
+| `OverSignHeaders` | `from` | Headers to oversign (colon-separated); empty disables oversigning |
+| `MaxBodyBytes` | `10M` | Largest message body buffered to hash; 0 disables the limit |
+| `MaxHeaders` | `500` | Largest number of headers accumulated per message; 0 disables the limit |
+| `MaxHeaderBytes` | `1M` | Largest total header size per message; 0 disables the limit |
+| `MaxSignatures` | `20` | Largest number of DKIM-Signature headers verified per message; 0 disables the limit |
+| `MinimumKeyBits` | `1024` | Smallest RSA key size accepted from a signer's DNS key record (RFC 8301 floor) |
+| `MaxKeyRecords` | `3` | TXT key records tried per selector before failing a signature (max 8) |
+| `MaxEvaluationMs` | `20000` | Wall-clock ceiling for evaluating one message; 0 disables it |
+| `BodyLengthTag` | `honor` | How a verified signature's `l=` tag is treated: `honor` or `refuse` |
 | `ZmqEndpoint` | *(disabled)* | ZMQ PUB endpoint |
 | `ZmqTopic` | `dkim` | ZMQ topic prefix |
 
