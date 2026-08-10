@@ -9,22 +9,13 @@ const header_select = securemilter_crypto.header_select;
 
 const dkim = @import("dkim.zig");
 
-/// The shipped `h=` list. Defined once here and referenced by the settings
-/// parser, the shorthand config and the CLI, all of which used to carry their
-/// own copy of the same string -- four places to change and three to forget.
+/// Default `h=` list shared by configuration and CLI parsing.
 pub const DEFAULT_SIGNED_HEADERS = "from:to:subject:date:message-id";
 
-/// Headers oversigned by default (audit D-12).
+/// Default oversigned headers (audit D-12).
 ///
-/// `from` alone. RFC 6376 §5.4 calls From the one header a signature MUST cover,
-/// and RFC 7489 makes it the identity DMARC aligns against, so an added second
-/// From is the substitution that actually buys an attacker something. The same
-/// section warns against signing "header fields that might have additional
-/// instances added later in the delivery process", which is why this is not a
-/// longer list: oversigning a field that legitimately gains instances in transit
-/// converts ordinary handling into a signature failure. `to`, `cc` and the
-/// MIME fields are all plausible candidates and all carry that risk, so they are
-/// left to the operator.
+/// Only `from` is oversigned by default; other fields may legitimately gain
+/// instances in transit.
 pub const DEFAULT_OVERSIGN_HEADERS = "from";
 
 /// Signing parameters provided by config/keytable.
@@ -48,27 +39,18 @@ pub const SignResult = struct {
     header: []u8,
     allocator: Allocator,
 
-    /// The field name, its colon, and the single space that
-    /// `dkim.generateHeaderValue` emits before its first tag.
+    /// Field name and separator shared by header construction and `value`.
     ///
-    /// Named once because two places depend on it being the same bytes:
-    /// `buildFullHeader` hashes them, and `value` strips them. Under `c=simple`
-    /// the field is hashed verbatim, so what was signed is also what has to
-    /// reach the wire -- a change to one side that missed the other would sign
-    /// one header and transmit another.
+    /// `c=simple` requires the signed and transmitted bytes to match exactly.
     pub const PREFIX = "DKIM-Signature: ";
 
     pub fn deinit(self: *SignResult) void {
         self.allocator.free(self.header);
     }
 
-    /// The value alone, without the field name or the separator.
+    /// Header value without the field name and separator.
     ///
-    /// For the milter, which sends name and value as separate protocol fields
-    /// and lets `responses.addHeader` place the separator according to what the
-    /// MTA negotiated. Removing only the colon would leave the space inside the
-    /// value, and an MTA that declined `SMFIP_HDR_LEADSPC` then adds one of its
-    /// own in front of it: two spaces transmitted where one was signed.
+    /// The milter supplies the negotiated separator through `responses.addHeader`.
     pub fn value(self: *const SignResult) []const u8 {
         std.debug.assert(mem.startsWith(u8, self.header, PREFIX));
         return self.header[PREFIX.len..];
@@ -190,11 +172,9 @@ fn buildFullHeader(allocator: Allocator, header_value: []const u8) ![]u8 {
     return buf.toOwnedSlice(allocator);
 }
 
-/// Build the data block to be signed: canonicalized headers + DKIM-Signature template.
-/// `h_tag` is the effective list -- the one that will be emitted -- not the
-/// configured one. Taking it as an argument rather than reading it back out of
-/// `params` is what keeps the hashed set and the emitted set the same object
-/// once oversigning can make them differ (audit D-12).
+/// Build canonicalized signed headers and the DKIM-Signature template.
+///
+/// `h_tag` is the effective emitted list, including any oversigning surplus.
 fn buildSigningInput(
     allocator: Allocator,
     h_tag: []const u8,
@@ -205,12 +185,7 @@ fn buildSigningInput(
     var data: std.ArrayList(u8) = .{};
     errdefer data.deinit(allocator);
 
-    // Same selection rule as verification, and it has to be the same code: a
-    // signer that hashes a repeated `h=` name differently from how a compliant
-    // verifier will read it produces a signature nobody else can verify. With
-    // the old per-mention lookup this was latent only because the shipped
-    // default names no field twice (audit D-1) -- which is no longer true, since
-    // the default now oversigns `from`.
+    // Use the verifier's header-instance selection rule for repeated `h=` names.
     var walk = header_select.lineWalker(h_tag, headers);
     while (walk.next()) |header| {
         const canonicalized = try canon.canonicalizeHeader(allocator, header_canon, header);
@@ -256,12 +231,8 @@ fn computeSignature(
             return crypto.base64Encode(allocator, sig_bytes);
         },
         .ed25519_sha256 => {
-            // `data` is the canonicalized signing input; RFC 8463 §3 signs its
-            // SHA-256 digest, which `signEd25519Sha256` applies internally.
-            // Until this call was corrected, every Ed25519 signature this daemon
-            // produced was rejected by every conformant verifier.
-            //
-            // The keypair is derived once at key load, not here (audit C-2).
+            // RFC 8463 §3 signs the SHA-256 digest of the canonicalized input.
+            // The keypair was derived during key loading.
             const sig_bytes = try key.signEd25519Sha256(data);
             return crypto.base64Encode(allocator, &sig_bytes);
         },

@@ -1,13 +1,7 @@
-//! SecureDKIM configuration: listener modes, the `l=` tag policy, and the parser
-//! that turns an INI file into a `DkimConfig`.
+//! SecureDKIM configuration parsing: listener modes and `l=` tag policy.
 //!
-//! Split out of `main.zig`, which was the largest file in the suite at 1008
-//! production lines against a 400-line goal. This is the same seam `securearc`
-//! took: nothing in here touches the daemon's global state, so the whole layer is
-//! pure parsing and is testable without a listener, a worker or a resolver.
-//!
-//! The daemon re-exports every name at its old spelling, so the move is not a
-//! rename at any call site.
+//! This module is independent of daemon globals and converts INI input into
+//! `DkimConfig`.
 
 const std = @import("std");
 const mem = std.mem;
@@ -33,12 +27,7 @@ pub const Mode = enum {
     both,
 };
 
-/// Parse a `Mode` value from a config section.
-///
-/// An unrecognised value is an error rather than a silent fallback: the
-/// previous parser tested three spellings and left the variable untouched on
-/// anything else, so `Mode = signing` ran a signing listener in verify mode
-/// and said nothing.
+/// Parse a listener mode; invalid values are configuration errors.
 pub fn parseMode(raw: []const u8) error{InvalidMode}!Mode {
     if (mem.eql(u8, raw, "sign")) return .sign_only;
     if (mem.eql(u8, raw, "verify")) return .verify_only;
@@ -46,12 +35,7 @@ pub fn parseMode(raw: []const u8) error{InvalidMode}!Mode {
     return error.InvalidMode;
 }
 
-/// Config-facing spelling of a mode, for logs.
-///
-/// The enum tags carry an `_only` suffix that appears neither in the config file
-/// nor in the documented log format, and operators grep these lines — the d4
-/// pentest probe greps for `mode=verify` by name. Kept identical to the accepted
-/// `Mode =` values so a log line reads back as the config that produced it.
+/// Config-facing mode spelling for logs.
 pub fn modeLabel(m: Mode) []const u8 {
     return switch (m) {
         .sign_only => "sign",
@@ -60,12 +44,7 @@ pub fn modeLabel(m: Mode) []const u8 {
     };
 }
 
-/// Parse `BodyLengthTag`, which decides what a signature's `l=` tag means here.
-///
-/// Rejected rather than defaulted on a typo, for the same reason `Mode` is: this
-/// selects between accepting a body whose tail nobody signed and refusing it, and
-/// quietly picking one because the operator misspelled the other is not a choice
-/// this daemon should make on their behalf.
+/// Parse `BodyLengthTag`, which controls handling of signature `l=` tags.
 pub fn parseBodyLengthTag(raw: []const u8) error{InvalidBodyLengthTag}!verify.BodyLengthPolicy {
     if (mem.eql(u8, raw, "honor")) return .honor;
     if (mem.eql(u8, raw, "honour")) return .honor;
@@ -78,14 +57,7 @@ pub const DkimConfig = struct {
     authserv_id: []const u8,
     listen_addresses: []const listener_mod.ListenAddress,
     worker_threads: u32,
-    /// Per-worker cap on simultaneous connections, enforced in the accept path.
-    ///
-    /// No default on this field on purpose. It reached the worker as a hard-coded
-    /// `DEFAULT_MAX_CONNECTIONS` while `MaxConnections` was already read by
-    /// `securespf`, so the same key was honoured by one daemon and silently ignored
-    /// by this one (audit L-2). A field that quietly supplies a constant when the
-    /// caller forgets to set it is how that happens, so every construction site
-    /// states it.
+    /// Per-worker connection cap enforced by the accept path.
     max_connections: u32,
     pid_file: []const u8,
     foreground: bool,
@@ -97,14 +69,7 @@ pub const DkimConfig = struct {
     dns_retries: u8,
     dns_cache_size: u32,
     dns_negative_ttl: u32,
-    /// Mode per listener, index-parallel to `listen_addresses` (audit A-2).
-    ///
-    /// Sharing one value across sockets is worse here than in `securearc`: if
-    /// a `Mode = sign` section is declared last it applied to the inbound
-    /// socket too, and a spoof of our own domain arriving from the internet
-    /// would match the signing table and be handed a valid signature under our
-    /// own key — `dkim=pass` aligned with `From`, hence `dmarc=pass` against
-    /// our own `p=reject`.
+    /// Listener modes, index-parallel to `listen_addresses` (audit A-2).
     modes: []const Mode,
     signing_table_path: ?[]const u8,
     key_table_path: ?[]const u8,
@@ -123,36 +88,15 @@ pub const DkimConfig = struct {
     body_length_policy: verify.BodyLengthPolicy,
     /// Key records tried at one selector before giving up (audit D-20).
     max_key_records: u8,
-    /// Wall-clock bound on verifying one message's signatures, in ms; 0
-    /// disables (X-21). The MaxSignatures and MaxKeyRecords caps bound the
-    /// count of the work; this bounds the time, which on a slow resolver is
-    /// the dimension that starves the worker pool.
+    /// Signature-validation deadline in milliseconds; zero disables it.
     max_evaluation_ms: i64,
 };
 
 pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !DkimConfig {
     const global = cfg.getSection("global") orelse return error.MissingGlobalSection;
 
-    // EVERY VALUE THAT CAN BE REJECTED FOR ITS CONTENT IS VALIDATED HERE, BEFORE
-    // THE FIRST ALLOCATION. Not style: a validation failure below the allocations
-    // has to unwind them, and one of them is a plain owned slice rather than an
-    // ArrayList with an `errdefer`, so it does not unwind itself.
-    //
-    // `BodyLengthTag` used to be parsed at the far end of this function, after
-    // `dns_nameservers` had been taken out of its ArrayList. A typo there leaked
-    // that slice — and because `reloadConfig` frees those slices only on the path
-    // where it got a config back, the leak repeated on every SIGHUP for as long
-    // as the typo stayed in the file.
-    //
-    // `securearc` hit exactly this with `On-DNSError` and fixed it by moving the
-    // validation up. The comment recording that lesson lived in the file that had
-    // already learned it, so this daemon reintroduced the shape when
-    // `BodyLengthTag` was added. Hence both halves here and an `errdefer` below:
-    // the ordering is the fix, the `errdefer` is what holds when someone adds the
-    // next `try`.
-    //
-    // RFC 6376 §3.5 says to honour l=; §8.2 says a verifier may refuse signatures
-    // that carry it. Both are legitimate, so it is the operator's call.
+    // Validate `BodyLengthTag` before allocations so invalid configuration cannot
+    // leak the subsequently allocated DNS nameserver slice.
     const body_length_policy: verify.BodyLengthPolicy = if (global.get("BodyLengthTag")) |raw|
         try parseBodyLengthTag(raw)
     else
@@ -214,16 +158,7 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
         }
     }
 
-    // Loopback, NOT 0.0.0.0. The milter protocol has no authentication, so anything
-    // that reaches this socket is trusted absolutely. The stakes here are the
-    // highest of the four daemons: on a sign listener a reachable port is an
-    // unauthenticated signing oracle -- anyone can have arbitrary mail DKIM-signed
-    // as the configured domain, which is the whole guarantee DKIM exists to make.
-    // Postfix is the only intended client and it is local.
-    //
-    // A-2 was re-rated High because an instance of THIS daemon had its public
-    // inbound socket in sign mode. Wide binding must be written down deliberately,
-    // not inherited from an omitted config section.
+    // Default to loopback because the milter protocol does not authenticate clients.
     if (addrs.items.len == 0) {
         try addrs.append(allocator, .{ .tcp = .{ .host = "127.0.0.1", .port = 8891 } });
         try modes.append(allocator, default_mode);

@@ -1,27 +1,7 @@
-//! `securedkim-sign` — sign a message file with the daemon's own signing path.
+//! `securedkim-sign` signs a message file through the daemon's signing path.
 //!
-//! The counterpart to `securedkim-check`, and it exists for the same reason: the
-//! milter's signing logic is otherwise reachable only through the milter protocol,
-//! so nothing external can ever look at a signature this suite produces.
-//!
-//! That gap is not hypothetical. **D-18 was a two-way defect** — Ed25519-SHA256
-//! signed the canonicalized signing input instead of its SHA-256 digest, so every
-//! signature the daemon emitted was rejected by every conformant verifier. The
-//! verify half was caught by the RFC 8463 vector. The signing half was caught by
-//! nothing, and would have gone on being caught by nothing, because a round-trip
-//! test agrees with a symmetric mistake and the daemon had no way to hand a
-//! signature to anyone else.
-//!
-//! With this, `dkimpy` can verify what we sign.
-//!
-//! **This deliberately reproduces the milter's lossy view of headers.** It parses a
-//! file, but then throws the original octets away and rebuilds each field as
-//! `name + ": " + value`, exactly as `securedkim-check` does and for the same
-//! reason: the MTA hands a milter a name and a value with one leading space already
-//! removed, so a tool that signed the pristine file bytes would produce signatures
-//! the daemon cannot produce, and would hide defects rather than expose them. See
-//! `appendField` in `check.zig`, and D-23 for the one case where the reconstruction
-//! is provably not byte-exact.
+//! It shares the milter's reconstructed-header representation so generated
+//! signatures model daemon behavior and can be verified externally.
 
 const std = @import("std");
 const mem = std.mem;
@@ -32,11 +12,7 @@ const Allocator = mem.Allocator;
 const securemilter = @import("securemilter");
 const cli = securemilter.cli.Tool("securedkim-sign");
 
-/// The one message-file parser in the suite, shared with `securedkim-check` and
-/// with securearc's two tools. This command emits signatures another
-/// implementation must verify, so it has to model the message exactly as the
-/// daemon does -- a private copy is a signature over a message that never
-/// existed (refactor plan stage 5.2).
+/// Shared message-file parser used by the CLI tools.
 const msgfile = securemilter.msgfile;
 const securemilter_crypto = @import("securemilter_crypto");
 const crypto = securemilter_crypto.crypto;

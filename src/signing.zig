@@ -1,9 +1,4 @@
-//! Loading, validating, publishing and consulting the signing configuration.
-//!
-//! Extracted from main.zig to pay back the ceiling raised for D-24, and because
-//! these belong together: what the signing assets ARE, how they are loaded and
-//! checked, and which of them applies to a given message. D-24 was precisely the
-//! last of those three drifting away from the other two.
+//! Load, validate, publish, and resolve DKIM signing configuration.
 
 const std = @import("std");
 const mem = std.mem;
@@ -19,11 +14,7 @@ const crypto = securemilter_crypto.crypto;
 const keytable = @import("keytable.zig");
 const sign_mod = @import("sign.zig");
 
-/// Where the signing configuration is read from.
-///
-/// Three paths rather than the whole DkimConfig: this module is imported BY
-/// main.zig, so depending on a type declared there would be circular, and the
-/// narrower argument says plainly what is used.
+/// Signing-configuration paths used by this module.
 pub const Paths = struct {
     signing_table: ?[]const u8 = null,
     key_table: ?[]const u8 = null,
@@ -49,16 +40,9 @@ pub fn signedHeaders() []const u8 {
     return g_shorthand.signed_headers;
 }
 
-/// Everything a message needs in order to sign, published as one unit.
+/// Signing assets published as one atomic configuration snapshot.
 ///
-/// Bundling these is not tidiness. Reloading the table and the key as separate
-/// atomic swaps lets a message resolve a domain out of the new SigningTable
-/// and then sign it with the previous key. One pointer means a message sees
-/// either the whole of the old configuration or the whole of the new one.
-///
-/// Previously these were three module globals replaced by value on SIGHUP
-/// while workers held pointers into them — a torn read, and the old contents
-/// (including the EVP_PKEY) were never freed (audit X-2).
+/// A message sees either all old assets or all new assets after reload.
 pub const Assets = struct {
     signing_table: ?keytable.SigningTable = null,
     key_table: ?keytable.KeyTable = null,
@@ -77,8 +61,7 @@ pub fn free(allocator: Allocator, assets: *Assets) void {
 const MAX_TABLE_BYTES: usize = 1024 * 1024;
 
 fn loadSigningTable(allocator: Allocator, path: []const u8) !keytable.SigningTable {
-    // parseSigningTable copies what it keeps, so the file buffer is ours to
-    // free. It previously was not freed, leaking the whole file on every read.
+    // The parser copies retained fields, so the file buffer is released here.
     const content = try std.fs.cwd().readFileAlloc(allocator, path, MAX_TABLE_BYTES);
     defer allocator.free(content);
     return keytable.parseSigningTable(allocator, content);
@@ -102,14 +85,8 @@ pub fn build(allocator: Allocator, cfg: Paths) !*Assets {
     if (cfg.signing_table) |path| assets.signing_table = try loadSigningTable(allocator, path);
     if (cfg.key_table) |path| assets.key_table = try loadKeyTable(allocator, path);
 
-    // D-24: table-based signing has to be able to actually sign.
-    //
-    // Every one of these was previously a config that started cleanly and then
-    // silently declined to sign, because parameters were resolved from the
-    // KeyTable while the key came from somewhere else entirely. A refusal here
-    // costs a restart; the silence cost unsigned outbound mail with nothing in
-    // the log to say so. On SIGHUP an error is free — `buildSigningAssets` is
-    // all-or-nothing, so the running daemon keeps the table it already had.
+    // Table signing requires both tables; failed reloads retain the prior
+    // published asset snapshot.
     if (assets.signing_table != null and assets.key_table == null) {
         log.err("SigningTable is set without a KeyTable: nothing can be signed through it", .{});
         return error.SigningTableWithoutKeyTable;
@@ -134,10 +111,7 @@ pub fn build(allocator: Allocator, cfg: Paths) !*Assets {
         };
         log.info("loaded {d} KeyTable signing key(s)", .{kt.entries.len});
 
-        // A SigningTable row naming an entry the KeyTable does not define is
-        // the same silent hole one level up: the sender matches, the lookup
-        // finds nothing, and the message goes out unsigned. Catch it while
-        // somebody is watching the config, not per message in the dark.
+        // Every SigningTable entry must resolve to at least one KeyTable row.
         if (assets.signing_table) |*st| {
             for (st.entries) |entry| {
                 if (kt.lookup(entry.signing_entry).len == 0) {
@@ -150,12 +124,8 @@ pub fn build(allocator: Allocator, cfg: Paths) !*Assets {
             }
         }
     }
-    // The signing key is held to the RFC 8301 floor, not to the operator's
-    // MinimumKeyBits. That option is a policy about keys *other people* publish;
-    // coupling our own key to it would mean tightening the verify policy could
-    // stop the daemon starting, which is a surprise nobody asked for. The floor
-    // itself is not optional: RFC 8301 §3.2 says signers MUST use at least 1024
-    // bits, and mail signed below it fails DKIM at every conformant verifier.
+    // Signing keys use the RFC 8301 minimum, independent of the verifier's
+    // `MinimumKeyBits` policy.
     if (cfg.key_file) |path| {
         var key = crypto.loadRsaKeyFile(path, crypto.RFC8301_MIN_RSA_BITS, .require_safe) catch |err| {
             if (err == error.RsaKeyTooSmall) {
@@ -179,13 +149,7 @@ pub fn build(allocator: Allocator, cfg: Paths) !*Assets {
     return assets;
 }
 
-/// What to sign a message as, and the key to do it with.
-///
-/// One type, because they are one decision. D-24 was two functions answering
-/// half the question each with nothing holding them together: parameters came
-/// from the `KeyTable` while the key came from the single-domain `KeyFile`, so a
-/// host with both configured signed `d=b.example` using a.example's key —
-/// measured, and caught by key size rather than by anything the daemon said.
+/// Signing parameters and the matching key for one message.
 pub const Choice = struct {
     params: sign_mod.SigningParams,
     /// Borrowed from `assets`, valid for the rest of this message (see
@@ -193,15 +157,9 @@ pub const Choice = struct {
     key: *const crypto.SigningKey,
 };
 
-/// Resolve how to sign this message against one snapshot of the signing assets.
+/// Resolve signing parameters and a key from one asset snapshot.
 ///
-/// The snapshot is passed in rather than re-read here so that the table
-/// consulted and the key used come from the same published configuration.
-///
-/// **Every branch yields the parameters and the key together or yields
-/// nothing.** That is the invariant D-24 lacked, and it is structural now rather
-/// than a rule somebody has to remember: there is no way to return a `d=` this
-/// function cannot also hand over the matching key for.
+/// A result always contains a matching key and parameter set.
 pub fn resolve(
     assets: *const Assets,
     domain: []const u8,
