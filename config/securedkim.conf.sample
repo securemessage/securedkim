@@ -214,8 +214,8 @@ Mode            = verify
 # [listener:sign-outbound]
 # Socket          = inet:8892@127.0.0.1
 # Mode            = sign
-# SigningTable    = /usr/local/etc/securedkim/signing-table
-# KeyTable        = /usr/local/etc/securedkim/key-table
+# SigningTable    = /var/db/securedkim/keys/signing-table
+# KeyTable        = /var/db/securedkim/keys/key-table
 
 # --- Sign outbound mail (single domain shorthand) ---
 # [listener:sign-outbound]
@@ -223,4 +223,4 @@ Mode            = verify
 # Mode            = sign
 # Domain          = example.com
 # Selector        = dkim2026
-# KeyFile         = /usr/local/etc/securedkim/keys/example.com.key
+# KeyFile         = /var/db/securedkim/keys/example.com.key
