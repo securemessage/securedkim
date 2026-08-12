@@ -24,9 +24,8 @@ zig build
 # milters already run as -- no dedicated user needed)
 mkdir -p /var/run/securedkim /usr/local/etc/securedkim
 
-# Generate DKIM key
+# Generate DKIM key (writes example.dns beside the key)
 securedkim-genkey -s 2026 -d example.com -o /usr/local/etc/securedkim/example.key
-# (outputs DNS TXT record to add to your zone)
 
 # Verify key is published
 securedkim-testkey -s 2026 -d example.com -k /usr/local/etc/securedkim/example.key
@@ -154,7 +153,9 @@ Order: **SPF (8890) → DKIM (8891) → DMARC (8894) → ARC (8895)**
 
 ### securedkim-genkey
 
-Generate DKIM keypair and DNS TXT record:
+Generate a DKIM keypair and write a BIND9-compatible DNS zone fragment beside
+the key (e.g. `key.pem` produces `key.dns`). RSA records are automatically
+split into <=255-byte strings as required by RFC 1035 section 3.3.
 
 ```sh
 securedkim-genkey -s 2026 -d example.com -o /path/to/key.pem

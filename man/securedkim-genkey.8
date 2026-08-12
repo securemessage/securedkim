@@ -5,7 +5,7 @@
 .Os
 .Sh NAME
 .Nm securedkim-genkey
-.Nd generate DKIM keypair and DNS record
+.Nd generate DKIM keypair and DNS zone fragment
 .Sh SYNOPSIS
 .Nm
 .Fl s Ar selector
@@ -15,12 +15,23 @@
 .Op Fl b Ar bits
 .Sh DESCRIPTION
 .Nm
-generates a DKIM private key and prints the corresponding DNS TXT record
-to standard output.
-The private key is written to the specified output file.
+generates a DKIM private key and writes a BIND9-compatible DNS zone fragment
+beside it.
+The private key is written to the file specified by
+.Fl o ;
+the zone fragment is written to a
+.Pa .dns
+file in the same directory (e.g.\&
+.Pa test2026.key
+produces
+.Pa test2026.dns ) .
 .Pp
-The generated DNS TXT record is ready to be added to the domain's DNS zone
-at
+For RSA keys the TXT record value exceeds the 255-byte character-string
+limit of RFC 1035 section 3.3, so the fragment splits it into multiple
+quoted strings inside parentheses.
+The fragment can be
+.Ic $INCLUDE Ns 'd
+or pasted into a BIND9 zone for
 .Ar selector Ns ._domainkey. Ns Ar domain .
 .Sh OPTIONS
 .Bl -tag -width indent
@@ -62,10 +73,23 @@ Generate a 4096-bit RSA key:
 securedkim-genkey -b 4096 -s strong2026 -d example.com -o /path/to/key.pem
 .Ed
 .Sh OUTPUT
-The DNS TXT record is printed to stdout in a format suitable for direct
-inclusion in a zone file:
+A summary is printed to standard output naming the private key file, the
+DNS record file, and the algorithm.
+The DNS TXT record itself is in the
+.Pa .dns
+file, not on stdout.
+.Pp
+For RSA keys the zone fragment looks like:
 .Bd -literal -offset indent
-selector._domainkey.example.com. IN TXT "v=DKIM1; k=rsa; p=MIIBIj..."
+selector._domainkey.example.com. IN TXT (
+    "v=DKIM1; k=rsa; p=MIIBIj..."
+    "...remainder..."
+    )
+.Ed
+.Pp
+For Ed25519 keys the value fits in a single string:
+.Bd -literal -offset indent
+selector._domainkey.example.com. IN TXT "v=DKIM1; k=ed25519; p=..."
 .Ed
 .Sh EXIT STATUS
 .Ex -std

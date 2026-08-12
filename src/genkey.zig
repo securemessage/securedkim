@@ -63,10 +63,131 @@ fn createKeyFile(allocator: std.mem.Allocator, output_path: []const u8) fs.File 
     };
 }
 
+/// RFC 1035 section 3.3: a single character-string in a TXT record is at most
+/// 255 octets. BIND9 refuses anything longer.
+const MAX_TXT_STRING: usize = 255;
+
+/// Build a BIND9-compatible zone fragment for a DKIM TXT record.
+///
+/// RSA-2048 produces ~410 octets for a single `"v=DKIM1; ..."` string, which
+/// exceeds the 255-byte limit. The output splits into multiple quoted strings
+/// inside parentheses, which the resolver concatenates per RFC 7208.
+fn formatDnsRecord(
+    allocator: std.mem.Allocator,
+    selector: []const u8,
+    domain: []const u8,
+    algorithm: []const u8,
+    key_bits: []const u8,
+    pub_b64: []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+
+    // Comment line.
+    try out.appendSlice(allocator, "; DKIM public key for ");
+    try out.appendSlice(allocator, domain);
+    try out.appendSlice(allocator, ", selector ");
+    try out.appendSlice(allocator, selector);
+    try out.appendSlice(allocator, " (");
+    try out.appendSlice(allocator, algorithm);
+    if (key_bits.len > 0) {
+        try out.appendSlice(allocator, ", ");
+        try out.appendSlice(allocator, key_bits);
+        try out.appendSlice(allocator, " bits");
+    }
+    try out.appendSlice(allocator, ")\n");
+
+    // Owner + type.
+    try out.appendSlice(allocator, selector);
+    try out.appendSlice(allocator, "._domainkey.");
+    try out.appendSlice(allocator, domain);
+    try out.appendSlice(allocator, ". IN TXT");
+
+    // The full TXT value as one logical string.
+    const value = try std.fmt.allocPrint(allocator, "v=DKIM1; k={s}; p={s}", .{ algorithm, pub_b64 });
+    defer allocator.free(value);
+
+    if (value.len <= MAX_TXT_STRING) {
+        // Fits in one string: no parentheses needed.
+        try out.appendSlice(allocator, " \"");
+        try out.appendSlice(allocator, value);
+        try out.appendSlice(allocator, "\"\n");
+    } else {
+        // Split into <=255-byte quoted strings inside parentheses.
+        try out.appendSlice(allocator, " (\n");
+        var pos: usize = 0;
+        while (pos < value.len) {
+            const end = @min(pos + MAX_TXT_STRING, value.len);
+            try out.appendSlice(allocator, "    \"");
+            try out.appendSlice(allocator, value[pos..end]);
+            try out.appendSlice(allocator, "\"\n");
+            pos = end;
+        }
+        try out.appendSlice(allocator, "    )\n");
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Derive the .dns path from the key path: replace a final extension, or append
+/// .dns if there is none.
+fn dnsPath(allocator: std.mem.Allocator, key_path: []const u8) ![]u8 {
+    const base = fs.path.basename(key_path);
+    if (mem.lastIndexOfScalar(u8, base, '.')) |dot| {
+        // Replace ".key" (or whatever extension) with ".dns".
+        const stem_len = key_path.len - (base.len - dot);
+        return std.fmt.allocPrint(allocator, "{s}.dns", .{key_path[0..stem_len]});
+    }
+    return std.fmt.allocPrint(allocator, "{s}.dns", .{key_path});
+}
+
+/// Write the zone fragment beside the private key. Mode 0644: this is public
+/// key material, not a secret. Refuses to overwrite.
+fn writeZoneFile(allocator: std.mem.Allocator, key_path: []const u8, content: []const u8) ![]const u8 {
+    const path = try dnsPath(allocator, key_path);
+    errdefer allocator.free(path);
+
+    const file = fs.cwd().createFile(path, .{
+        .mode = 0o644,
+        .exclusive = true,
+    }) catch |err| {
+        if (err == error.PathAlreadyExists) {
+            const msg = std.fmt.allocPrint(
+                allocator,
+                "{s} already exists; refusing to replace a DNS record file that may be in use\n",
+                .{path},
+            ) catch fatal("the DNS record file already exists");
+            defer allocator.free(msg);
+            writeErr(msg);
+            fatal("refusing to overwrite an existing DNS record file");
+        }
+        const msg = std.fmt.allocPrint(
+            allocator,
+            "could not create {s}: {t}\n",
+            .{ path, err },
+        ) catch fatal("could not create the DNS record file");
+        defer allocator.free(msg);
+        writeErr(msg);
+        fatal("could not create the DNS record file");
+    };
+    defer file.close();
+    file.writeAll(content) catch |err| {
+        const msg = std.fmt.allocPrint(
+            allocator,
+            "could not write {s}: {t}\n",
+            .{ path, err },
+        ) catch fatal("could not write the DNS record file");
+        defer allocator.free(msg);
+        writeErr(msg);
+        fatal("could not write the DNS record file");
+    };
+    return path;
+}
+
 const Usage =
     \\Usage: securedkim-genkey [options]
     \\
-    \\Generate a DKIM keypair and print the DNS TXT record.
+    \\Generate a DKIM keypair and write a BIND9-compatible DNS zone fragment.
     \\
     \\Options:
     \\  -a <algorithm>   rsa (default) or ed25519
@@ -75,6 +196,11 @@ const Usage =
     \\  -d <domain>      Domain name (required)
     \\  -o <path>        Output private key file (required)
     \\  -h               Show this help
+    \\
+    \\The DNS record is written to a .dns file beside the private key (e.g.
+    \\test2026.key produces test2026.dns). The file can be $INCLUDEd or pasted
+    \\into a BIND9 zone. RSA records are split into <=255-byte strings as
+    \\required by RFC 1035 section 3.3.
     \\
 ;
 
@@ -197,19 +323,24 @@ fn generateRsa(
     var der_ptr: [*c]u8 = der_buf.ptr;
     _ = c.i2d_PUBKEY(pkey, &der_ptr);
 
-    // Base64 encode
     const pub_b64 = try crypto.base64Encode(allocator, der_buf);
     defer allocator.free(pub_b64);
 
-    // Output
+    const bits_str = try std.fmt.allocPrint(allocator, "{d}", .{bits});
+    defer allocator.free(bits_str);
+
+    const record = try formatDnsRecord(allocator, selector, domain, "rsa", bits_str, pub_b64);
+    defer allocator.free(record);
+
+    const dns_path = try writeZoneFile(allocator, output_path, record);
+    defer allocator.free(dns_path);
+
     const output = try std.fmt.allocPrint(allocator,
         \\Private key written to: {s}
-        \\Key size: {d} bits
+        \\DNS record written to:  {s}
+        \\Algorithm: rsa, {d} bits
         \\
-        \\DNS TXT record:
-        \\{s}._domainkey.{s}. IN TXT "v=DKIM1; k=rsa; p={s}"
-        \\
-    , .{ output_path, bits, selector, domain, pub_b64 });
+    , .{ output_path, dns_path, bits });
     defer allocator.free(output);
     writeOut(output);
 }
@@ -253,18 +384,21 @@ fn generateEd25519(
     try file.writeAll(seed_b64);
     try file.writeAll(pem_end);
 
-    // Public key for DNS (raw 32-byte public key, base64 encoded)
     const pub_b64 = try crypto.base64Encode(allocator, &kp.public_key.toBytes());
     defer allocator.free(pub_b64);
 
+    const record = try formatDnsRecord(allocator, selector, domain, "ed25519", "", pub_b64);
+    defer allocator.free(record);
+
+    const dns_path = try writeZoneFile(allocator, output_path, record);
+    defer allocator.free(dns_path);
+
     const output = try std.fmt.allocPrint(allocator,
         \\Private key written to: {s}
+        \\DNS record written to:  {s}
         \\Algorithm: Ed25519-SHA256
         \\
-        \\DNS TXT record:
-        \\{s}._domainkey.{s}. IN TXT "v=DKIM1; k=ed25519; p={s}"
-        \\
-    , .{ output_path, selector, domain, pub_b64 });
+    , .{ output_path, dns_path });
     defer allocator.free(output);
     writeOut(output);
 }
@@ -277,4 +411,91 @@ fn fatal(msg: []const u8) noreturn {
     writeErr(msg);
     writeErr("\n");
     process.exit(2);
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+test "dnsPath replaces a final extension" {
+    const allocator = std.testing.allocator;
+    const p = try dnsPath(allocator, "/var/db/securedkim/keys/test2026.key");
+    defer allocator.free(p);
+    try std.testing.expectEqualStrings("/var/db/securedkim/keys/test2026.dns", p);
+}
+
+test "dnsPath appends .dns when there is no extension" {
+    const allocator = std.testing.allocator;
+    const p = try dnsPath(allocator, "/var/db/securedkim/keys/test2026");
+    defer allocator.free(p);
+    try std.testing.expectEqualStrings("/var/db/securedkim/keys/test2026.dns", p);
+}
+
+test "dnsPath handles a bare filename" {
+    const allocator = std.testing.allocator;
+    const p = try dnsPath(allocator, "mykey.pem");
+    defer allocator.free(p);
+    try std.testing.expectEqualStrings("mykey.dns", p);
+}
+
+test "ed25519 record fits in one string and has no parentheses" {
+    const allocator = std.testing.allocator;
+    // Ed25519 p= is 44 base64 characters: well under 255.
+    const record = try formatDnsRecord(allocator, "sel", "example.com", "ed25519", "", "AAAA" ** 11);
+    defer allocator.free(record);
+
+    try std.testing.expect(mem.indexOf(u8, record, "(\n") == null);
+    try std.testing.expect(mem.indexOf(u8, record, " IN TXT \"v=DKIM1; k=ed25519; p=") != null);
+}
+
+test "RSA-2048 record is split into multiple strings" {
+    const allocator = std.testing.allocator;
+    // ~392 base64 characters for RSA-2048: prefix + p= exceeds 255.
+    const fake_b64 = "A" ** 392;
+    const record = try formatDnsRecord(allocator, "test2026", "example.com", "rsa", "2048", fake_b64);
+    defer allocator.free(record);
+
+    // Must use parenthesised multi-string form.
+    try std.testing.expect(mem.indexOf(u8, record, " IN TXT (\n") != null);
+    try std.testing.expect(mem.indexOf(u8, record, "    )\n") != null);
+
+    // No individual quoted string may exceed 255 octets.
+    var lines = mem.splitScalar(u8, record, '\n');
+    while (lines.next()) |line| {
+        const trimmed = mem.trim(u8, line, " ");
+        if (trimmed.len < 2 or trimmed[0] != '"') continue;
+        // Content between quotes: strip opening and closing quote.
+        const content = trimmed[1 .. trimmed.len - 1];
+        try std.testing.expect(content.len <= MAX_TXT_STRING);
+    }
+
+    // Concatenation of all quoted strings must equal the full record value.
+    const expected_value = try std.fmt.allocPrint(allocator, "v=DKIM1; k=rsa; p={s}", .{fake_b64});
+    defer allocator.free(expected_value);
+
+    var reassembled: std.ArrayList(u8) = .{};
+    defer reassembled.deinit(allocator);
+    var lines2 = mem.splitScalar(u8, record, '\n');
+    while (lines2.next()) |line| {
+        const trimmed = mem.trim(u8, line, " ");
+        if (trimmed.len < 2 or trimmed[0] != '"') continue;
+        try reassembled.appendSlice(allocator, trimmed[1 .. trimmed.len - 1]);
+    }
+    try std.testing.expectEqualStrings(expected_value, reassembled.items);
+}
+
+test "RSA-4096 record splits correctly" {
+    const allocator = std.testing.allocator;
+    // ~736 base64 characters for RSA-4096.
+    const fake_b64 = "B" ** 736;
+    const record = try formatDnsRecord(allocator, "big", "example.com", "rsa", "4096", fake_b64);
+    defer allocator.free(record);
+
+    // Every quoted string <= 255 octets.
+    var lines = mem.splitScalar(u8, record, '\n');
+    while (lines.next()) |line| {
+        const trimmed = mem.trim(u8, line, " ");
+        if (trimmed.len < 2 or trimmed[0] != '"') continue;
+        try std.testing.expect(trimmed[1 .. trimmed.len - 1].len <= MAX_TXT_STRING);
+    }
 }

@@ -132,6 +132,19 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(main_tests);
     test_step.dependOn(&run_tests.step);
 
+    // genkey.zig has its own root module (no securemilter dependency), so its
+    // tests are not reachable from main.zig.
+    const genkey_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/genkey.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "securemilter_crypto", .module = crypto_mod },
+        },
+    });
+    const genkey_tests = b.addTest(.{ .root_module = genkey_test_mod });
+    test_step.dependOn(&b.addRunArtifact(genkey_tests).step);
+
     // One canonical checker, shared from securemilter-lib rather than copied.
     const lint = b.addSystemCommand(&.{"sh"});
     lint.addFileArg(securemilter_dep.path("tools/check-line-limit.sh"));
