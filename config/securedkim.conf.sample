@@ -214,8 +214,8 @@ Mode            = verify
 # [listener:sign-outbound]
 # Socket          = inet:8892@127.0.0.1
 # Mode            = sign
-# SigningTable    = /var/db/securedkim/keys/signing-table
-# KeyTable        = /var/db/securedkim/keys/key-table
+# SigningTable    = /var/db/securedkim/signing-table
+# KeyTable        = /var/db/securedkim/key-table
 
 # --- Sign outbound mail (single domain shorthand) ---
 # [listener:sign-outbound]
