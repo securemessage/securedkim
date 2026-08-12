@@ -19,6 +19,7 @@ const deadline_mod = securemilter.deadline;
 const zmq = securemilter.zmq;
 const log = securemilter.log;
 const header_scrub = securemilter.header_scrub;
+const header_fold = securemilter.header_fold;
 
 const verify = @import("verify.zig");
 const sign_mod = @import("sign.zig");
@@ -326,10 +327,18 @@ fn doSign(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     // front of the one already there, and every `c=simple` signature this
     // daemon produced would fail everywhere, silently, with the daemon
     // reporting `sign pass`.
+    // The signed value folds with CRLF — the canonical form the hash covers.
+    // The milter protocol carries folds as bare LF (smfi_addheader(3): the MTA
+    // adds the CR), and sending CRLF lets the MTA double every fold into a
+    // blank line, ending the header block early for every downstream parser.
+    const wire_value = header_fold.toWire(conn.allocator, sign_result.value()) catch
+        return signInternalError("building the DKIM-Signature header");
+    defer conn.allocator.free(wire_value);
+
     const hdr_payload = responses.addHeader(
         conn.allocator,
         "DKIM-Signature",
-        sign_result.value(),
+        wire_value,
         conn.negotiated_protocol.header_leading_space,
     ) catch return signInternalError("building the DKIM-Signature header");
     defer conn.allocator.free(hdr_payload);
