@@ -57,8 +57,12 @@ pub fn free(allocator: Allocator, assets: *Assets) void {
     allocator.destroy(assets);
 }
 
-/// Largest SigningTable/KeyTable we will read.
-const MAX_TABLE_BYTES: usize = 1024 * 1024;
+const build_options = @import("build_options");
+
+/// Largest SigningTable/KeyTable we will read. Adjustable at compile time with
+/// `-Dmax-table-bytes=<n>` to support deployments with more domains than the
+/// default 1 MiB accommodates.
+const MAX_TABLE_BYTES: usize = build_options.max_table_bytes;
 
 fn loadSigningTable(allocator: Allocator, path: []const u8) !keytable.SigningTable {
     // The parser copies retained fields, so the file buffer is released here.

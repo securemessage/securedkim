@@ -211,6 +211,12 @@ Mode            = verify
 # --- Sign outbound mail (multi-domain via SigningTable/KeyTable) ---
 # Bound to loopback deliberately: only the local MTA submits to the signing
 # socket, and anything that can reach it can have mail signed by this host.
+#
+# Each table file is read entirely into memory and is capped at 1 MiB by
+# default, which accommodates roughly 40,000 signing-table patterns or
+# 15,000-23,000 key-table rows depending on path length. Deployments with
+# more domains can raise the cap at compile time:
+#   zig build -Dmax-table-bytes=4194304
 # [listener:sign-outbound]
 # Socket          = inet:8892@127.0.0.1
 # Mode            = sign

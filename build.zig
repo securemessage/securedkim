@@ -16,6 +16,19 @@ pub fn build(b: *std.Build) void {
     });
     const crypto_mod = crypto_dep.module("securemilter_crypto");
 
+    // Compile-time limit on signing/key table size. The default is 1 MiB, which
+    // covers ~40,000 signing-table patterns or ~15,000–23,000 key-table rows.
+    // Deployments with more domains can raise it with:
+    //   zig build -Dmax-table-bytes=4194304
+    const max_table_bytes = b.option(
+        u32,
+        "max-table-bytes",
+        "Maximum bytes per SigningTable/KeyTable file (default 1 MiB)",
+    ) orelse 1024 * 1024;
+
+    const build_options = b.addOptions();
+    build_options.addOption(u32, "max_table_bytes", max_table_bytes);
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -25,6 +38,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "securemilter_crypto", .module = crypto_mod },
         },
     });
+    exe_mod.addOptions("build_options", build_options);
 
     const exe = b.addExecutable(.{
         .name = "securedkim",
@@ -109,6 +123,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "securemilter_crypto", .module = crypto_mod },
         },
     });
+    test_mod.addOptions("build_options", build_options);
 
     const main_tests = b.addTest(.{
         .root_module = test_mod,
