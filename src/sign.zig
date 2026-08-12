@@ -7,6 +7,9 @@ const crypto = securemilter_crypto.crypto;
 const canon = securemilter_crypto.canon;
 const header_select = securemilter_crypto.header_select;
 
+const securemilter = @import("securemilter");
+const header_fold = securemilter.header_fold;
+
 const dkim = @import("dkim.zig");
 
 /// Default `h=` list shared by configuration and CLI parsing.
@@ -138,7 +141,19 @@ pub fn signMessage(
 
     try final.appendSlice(allocator, "DKIM-Signature:");
     try final.appendSlice(allocator, header_value);
-    try final.appendSlice(allocator, signature_b64);
+
+    // Fold the base64 across continuation lines. This happens AFTER the hash was
+    // taken over the same template with b= empty, and RFC 6376 §3.5 states that
+    // whitespace inside b= "MUST be ignored when reassembling the original
+    // signature", so neither our own verifier nor anyone else's sees a
+    // difference. Without it an RSA-4096 signature alone puts the field past
+    // the 998-character line limit RFC 5322 §2.1.1 makes a MUST.
+    var folder = header_fold.Folder.init(
+        &final,
+        allocator,
+        header_fold.longestLine(final.items),
+    );
+    try folder.appendChunked(signature_b64);
 
     return .{
         .header = try final.toOwnedSlice(allocator),

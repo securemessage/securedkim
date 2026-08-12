@@ -6,6 +6,13 @@ const securemilter_crypto = @import("securemilter_crypto");
 const canon = securemilter_crypto.canon;
 const sig_header = securemilter_crypto.sig_header;
 
+const securemilter = @import("securemilter");
+const header_fold = securemilter.header_fold;
+
+/// The field name this module generates a body for. Its width counts against
+/// the first line's length limit.
+const HEADER_NAME = "DKIM-Signature:";
+
 /// DKIM signing algorithm (RFC 6376 §3.3, RFC 8463).
 pub const Algorithm = enum {
     rsa_sha256,
@@ -157,53 +164,95 @@ pub fn generateHeaderValue(allocator: Allocator, sig: *const Signature) ![]u8 {
     var buf: std.ArrayList(u8) = .{};
     errdefer buf.deinit(allocator);
 
-    try appendTag(&buf, allocator, "v", sig.version);
-    try appendTag(&buf, allocator, "a", sig.algorithm.toString());
+    // The column starts at the field name, because RFC 5322's limit applies to
+    // the whole line and "DKIM-Signature:" is on the first one.
+    var folder = header_fold.Folder.init(&buf, allocator, HEADER_NAME.len + 1);
+
+    // FOLDING THE SIGNED TAGS IS ONLY SAFE UNDER RELAXED CANONICALIZATION, and
+    // this was learned the hard way: folding them unconditionally made every
+    // signature this daemon produced fail its own verification with permerror.
+    //
+    // Everything up to `b=` is inside the hash. Relaxed unfolds continuation
+    // lines before hashing (RFC 6376 §3.4.2), so the fold cannot change what
+    // either side computes. Simple hashes the field literally, which means the
+    // signature only survives if every hop preserves our exact folding
+    // byte-for-byte -- and the MTA re-emits the field its own way, so it does
+    // not. The b= value is folded regardless, further down: it is excluded from
+    // the hash entirely, which is what makes it the safe place to put the bulk.
+    //
+    // Consequence, stated plainly: under simple the first line stays long. That
+    // is the 78-character SHOULD losing to a signature that verifies, while the
+    // 998-character MUST is still met because b= is folded either way.
+    if (sig.canonicalization.header != .relaxed) folder.limit = header_fold.HARD_LIMIT;
+
+    try appendTag(&folder, "v", sig.version);
+    try appendTag(&folder, "a", sig.algorithm.toString());
     const canon_str = try canonPairToString(allocator, sig.canonicalization);
     defer allocator.free(canon_str);
-    try appendTag(&buf, allocator, "c", canon_str);
-    try appendTag(&buf, allocator, "d", sig.domain);
-    try appendTag(&buf, allocator, "s", sig.selector);
-    try appendTag(&buf, allocator, "h", sig.signed_headers);
+    try appendTag(&folder, "c", canon_str);
+    try appendTag(&folder, "d", sig.domain);
+    try appendTag(&folder, "s", sig.selector);
+    try appendTag(&folder, "h", sig.signed_headers);
 
     if (sig.timestamp) |t| {
         var ts_buf: [20]u8 = undefined;
         const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{t}) catch unreachable;
-        try appendTag(&buf, allocator, "t", ts_str);
+        try appendTag(&folder, "t", ts_str);
     }
 
     if (sig.expiration) |x| {
         var ts_buf: [20]u8 = undefined;
         const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{x}) catch unreachable;
-        try appendTag(&buf, allocator, "x", ts_str);
+        try appendTag(&folder, "x", ts_str);
     }
 
     if (sig.body_length) |l| {
         var ts_buf: [20]u8 = undefined;
         const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{l}) catch unreachable;
-        try appendTag(&buf, allocator, "l", ts_str);
+        try appendTag(&folder, "l", ts_str);
     }
 
     if (sig.auid) |auid| {
-        try appendTag(&buf, allocator, "i", auid);
+        try appendTag(&folder, "i", auid);
     }
 
-    try appendTag(&buf, allocator, "bh", sig.body_hash);
+    try appendTag(&folder, "bh", sig.body_hash);
 
-    // b= tag always last (empty for initial signing pass)
-    try buf.appendSlice(allocator, "; b=");
+    // b= tag always last, and empty on the signing pass: everything after this
+    // point is excluded from the hash, which is what lets `signMessage` fold
+    // the base64 in afterwards without disturbing the signature.
+    try folder.append("; ", "b=");
 
     return buf.toOwnedSlice(allocator);
 }
 
-fn appendTag(buf: *std.ArrayList(u8), allocator: Allocator, tag: []const u8, value: []const u8) !void {
-    if (buf.items.len > 0) {
-        try buf.appendSlice(allocator, ";");
+/// Append "; tag=value", folding onto a continuation line when the tag would
+/// push the line past the RFC 5322 §2.1.1 limit.
+///
+/// The folded form is what gets hashed as well as emitted -- `signMessage`
+/// builds this value once and feeds the same bytes to `buildSigningInput` --
+/// so relaxed canonicalization unfolds it again and simple hashes it literally.
+/// Either way the verifier reads back exactly what was signed.
+fn appendTag(
+    folder: *header_fold.Folder,
+    tag: []const u8,
+    value: []const u8,
+) !void {
+    const separator: []const u8 = if (folder.buf.items.len > 0) "; " else " ";
+    var name_buf: [8]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&name_buf, "{s}=", .{tag});
+
+    // bh= is base64 and long enough to need splitting on its own; RFC 6376 §3.5
+    // exempts whitespace inside it, so it may be broken anywhere.
+    if (mem.eql(u8, tag, "bh")) {
+        try folder.append(separator, prefix);
+        try folder.appendChunked(value);
+        return;
     }
-    try buf.appendSlice(allocator, " ");
-    try buf.appendSlice(allocator, tag);
-    try buf.append(allocator, '=');
-    try buf.appendSlice(allocator, value);
+
+    const token = try std.fmt.allocPrint(folder.allocator, "{s}{s}", .{ prefix, value });
+    defer folder.allocator.free(token);
+    try folder.append(separator, token);
 }
 
 fn canonPairToString(allocator: Allocator, pair: canon.CanonicalizationPair) ![]const u8 {
