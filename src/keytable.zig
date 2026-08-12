@@ -32,12 +32,68 @@ pub const KeyTableEntry = struct {
     key: ?crypto.SigningKey = null,
 };
 
-/// Loaded SigningTable.
+/// Hash-map context folding case on both sides of the comparison.
+///
+/// Patterns and sender addresses arrive in whatever case the operator and the
+/// peer chose. Folding inside the context keeps the map keys borrowed from
+/// `entries` rather than allocating a lowercased copy of every key, and lets a
+/// lookup probe the sender in place.
+const CaseFoldedKey = struct {
+    pub fn hash(_: CaseFoldedKey, key: []const u8) u64 {
+        // FNV-1a over the folded bytes: keys are short domain names.
+        var h: u64 = 0xcbf29ce484222325;
+        for (key) |c| {
+            h ^= std.ascii.toLower(c);
+            h *%= 0x100000001b3;
+        }
+        return h;
+    }
+
+    pub fn eql(_: CaseFoldedKey, a: []const u8, b: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(a, b);
+    }
+};
+
+const PatternMap = std.HashMapUnmanaged(
+    []const u8,
+    SigningMatch,
+    CaseFoldedKey,
+    std.hash_map.default_max_load_percentage,
+);
+
+/// One indexed pattern: the signing entry it names and the line that named it.
+///
+/// `file_index` is what preserves first-match-wins across tiers. Several
+/// patterns may match one sender, and the earliest line in the file decides.
+const SigningMatch = struct {
+    signing_entry: []const u8,
+    file_index: u32,
+};
+
+/// Which tier can answer a pattern with a hash probe.
+const PatternTier = enum { exact, domain, suffix, residual };
+
+/// Loaded SigningTable, indexed by pattern shape.
 pub const SigningTable = struct {
     entries: []SigningTableEntry,
     allocator: Allocator,
 
+    /// Keyed by full sender address: "user@specific.com".
+    exact_map: PatternMap = .{},
+    /// Keyed by sender domain: "*@example.com" as "example.com".
+    domain_map: PatternMap = .{},
+    /// Keyed by base domain: "*@*.example.com" as "example.com".
+    suffix_map: PatternMap = .{},
+    /// Ascending indices of patterns no tier can key on: a literal local part
+    /// with a wildcard domain ("admin@*.example.com"). Matched by scan.
+    residual: []const u32 = &.{},
+
     pub fn deinit(self: *SigningTable) void {
+        // Map keys point into the entries, so only the tables are freed here.
+        self.exact_map.deinit(self.allocator);
+        self.domain_map.deinit(self.allocator);
+        self.suffix_map.deinit(self.allocator);
+        self.allocator.free(self.residual);
         for (self.entries) |entry| {
             self.allocator.free(entry.pattern);
             self.allocator.free(entry.signing_entry);
@@ -47,14 +103,73 @@ pub const SigningTable = struct {
 
     /// Find the signing entry for a given sender address.
     /// Returns the signing-entry name or null if no match.
+    ///
+    /// Answers exactly what a file-order scan of every pattern would, at the
+    /// cost of one hash probe per tier plus one per label of the sender domain.
     pub fn lookup(self: *const SigningTable, sender: []const u8) ?[]const u8 {
-        for (self.entries) |entry| {
-            if (matchPattern(entry.pattern, sender)) {
-                return entry.signing_entry;
+        // A table built without the parser has no index; its rows are still
+        // matched, so soundness never depends on who built the table.
+        if (self.indexedCount() == 0) return self.scan(sender);
+
+        var best: ?SigningMatch = null;
+        consider(&best, self.exact_map.get(sender));
+
+        if (mem.indexOfScalar(u8, sender, '@')) |at| {
+            const domain = sender[at + 1 ..];
+            consider(&best, self.domain_map.get(domain));
+
+            // "*@*.example.com" matches user@example.com as well as any
+            // subdomain, so the sender's own domain is probed before the walk.
+            consider(&best, self.suffix_map.get(domain));
+
+            // Every suffix with a non-empty prefix, which is the set a trailing
+            // ".base" comparison accepts. Starting at 1 skips a leading dot,
+            // whose prefix is empty and which that comparison rejects.
+            var pos: usize = 1;
+            while (mem.indexOfScalarPos(u8, domain, pos, '.')) |dot| {
+                const parent = domain[dot + 1 ..];
+                if (parent.len == 0) break;
+                consider(&best, self.suffix_map.get(parent));
+                pos = dot + 1;
             }
+        }
+
+        // Residual indices ascend, so an earlier tier match at a lower index
+        // already wins and the first residual match is the best one left.
+        for (self.residual) |i| {
+            if (best) |b| if (i > b.file_index) break;
+            const entry = self.entries[i];
+            if (!matchPattern(entry.pattern, sender)) continue;
+            best = .{ .signing_entry = entry.signing_entry, .file_index = i };
+            break;
+        }
+
+        return if (best) |b| b.signing_entry else null;
+    }
+
+    fn indexedCount(self: *const SigningTable) usize {
+        return self.exact_map.count() + self.domain_map.count() + self.suffix_map.count();
+    }
+
+    fn scan(self: *const SigningTable, sender: []const u8) ?[]const u8 {
+        for (self.entries) |entry| {
+            if (matchPattern(entry.pattern, sender)) return entry.signing_entry;
         }
         return null;
     }
+};
+
+/// Keep the match from the earliest line among the tiers that answered.
+fn consider(best: *?SigningMatch, found: ?SigningMatch) void {
+    const match = found orelse return;
+    if (best.*) |current| if (current.file_index <= match.file_index) return;
+    best.* = match;
+}
+
+/// Half-open range of `KeyTable.entries` holding one signing entry's rows.
+const KeyGroup = struct {
+    start: u32,
+    end: u32,
 };
 
 /// Loaded KeyTable.
@@ -62,7 +177,12 @@ pub const KeyTable = struct {
     entries: []KeyTableEntry,
     allocator: Allocator,
 
+    /// Signing-entry name to its contiguous range in `entries`. Keys are
+    /// borrowed from the rows they point at, so nothing extra is allocated.
+    index: std.StringHashMapUnmanaged(KeyGroup) = .{},
+
     pub fn deinit(self: *KeyTable) void {
+        self.index.deinit(self.allocator);
         for (self.entries) |*entry| {
             self.allocator.free(entry.signing_entry);
             self.allocator.free(entry.domain);
@@ -87,10 +207,19 @@ pub const KeyTable = struct {
         }
     }
 
-    /// Find all adjacent entries for a signing-entry name.
+    /// Find every row for a signing-entry name, in file order.
     ///
-    /// `parseKeyTable` groups matching rows; this scan returns only verified matches.
+    /// `parseKeyTable` sorts matching rows together and records each group's
+    /// range, so this is one hash probe.
     pub fn lookup(self: *const KeyTable, signing_entry: []const u8) []const KeyTableEntry {
+        if (self.index.count() == 0) return self.scan(signing_entry);
+        const group = self.index.get(signing_entry) orelse return &.{};
+        return self.entries[group.start..group.end];
+    }
+
+    /// Row scan for a table built without the parser's index. Returns only rows
+    /// that carry the requested name, whether or not the rows are grouped.
+    fn scan(self: *const KeyTable, signing_entry: []const u8) []const KeyTableEntry {
         const first = for (self.entries, 0..) |entry, i| {
             if (mem.eql(u8, entry.signing_entry, signing_entry)) break i;
         } else return &.{};
@@ -136,10 +265,66 @@ pub fn parseSigningTable(allocator: Allocator, content: []const u8) !SigningTabl
         });
     }
 
-    return .{
+    var table = SigningTable{
         .entries = try entries.toOwnedSlice(allocator),
         .allocator = allocator,
     };
+    errdefer table.deinit();
+    try indexSigningTable(&table);
+    return table;
+}
+
+/// File every pattern under the tier that can answer it with a hash probe.
+///
+/// Only the first row per key is kept: a later row with the same key can never
+/// win, because the scan it replaces takes the earliest matching line.
+fn indexSigningTable(table: *SigningTable) !void {
+    const allocator = table.allocator;
+    var residual: std.ArrayList(u32) = .{};
+    errdefer residual.deinit(allocator);
+
+    for (table.entries, 0..) |entry, i| {
+        const file_index: u32 = @intCast(i);
+        const tier = classify(entry.pattern);
+        const map = switch (tier) {
+            .exact => &table.exact_map,
+            .domain => &table.domain_map,
+            .suffix => &table.suffix_map,
+            .residual => {
+                try residual.append(allocator, file_index);
+                continue;
+            },
+        };
+        const gop = try map.getOrPut(allocator, tierKey(tier, entry.pattern));
+        if (!gop.found_existing) gop.value_ptr.* = .{
+            .signing_entry = entry.signing_entry,
+            .file_index = file_index,
+        };
+    }
+
+    table.residual = try residual.toOwnedSlice(allocator);
+}
+
+/// Classify a pattern by the shape of its local part and domain.
+fn classify(pattern: []const u8) PatternTier {
+    // No '@' at all can only ever match a sender literally.
+    const at = mem.indexOfScalar(u8, pattern, '@') orelse return .exact;
+    const wildcard_domain = mem.startsWith(u8, pattern[at + 1 ..], "*.");
+    if (!mem.eql(u8, pattern[0..at], "*")) {
+        // A literal local part with a wildcard domain needs both a suffix walk
+        // and a local-part comparison, which no single key expresses.
+        return if (wildcard_domain) .residual else .exact;
+    }
+    return if (wildcard_domain) .suffix else .domain;
+}
+
+/// The key a pattern is filed under within its tier's map.
+fn tierKey(tier: PatternTier, pattern: []const u8) []const u8 {
+    if (tier == .exact) return pattern;
+    const at = mem.indexOfScalar(u8, pattern, '@').?;
+    const domain = pattern[at + 1 ..];
+    // ".example.com" and up: the suffix tier is keyed by the base domain.
+    return if (tier == .suffix) domain[2..] else domain;
 }
 
 /// Parse a KeyTable file. Format: one entry per line, "signing-entry domain:selector:keypath".
@@ -181,34 +366,49 @@ pub fn parseKeyTable(allocator: Allocator, content: []const u8) !KeyTable {
     }
 
     const owned = try entries.toOwnedSlice(allocator);
-    groupBySigningEntry(owned);
+    errdefer {
+        for (owned) |entry| {
+            allocator.free(entry.signing_entry);
+            allocator.free(entry.domain);
+            allocator.free(entry.selector);
+            allocator.free(entry.key_path);
+        }
+        allocator.free(owned);
+    }
+
+    // Stable, so rows keep their file order within a signing entry: multi-sign
+    // order decides which signature is added first.
+    mem.sort(KeyTableEntry, owned, {}, bySigningEntry);
+
+    var index: std.StringHashMapUnmanaged(KeyGroup) = .{};
+    errdefer index.deinit(allocator);
+    try indexKeyGroups(allocator, owned, &index);
 
     return .{
         .entries = owned,
         .allocator = allocator,
+        .index = index,
     };
 }
 
-/// Group rows by signing entry while preserving their file order.
-///
-/// This load-time quadratic pass keeps multi-sign lookup complete and ordered.
-fn groupBySigningEntry(items: []KeyTableEntry) void {
-    var group_start: usize = 0;
-    while (group_start < items.len) {
-        var insert = group_start + 1;
-        var j = insert;
-        while (j < items.len) : (j += 1) {
-            if (!mem.eql(u8, items[j].signing_entry, items[group_start].signing_entry)) continue;
-            if (j != insert) {
-                // Shift rather than swap to preserve file order.
-                const moved = items[j];
-                var k = j;
-                while (k > insert) : (k -= 1) items[k] = items[k - 1];
-                items[insert] = moved;
-            }
-            insert += 1;
-        }
-        group_start = insert;
+fn bySigningEntry(_: void, a: KeyTableEntry, b: KeyTableEntry) bool {
+    return mem.lessThan(u8, a.signing_entry, b.signing_entry);
+}
+
+/// Record the range of each signing entry's rows in the sorted row list.
+fn indexKeyGroups(
+    allocator: Allocator,
+    items: []const KeyTableEntry,
+    index: *std.StringHashMapUnmanaged(KeyGroup),
+) !void {
+    var start: usize = 0;
+    while (start < items.len) {
+        const name = items[start].signing_entry;
+        var end = start + 1;
+        while (end < items.len and mem.eql(u8, items[end].signing_entry, name)) : (end += 1) {}
+        // Sorting makes each name contiguous, so a name is recorded once.
+        try index.put(allocator, name, .{ .start = @intCast(start), .end = @intCast(end) });
+        start = end;
     }
 }
 
@@ -422,4 +622,144 @@ test "pattern matching exact" {
 test "pattern matching case insensitive" {
     try std.testing.expect(matchPattern("*@Example.COM", "user@example.com"));
     try std.testing.expect(matchPattern("Admin@test.org", "admin@TEST.ORG"));
+}
+
+// --- Indexed signing-table lookup ---------------------------------------------
+//
+// The index answers what a file-order scan of every pattern answers. That is the
+// property worth testing, rather than any one tier: a sender that reaches the
+// wrong tier is signed with another domain's key, and the tier a pattern lands
+// in is decided by `classify` at parse time where no caller can see it.
+
+/// File-order scan, independent of the index. The answer the index must match.
+fn referenceLookup(table: *const SigningTable, sender: []const u8) ?[]const u8 {
+    for (table.entries) |entry| {
+        if (matchPattern(entry.pattern, sender)) return entry.signing_entry;
+    }
+    return null;
+}
+
+fn expectAgreesWithScan(content: []const u8, senders: []const []const u8) !void {
+    var table = try parseSigningTable(std.testing.allocator, content);
+    defer table.deinit();
+
+    for (senders) |sender| {
+        const expected = referenceLookup(&table, sender);
+        const actual = table.lookup(sender);
+        if (expected) |want| {
+            try std.testing.expectEqualStrings(want, actual orelse return error.MissedMatch);
+        } else {
+            try std.testing.expect(actual == null);
+        }
+    }
+}
+
+test "indexed lookup agrees with a file-order scan on every pattern shape" {
+    try expectAgreesWithScan(
+        \\admin@specific.com   specific
+        \\*@example.com        example
+        \\*@*.clients.net      clients
+        \\*@*.com              anycom
+        \\boss@*.corp.example  boss
+        \\bare.pattern         bare
+    , &.{
+        "admin@specific.com",
+        "other@specific.com",
+        "user@example.com",
+        "user@sub.example.com",
+        "user@clients.net",
+        "user@deep.sub.clients.net",
+        "user@notclients.net",
+        "user@example.org",
+        "boss@a.corp.example",
+        "boss@corp.example",
+        "staff@a.corp.example",
+        "bare.pattern",
+        // Malformed shapes a scan rejects and a suffix walk must reject too.
+        // A leading dot is the interesting one: "*@*.clients.net" is a trailing
+        // ".clients.net" comparison, which ".clients.net" itself fails.
+        "user@.clients.net",
+        "user@.example.com",
+        "user@example.com.",
+        "nodomain",
+        "@example.com",
+        "",
+    });
+}
+
+test "indexed lookup keeps first-match-wins across tiers" {
+    // Each pair puts a matching pattern in two different tiers, in both orders:
+    // the earlier line must win regardless of which tier answered.
+    try expectAgreesWithScan(
+        \\*@example.com     wildcard
+        \\admin@example.com exact
+    , &.{ "admin@example.com", "user@example.com" });
+
+    try expectAgreesWithScan(
+        \\admin@example.com exact
+        \\*@example.com     wildcard
+    , &.{ "admin@example.com", "user@example.com" });
+
+    try expectAgreesWithScan(
+        \\*@*.example.com suffix
+        \\*@example.com   domain
+    , &.{ "user@example.com", "user@sub.example.com" });
+
+    try expectAgreesWithScan(
+        \\*@*.com         anycom
+        \\*@*.example.com suffix
+    , &.{ "user@sub.example.com", "user@example.com" });
+
+    // A residual pattern loses to an earlier tier match and wins over a later one.
+    try expectAgreesWithScan(
+        \\*@a.example      domain
+        \\boss@*.a.example residual
+    , &.{ "boss@a.example", "boss@sub.a.example" });
+
+    try expectAgreesWithScan(
+        \\boss@*.a.example residual
+        \\*@a.example      domain
+    , &.{ "boss@a.example", "user@a.example" });
+}
+
+test "indexed lookup folds case on both the pattern and the sender" {
+    const allocator = std.testing.allocator;
+    var table = try parseSigningTable(allocator,
+        \\Admin@Specific.COM  specific
+        \\*@Example.COM       example
+        \\*@*.Clients.NET     clients
+    );
+    defer table.deinit();
+
+    try std.testing.expectEqualStrings("specific", table.lookup("ADMIN@specific.com").?);
+    try std.testing.expectEqualStrings("example", table.lookup("User@EXAMPLE.com").?);
+    try std.testing.expectEqualStrings("clients", table.lookup("u@Sub.CLIENTS.net").?);
+}
+
+test "indexed lookup stores one signing entry per repeated pattern" {
+    const allocator = std.testing.allocator;
+    // Repeats differing only in case must not each allocate a map slot.
+    var table = try parseSigningTable(allocator,
+        \\*@example.com  first
+        \\*@EXAMPLE.COM  second
+        \\*@example.com  third
+    );
+    defer table.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), table.domain_map.count());
+    try std.testing.expectEqualStrings("first", table.lookup("user@example.com").?);
+}
+
+test "signing table lookup is sound on a table the parser did not build" {
+    // Same property as the D-7 key-table test: a hand-built table carries no
+    // index, and matching must not depend on who built it.
+    var rows = [_]SigningTableEntry{
+        .{ .pattern = "*@a.example", .signing_entry = "a" },
+        .{ .pattern = "*@b.example", .signing_entry = "b" },
+    };
+    const table = SigningTable{ .entries = &rows, .allocator = std.testing.allocator };
+
+    try std.testing.expectEqualStrings("a", table.lookup("user@a.example").?);
+    try std.testing.expectEqualStrings("b", table.lookup("user@b.example").?);
+    try std.testing.expect(table.lookup("user@c.example") == null);
 }
