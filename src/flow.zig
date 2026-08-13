@@ -74,10 +74,14 @@ pub fn onBody(conn: *connection_mod.Connection, data: []const u8) u8 {
 pub fn doEom(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     const start_ns = std.time.nanoTimestamp();
 
-    // Remove forged results for this authserv-id before adding DKIM results.
-    _ = header_scrub.stripAuthResults(conn, ctx.authserv_id, ctx.strip_policy);
-
     const mode = modeFor(ctx.modes, conn.listener_index);
+
+    // Strip forged A-R headers only on listeners that add verification results.
+    // A sign-only listener shares a Postfix pipeline with the verify listener,
+    // whose A-R headers (claiming this authserv-id) are already present when
+    // the sign listener runs; stripping them removes legitimate results.
+    if (mode != .sign_only)
+        _ = header_scrub.stripAuthResults(conn, ctx.authserv_id, ctx.strip_policy);
 
     const result = switch (mode) {
         .verify_only => doVerify(conn, ctx),
