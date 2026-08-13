@@ -312,9 +312,13 @@ fn doSign(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     ) catch return signInternalError("signing the message");
     defer sign_result.deinit();
 
-    // Prepend DKIM-Signature header via milter protocol.
+    // Prepend DKIM-Signature header via milter protocol: SMFIR_INSHEADER at
+    // index 0, as OpenDKIM does. An appended signature lands at the bottom of
+    // the header block, adjacent to the body separator — off-convention for a
+    // signature field, and visibly "in the body area" to anyone reading the
+    // source.
     //
-    // The separator is handed to `addHeader` rather than carried inside the
+    // The separator is handed to `insertHeader` rather than carried inside the
     // value, which is what makes the transmitted bytes `"DKIM-Signature: " ++
     // value` under either negotiation: the milter writes the space when it owns
     // it, the MTA writes it otherwise, and exactly one of them does. Those are
@@ -335,8 +339,9 @@ fn doSign(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
         return signInternalError("building the DKIM-Signature header");
     defer conn.allocator.free(wire_value);
 
-    const hdr_payload = responses.addHeader(
+    const hdr_payload = responses.insertHeader(
         conn.allocator,
+        0,
         "DKIM-Signature",
         wire_value,
         conn.negotiated_protocol.header_leading_space,
