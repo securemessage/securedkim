@@ -169,6 +169,13 @@ fn loadKey(allocator: Allocator, path: []const u8, algorithm: dkim.Algorithm) !c
 }
 
 pub fn main() !void {
+    // Conformance harnesses read this tool's stderr as a verdict channel:
+    // anything below err (e.g. the resolver's warn on a SERVFAIL) is noise
+    // there, however useful it is in a daemon's syslog.
+    {
+        const log_cfg = securemilter.log.LogConfig.init(false, .mail, .err, "securedkim-sign");
+        securemilter.log.initGlobal(&log_cfg);
+    }
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();

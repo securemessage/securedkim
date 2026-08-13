@@ -71,7 +71,12 @@ const SigningMatch = struct {
 };
 
 /// Which tier can answer a pattern with a hash probe.
-const PatternTier = enum { exact, domain, suffix, residual };
+///
+/// The tiers implement OpenDKIM's SigningTable lookup order (opendkim.conf(5)):
+/// exact address, bare host (any user at that domain), `user@.domain` and
+/// `.domain` walking superdomains, `user@*`, `*`. First match in file order
+/// wins across tiers, tracked by `SigningMatch.file_index`.
+const PatternTier = enum { exact, domain, suffix, userdot, dot, userstar, star, residual };
 
 /// Loaded SigningTable, indexed by pattern shape.
 pub const SigningTable = struct {
@@ -80,10 +85,22 @@ pub const SigningTable = struct {
 
     /// Keyed by full sender address: "user@specific.com".
     exact_map: PatternMap = .{},
-    /// Keyed by sender domain: "*@example.com" as "example.com".
+    /// Keyed by sender domain: "*@example.com" as "example.com", and a bare
+    /// host pattern "example.com" likewise (OpenDKIM: a bare host matches any
+    /// user at that domain — F3).
     domain_map: PatternMap = .{},
     /// Keyed by base domain: "*@*.example.com" as "example.com".
     suffix_map: PatternMap = .{},
+    /// Keyed by the whole pattern: "user@.example.com" (that user at the
+    /// domain or any subdomain of it).
+    userdot_map: PatternMap = .{},
+    /// Keyed by the whole pattern: ".example.com" (any user there or below).
+    dot_map: PatternMap = .{},
+    /// Keyed by the whole pattern: "user@*" (that user anywhere).
+    userstar_map: PatternMap = .{},
+    /// The pattern "*" is present at this file index, or null. Matches every
+    /// sender, so it needs no key.
+    star_index: ?u32 = null,
     /// Ascending indices of patterns no tier can key on: a literal local part
     /// with a wildcard domain ("admin@*.example.com"). Matched by scan.
     residual: []const u32 = &.{},
@@ -93,6 +110,9 @@ pub const SigningTable = struct {
         self.exact_map.deinit(self.allocator);
         self.domain_map.deinit(self.allocator);
         self.suffix_map.deinit(self.allocator);
+        self.userdot_map.deinit(self.allocator);
+        self.dot_map.deinit(self.allocator);
+        self.userstar_map.deinit(self.allocator);
         self.allocator.free(self.residual);
         for (self.entries) |entry| {
             self.allocator.free(entry.pattern);
@@ -115,6 +135,7 @@ pub const SigningTable = struct {
         consider(&best, self.exact_map.get(sender));
 
         if (mem.indexOfScalar(u8, sender, '@')) |at| {
+            const local = sender[0..at];
             const domain = sender[at + 1 ..];
             consider(&best, self.domain_map.get(domain));
 
@@ -122,9 +143,8 @@ pub const SigningTable = struct {
             // subdomain, so the sender's own domain is probed before the walk.
             consider(&best, self.suffix_map.get(domain));
 
-            // Every suffix with a non-empty prefix, which is the set a trailing
-            // ".base" comparison accepts. Starting at 1 skips a leading dot,
-            // whose prefix is empty and which that comparison rejects.
+            // The suffix tier walk (existing behaviour). Starting at 1 skips
+            // a leading dot, whose prefix is empty.
             var pos: usize = 1;
             while (mem.indexOfScalarPos(u8, domain, pos, '.')) |dot| {
                 const parent = domain[dot + 1 ..];
@@ -132,6 +152,35 @@ pub const SigningTable = struct {
                 consider(&best, self.suffix_map.get(parent));
                 pos = dot + 1;
             }
+
+            // Walk the same suffixes for the dotted tiers, from the full
+            // domain upward. The buffer holds any legal pattern key (local
+            // part 64 + separator + domain 253); an oversized one cannot be a
+            // valid pattern, so a failed print means "no such pattern".
+            var buf: [512]u8 = undefined;
+            var suffix: []const u8 = domain;
+            while (suffix.len > 0) {
+                if (std.fmt.bufPrint(&buf, "{s}@.{s}", .{ local, suffix })) |key| {
+                    consider(&best, self.userdot_map.get(key));
+                } else |_| {}
+                if (suffix.len + 1 <= buf.len) {
+                    buf[0] = '.';
+                    @memcpy(buf[1 .. suffix.len + 1], suffix);
+                    consider(&best, self.dot_map.get(buf[0 .. suffix.len + 1]));
+                }
+                const next_dot = mem.indexOfScalar(u8, suffix, '.') orelse break;
+                suffix = suffix[next_dot + 1 ..];
+            }
+
+            // "user@*" — that local part at any domain.
+            if (std.fmt.bufPrint(&buf, "{s}@*", .{local})) |key| {
+                consider(&best, self.userstar_map.get(key));
+            } else |_| {}
+        }
+
+        // "*" matches everything, at its own place in file order.
+        if (self.star_index) |i| {
+            consider(&best, .{ .signing_entry = self.entries[i].signing_entry, .file_index = i });
         }
 
         // Residual indices ascend, so an earlier tier match at a lower index
@@ -148,7 +197,9 @@ pub const SigningTable = struct {
     }
 
     fn indexedCount(self: *const SigningTable) usize {
-        return self.exact_map.count() + self.domain_map.count() + self.suffix_map.count();
+        return self.exact_map.count() + self.domain_map.count() + self.suffix_map.count() +
+            self.userdot_map.count() + self.dot_map.count() + self.userstar_map.count() +
+            @intFromBool(self.star_index != null);
     }
 
     fn scan(self: *const SigningTable, sender: []const u8) ?[]const u8 {
@@ -290,6 +341,13 @@ fn indexSigningTable(table: *SigningTable) !void {
             .exact => &table.exact_map,
             .domain => &table.domain_map,
             .suffix => &table.suffix_map,
+            .userdot => &table.userdot_map,
+            .dot => &table.dot_map,
+            .userstar => &table.userstar_map,
+            .star => {
+                if (table.star_index == null) table.star_index = file_index;
+                continue;
+            },
             .residual => {
                 try residual.append(allocator, file_index);
                 continue;
@@ -307,24 +365,37 @@ fn indexSigningTable(table: *SigningTable) !void {
 
 /// Classify a pattern by the shape of its local part and domain.
 fn classify(pattern: []const u8) PatternTier {
-    // No '@' at all can only ever match a sender literally.
-    const at = mem.indexOfScalar(u8, pattern, '@') orelse return .exact;
-    const wildcard_domain = mem.startsWith(u8, pattern[at + 1 ..], "*.");
-    if (!mem.eql(u8, pattern[0..at], "*")) {
+    if (mem.eql(u8, pattern, "*")) return .star;
+    const at = mem.indexOfScalar(u8, pattern, '@') orelse {
+        // No '@': OpenDKIM treats a bare host as any user at that domain
+        // (F3); a leading dot makes it the any-user subdomain form.
+        return if (mem.startsWith(u8, pattern, ".")) .dot else .domain;
+    };
+    const local = pattern[0..at];
+    const domain = pattern[at + 1 ..];
+    if (!mem.eql(u8, local, "*")) {
+        if (mem.startsWith(u8, domain, ".")) return .userdot;
+        if (mem.eql(u8, domain, "*")) return .userstar;
         // A literal local part with a wildcard domain needs both a suffix walk
         // and a local-part comparison, which no single key expresses.
-        return if (wildcard_domain) .residual else .exact;
+        if (mem.startsWith(u8, domain, "*.")) return .residual;
+        return .exact;
     }
-    return if (wildcard_domain) .suffix else .domain;
+    return if (mem.startsWith(u8, domain, "*.")) .suffix else .domain;
 }
 
 /// The key a pattern is filed under within its tier's map.
 fn tierKey(tier: PatternTier, pattern: []const u8) []const u8 {
-    if (tier == .exact) return pattern;
-    const at = mem.indexOfScalar(u8, pattern, '@').?;
-    const domain = pattern[at + 1 ..];
-    // ".example.com" and up: the suffix tier is keyed by the base domain.
-    return if (tier == .suffix) domain[2..] else domain;
+    switch (tier) {
+        .exact, .userdot, .dot, .userstar => return pattern,
+        .domain, .suffix => {
+            // A bare host keys on itself; "*@host" / "*@*.host" on the domain.
+            const at = mem.indexOfScalar(u8, pattern, '@') orelse return pattern;
+            const domain = pattern[at + 1 ..];
+            return if (tier == .suffix) domain[2..] else domain;
+        },
+        .star, .residual => unreachable, // not map-filed
+    }
 }
 
 /// Parse a KeyTable file. Format: one entry per line, "signing-entry domain:selector:keypath".
@@ -417,42 +488,47 @@ fn indexKeyGroups(
 // =============================================================================
 
 /// Match a signing-table pattern against a sender address.
-/// Supports:
-///   - Exact match: "user@domain.com"
-///   - Wildcard local-part: "*@domain.com"
-///   - Wildcard subdomain: "*@*.domain.com"
+/// OpenDKIM's SigningTable language (opendkim.conf(5)):
+///   - "*": any sender
+///   - "user@host": exact address
+///   - "host": any user at exactly that domain (F3)
+///   - "*@host": any user at exactly that domain
+///   - "user@.domain": that user at the domain or any subdomain of it
+///   - ".domain": any user at the domain or any subdomain of it
+///   - "*@*.domain": any user at the domain or any subdomain of it
+///   - "user@*": that user at any domain
 fn matchPattern(pattern: []const u8, sender: []const u8) bool {
-    // Exact match first
-    if (std.ascii.eqlIgnoreCase(pattern, sender)) return true;
+    if (mem.eql(u8, pattern, "*")) return true;
 
-    // Split pattern and sender at @
-    const pat_at = mem.indexOfScalar(u8, pattern, '@') orelse return false;
     const snd_at = mem.indexOfScalar(u8, sender, '@') orelse return false;
-
-    const pat_local = pattern[0..pat_at];
-    const pat_domain = pattern[pat_at + 1 ..];
     const snd_local = sender[0..snd_at];
     const snd_domain = sender[snd_at + 1 ..];
 
-    // Check local-part: * matches any, otherwise must match exactly
-    if (!mem.eql(u8, pat_local, "*")) {
-        if (!std.ascii.eqlIgnoreCase(pat_local, snd_local)) return false;
-    }
+    const pat_at = mem.indexOfScalar(u8, pattern, '@') orelse {
+        if (mem.startsWith(u8, pattern, ".")) return domainIsOrUnder(snd_domain, pattern[1..]);
+        return std.ascii.eqlIgnoreCase(snd_domain, pattern);
+    };
 
-    // Check domain: may have leading *. for subdomain wildcard
-    if (mem.startsWith(u8, pat_domain, "*.")) {
-        const suffix = pat_domain[1..]; // ".domain.com"
-        // Sender domain must end with this suffix
-        if (snd_domain.len > suffix.len) {
-            const snd_suffix = snd_domain[snd_domain.len - suffix.len ..];
-            return std.ascii.eqlIgnoreCase(snd_suffix, suffix);
-        }
-        // Or exact match on the base domain (without the dot prefix)
-        return std.ascii.eqlIgnoreCase(snd_domain, pat_domain[2..]);
-    }
+    const pat_local = pattern[0..pat_at];
+    const pat_domain = pattern[pat_at + 1 ..];
 
-    // Exact domain match
+    if (!mem.eql(u8, pat_local, "*") and !std.ascii.eqlIgnoreCase(pat_local, snd_local)) return false;
+
+    if (mem.eql(u8, pat_domain, "*")) return true;
+    if (mem.startsWith(u8, pat_domain, ".")) return domainIsOrUnder(snd_domain, pat_domain[1..]);
+    if (mem.startsWith(u8, pat_domain, "*.")) return domainIsOrUnder(snd_domain, pat_domain[2..]);
     return std.ascii.eqlIgnoreCase(pat_domain, snd_domain);
+}
+
+/// Whether `domain` equals `base` or sits below it, compared case-insensitively.
+fn domainIsOrUnder(domain: []const u8, base: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(domain, base)) return true;
+    // A subdomain needs at least one label character before the separator dot:
+    // without it ".base" would match, and an empty leading label is malformed
+    // input, not a subdomain.
+    if (domain.len < base.len + 2) return false;
+    return domain[domain.len - base.len - 1] == '.' and
+        std.ascii.eqlIgnoreCase(domain[domain.len - base.len ..], base);
 }
 
 // =============================================================================
@@ -489,6 +565,76 @@ test "signing table lookup" {
     try std.testing.expectEqualStrings("example.com", table.lookup("user@example.com").?);
     try std.testing.expectEqualStrings("other.org", table.lookup("admin@other.org").?);
     try std.testing.expect(table.lookup("user@unknown.com") == null);
+}
+
+// F3: OpenDKIM's SigningTable semantics (opendkim.conf(5)), decided
+// 2026-08-12. A bare host pattern is "any user at that domain" -- the form
+// that silently signed nothing before -- and the dotted/starred forms walk
+// superdomains. First matching line in the file wins across all tiers.
+test "F3: bare host matches the whole domain, never subdomains" {
+    const allocator = std.testing.allocator;
+    var table = try parseSigningTable(allocator,
+        \\example.com  example.com
+    );
+    defer table.deinit();
+
+    try std.testing.expectEqualStrings("example.com", table.lookup("anyone@example.com").?);
+    try std.testing.expect(table.lookup("anyone@sub.example.com") == null);
+    try std.testing.expect(table.lookup("anyone@example.org") == null);
+}
+
+test "F3: user@.domain and .domain walk subdomains" {
+    const allocator = std.testing.allocator;
+    var table = try parseSigningTable(allocator,
+        \\alice@.example.com  alice-keys
+        \\.example.org        org-keys
+    );
+    defer table.deinit();
+
+    // The dotted forms match the base domain and everything under it.
+    try std.testing.expectEqualStrings("alice-keys", table.lookup("alice@example.com").?);
+    try std.testing.expectEqualStrings("alice-keys", table.lookup("alice@a.b.example.com").?);
+    try std.testing.expect(table.lookup("bob@example.com") == null);
+    try std.testing.expectEqualStrings("org-keys", table.lookup("anyone@deep.example.org").?);
+    try std.testing.expectEqualStrings("org-keys", table.lookup("anyone@example.org").?);
+    // But not sideways.
+    try std.testing.expect(table.lookup("anyone@example.org.evil.test") == null);
+    try std.testing.expect(table.lookup("alice@notexample.com") == null);
+}
+
+test "F3: user@* and * are the open forms" {
+    const allocator = std.testing.allocator;
+    var table = try parseSigningTable(allocator,
+        \\alice@*  alice-keys
+        \\*        catch-all
+    );
+    defer table.deinit();
+
+    try std.testing.expectEqualStrings("alice-keys", table.lookup("alice@anywhere.test").?);
+    try std.testing.expectEqualStrings("catch-all", table.lookup("bob@anywhere.test").?);
+}
+
+test "F3: earliest line wins across pattern shapes" {
+    const allocator = std.testing.allocator;
+    var table = try parseSigningTable(allocator,
+        \\example.com       bare-host
+        \\*@example.com     star-at
+        \\carol@example.com exact
+    );
+    defer table.deinit();
+
+    // The bare host precedes the wildcard form it duplicates.
+    try std.testing.expectEqualStrings("bare-host", table.lookup("dave@example.com").?);
+    // The exact address is later in the file than both, so it loses to them
+    // for its own sender too -- file order, not specificity, decides.
+    try std.testing.expectEqualStrings("bare-host", table.lookup("carol@example.com").?);
+
+    var table2 = try parseSigningTable(allocator,
+        \\carol@example.com exact
+        \\example.com       bare-host
+    );
+    defer table2.deinit();
+    try std.testing.expectEqualStrings("exact", table2.lookup("carol@example.com").?);
 }
 
 test "parse key table" {

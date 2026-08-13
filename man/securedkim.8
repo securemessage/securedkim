@@ -367,6 +367,25 @@ section as in the sample configuration.
 .It Cm SigningTable
 Path to signing table file mapping sender patterns to signing identities.
 Required for sign mode with multi-domain support.
+.Pp
+Patterns follow OpenDKIM's SigningTable language; the first matching line in
+the file wins:
+.Bl -column -offset indent ".Qq user@.example.com" ".Qq matches"
+.It Qq * Ta any sender
+.It Qq user@example.com Ta that exact address
+.It Qq example.com Ta any user at that domain (not subdomains)
+.It Qq *@example.com Ta any user at that domain (same as the bare host)
+.It Qq *@*.example.com Ta the domain and every subdomain of it
+.It Qq .example.com Ta the domain and every subdomain of it, any user
+.It Qq user@.example.com Ta that user at the domain or any subdomain of it
+.It Qq user@* Ta that local part at any domain
+.El
+.Pp
+Compatibility note: before 0.6.6 a bare host pattern matched only a sender
+literally equal to it, so a table line like
+.Qq example.com
+signed nothing at all.
+It now does what OpenDKIM does with the same line.
 .It Cm KeyTable
 Path to key table file mapping signing identities to key files.
 Required for sign mode with multi-domain support.
