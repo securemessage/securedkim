@@ -53,7 +53,7 @@ pub const SignResult = struct {
 
     /// Header value without the field name and separator.
     ///
-    /// The milter supplies the negotiated separator through `responses.addHeader`.
+    /// The milter supplies the negotiated separator through `responses.insertHeader`.
     pub fn value(self: *const SignResult) []const u8 {
         std.debug.assert(mem.startsWith(u8, self.header, PREFIX));
         return self.header[PREFIX.len..];
