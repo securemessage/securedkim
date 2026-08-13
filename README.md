@@ -140,6 +140,8 @@ milter_default_action = accept
 
 ### Milter Chain Ordering
 
+With SecureDMARC in its default stamp-only mode:
+
 ```ini
 smtpd_milters = inet:127.0.0.1:8890,
                 inet:127.0.0.1:8891,
@@ -148,6 +150,10 @@ smtpd_milters = inet:127.0.0.1:8890,
 ```
 
 Order: **SPF (8890) → DKIM (8891) → DMARC (8894) → ARC (8895)**
+
+If SecureDMARC has `Enforcement` enabled with a `TrustedSealersFile`
+override, SecureARC's verify step must run before SecureDMARC instead; see
+[securedmarc's README](https://pacyworld.dev/securemessage/securedmarc#milter-chain-ordering).
 
 ## CLI Tools
 
