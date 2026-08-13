@@ -1,0 +1,23 @@
+#!/bin/sh
+
+# PROVIDE: securedkim
+# REQUIRE: LOGIN dns
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="securedkim"
+rcvar="${name}_enable"
+desc="SecureDKIM milter daemon (RFC 6376 DKIM signing and verification)"
+
+load_rc_config $name
+
+: ${securedkim_enable:="NO"}
+: ${securedkim_config:="%%PREFIX%%/etc/securedkim/securedkim.conf"}
+: ${securedkim_pidfile:="/var/run/securedkim/securedkim.pid"}
+
+pidfile="${securedkim_pidfile}"
+command="%%PREFIX%%/bin/securedkim"
+command_args="-c ${securedkim_config}"
+
+run_rc_command "$1"
