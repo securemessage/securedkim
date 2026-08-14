@@ -12,7 +12,6 @@ const connection_mod = securemilter.connection;
 const auth_results = securemilter.auth_results;
 const auth_stamp = securemilter.auth_stamp;
 const escape = securemilter.escape;
-const codec = securemilter.milter.codec;
 const responses = securemilter.milter.responses;
 const dns_mod = securemilter.dns;
 const deadline_mod = securemilter.deadline;
@@ -352,11 +351,19 @@ fn doSign(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     ) catch return signInternalError("building the DKIM-Signature header");
     defer conn.allocator.free(hdr_payload);
 
-    // A swallowed write here delivered the message unsigned and then published
-    // "sign pass" for it, so both the recipient and our own event stream were
-    // misinformed at once (audit X-10).
-    codec.writePacket(conn.fd, hdr_payload) catch
-        return signInternalError("writing the DKIM-Signature header");
+    // A swallowed failure here delivered the message unsigned and then
+    // published "sign pass" for it, so both the recipient and our own event
+    // stream were misinformed at once (audit X-10).
+    //
+    // The signature is QUEUED here, not written: the worker flushes it with the
+    // final action, in one packet. What that changes for X-10 is only the
+    // remaining failure mode -- a flush that fails after this point closes the
+    // connection, so the MTA defers the message rather than delivering it
+    // unsigned, while the event below has already said "pass". The event stream
+    // can therefore over-report a signature on a connection that died; the mail
+    // cannot go out unsigned, which is the half X-10 was about.
+    conn.sendPacket(hdr_payload) catch
+        return signInternalError("queueing the DKIM-Signature header");
 
     publishEvent(ctx, conn.allocator, "sign", "pass", sign_params.domain, sign_params.selector);
 
@@ -434,14 +441,14 @@ fn addArHeader(
         prop_count += 1;
     }
 
-    try auth_stamp.stamp(conn.allocator, conn.fd, ctx.authserv_id, &.{
+    try auth_stamp.stamp(conn, ctx.authserv_id, &.{
         .{
             .method = method,
             .result = result_str,
             .reason = null,
             .properties = properties[0..prop_count],
         },
-    }, conn.negotiated_protocol.header_leading_space);
+    });
 }
 
 // =============================================================================
