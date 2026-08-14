@@ -5,9 +5,9 @@ High-performance DKIM signing and verification milter for Postfix, implementing 
 ## Features
 
 - **RSA-SHA256 and Ed25519-SHA256** signature algorithms
-- **Sign and verify modes** — configurable per listener
+- **Sign and verify modes** -- configurable per listener
 - **SigningTable/KeyTable** for multi-domain signing
-- **Single-domain shorthand** — simple config for single-domain setups
+- **Single-domain shorthand** -- simple config for single-domain setups
 - **Thread-per-core architecture** with kqueue I/O multiplexing
 - **DNS resolution** with per-worker TTL caching and proactive health monitoring
 - **Multi-listener** support (TCP and Unix domain sockets)
@@ -100,7 +100,7 @@ securedkim -c /usr/local/etc/securedkim/securedkim.conf
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `Socket` | — | `inet:port@ip` or `unix:/path`. The IP must be numeric (no DNS). An unparseable value is a fatal startup error, never ignored. |
+| `Socket` | -- | `inet:port@ip` or `unix:/path`. The IP must be numeric (no DNS). An unparseable value is a fatal startup error, never ignored. |
 | `Mode` | `verify` | `sign`, `verify`, or `both` |
 | `SigningTable` | *(none)* | Path to signing table (multi-domain) |
 | `KeyTable` | *(none)* | Path to key table (multi-domain) |
@@ -197,17 +197,17 @@ securedkim-sign -a ed25519-sha256 -d example.com -s ed2026 -k ed-key.seed --no-t
 
 ## Signals
 
-- **SIGHUP** — Reload configuration and key tables
-- **SIGTERM** — Graceful shutdown (30s drain timeout)
+- **SIGHUP** -- Reload configuration and key tables
+- **SIGTERM** -- Graceful shutdown (30s drain timeout)
 
 ## Part of the SecureMilter Suite
 
-- [securemilter-lib](https://pacyworld.dev/securemessage/securemilter-lib) — Shared infrastructure library
-- [securemilter-crypto](https://pacyworld.dev/securemessage/securemilter-crypto) — Cryptographic primitives
-- [SecureSPF](https://pacyworld.dev/securemessage/securespf) — SPF verification
-- **SecureDKIM** — DKIM signing and verification (this project)
-- [SecureDMARC](https://pacyworld.dev/securemessage/securedmarc) — DMARC policy evaluation
-- [SecureARC](https://pacyworld.dev/securemessage/securearc) — ARC chain validation and sealing
+- [securemilter-lib](https://pacyworld.dev/securemessage/securemilter-lib) -- Shared infrastructure library
+- [securemilter-crypto](https://pacyworld.dev/securemessage/securemilter-crypto) -- Cryptographic primitives
+- [SecureSPF](https://pacyworld.dev/securemessage/securespf) -- SPF verification
+- **SecureDKIM** -- DKIM signing and verification (this project)
+- [SecureDMARC](https://pacyworld.dev/securemessage/securedmarc) -- DMARC policy evaluation
+- [SecureARC](https://pacyworld.dev/securemessage/securearc) -- ARC chain validation and sealing
 
 ## Requirements
 
