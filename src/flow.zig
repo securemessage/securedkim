@@ -267,13 +267,14 @@ fn doSign(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     // if a SIGHUP lands midway.
     const assets = ctx.signing_rcu.get() orelse return @intFromEnum(responses.Code.@"continue");
 
-    // How to sign, and what with — resolved together so they cannot disagree.
-    const choice = signing.resolve(assets, domain, mail_from) orelse
-        return @intFromEnum(responses.Code.@"continue");
-    const sign_params = choice.params;
-    const sign_key = choice.key;
+    // Resolve all matching signing keys. RFC 6376 Section 4 allows multiple
+    // DKIM-Signature headers; during key rotation both old and new selectors
+    // sign so receivers verify whichever matches their cached DNS record.
+    const choices = signing.resolveAll(assets, domain, mail_from);
+    if (choices.len == 0) return @intFromEnum(responses.Code.@"continue");
 
-    // Build the header list that will be signed.
+    // Build the header list that will be signed. Shared across all signatures
+    // because signed_headers and canonicalization are global, not per-key.
     //
     // One defer for both the strings and the list, registered before the loop, so
     // an early return below cannot leak the strings appended so far.
@@ -299,73 +300,61 @@ fn doSign(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
         };
     }
 
-    // Compute body hash. The truncation check at the top of doSign already
-    // established the body is whole.
+    // Compute body hash once. All choices share the same canonicalization
+    // (it is a global setting, not per-key), so the body hash is identical.
     const body_data = conn.getBody() orelse return signInternalError("the accumulated body is unavailable");
-    const body_hash = sign_mod.computeBodyHash(conn.allocator, body_data, sign_params.canonicalization.body) catch
-        return signInternalError("computing the body hash");
-
-    // Sign the message
-    var sign_result = sign_mod.signMessage(
+    const body_hash = sign_mod.computeBodyHash(
         conn.allocator,
-        &sign_params,
-        sign_key,
-        header_strings.items,
-        body_hash,
-    ) catch return signInternalError("signing the message");
-    defer sign_result.deinit();
+        body_data,
+        choices.get(0).params.canonicalization.body,
+    ) catch return signInternalError("computing the body hash");
 
-    // Prepend DKIM-Signature header via milter protocol: SMFIR_INSHEADER at
-    // index 0, as OpenDKIM does. An appended signature lands at the bottom of
-    // the header block, adjacent to the body separator — off-convention for a
-    // signature field, and visibly "in the body area" to anyone reading the
-    // source.
-    //
-    // The separator is handed to `insertHeader` rather than carried inside the
-    // value, which is what makes the transmitted bytes `"DKIM-Signature: " ++
-    // value` under either negotiation: the milter writes the space when it owns
-    // it, the MTA writes it otherwise, and exactly one of them does. Those are
-    // the bytes `signMessage` canonicalized, and under `c=simple` -- which
-    // hashes the field verbatim -- signed and transmitted have to agree
-    // octet for octet or no verifier anywhere accepts the signature.
-    //
-    // Passing `false` and leaving the space inside the value agrees only while
-    // the MTA grants `SMFIP_HDR_LEADSPC`. One that declines it puts a space in
-    // front of the one already there, and every `c=simple` signature this
-    // daemon produced would fail everywhere, silently, with the daemon
-    // reporting `sign pass`.
-    // The signed value folds with CRLF — the canonical form the hash covers.
-    // The milter protocol carries folds as bare LF (smfi_addheader(3): the MTA
-    // adds the CR), and sending CRLF lets the MTA double every fold into a
-    // blank line, ending the header block early for every downstream parser.
-    const wire_value = header_fold.toWire(conn.allocator, sign_result.value()) catch
-        return signInternalError("building the DKIM-Signature header");
-    defer conn.allocator.free(wire_value);
+    // Sign with each matching key and prepend a DKIM-Signature header for each.
+    for (choices.slice()) |choice| {
+        const sign_params = choice.params;
+        const sign_key = choice.key;
 
-    const hdr_payload = responses.insertHeader(
-        conn.allocator,
-        0,
-        "DKIM-Signature",
-        wire_value,
-        conn.negotiated_protocol.header_leading_space,
-    ) catch return signInternalError("building the DKIM-Signature header");
-    defer conn.allocator.free(hdr_payload);
+        var sign_result = sign_mod.signMessage(
+            conn.allocator,
+            &sign_params,
+            sign_key,
+            header_strings.items,
+            body_hash,
+        ) catch return signInternalError("signing the message");
+        defer sign_result.deinit();
 
-    // A swallowed failure here delivered the message unsigned and then
-    // published "sign pass" for it, so both the recipient and our own event
-    // stream were misinformed at once (audit X-10).
-    //
-    // The signature is QUEUED here, not written: the worker flushes it with the
-    // final action, in one packet. What that changes for X-10 is only the
-    // remaining failure mode -- a flush that fails after this point closes the
-    // connection, so the MTA defers the message rather than delivering it
-    // unsigned, while the event below has already said "pass". The event stream
-    // can therefore over-report a signature on a connection that died; the mail
-    // cannot go out unsigned, which is the half X-10 was about.
-    conn.sendPacket(hdr_payload) catch
-        return signInternalError("queueing the DKIM-Signature header");
+        // Prepend DKIM-Signature via milter SMFIR_INSHEADER at index 0.
+        //
+        // The separator is handed to `insertHeader` rather than carried inside
+        // the value, which is what makes the transmitted bytes
+        // `"DKIM-Signature: " ++ value` under either negotiation: the milter
+        // writes the space when it owns it, the MTA writes it otherwise. Those
+        // are the bytes `signMessage` canonicalized, and under `c=simple` the
+        // signed and transmitted bytes must agree octet for octet.
+        //
+        // The signed value folds with CRLF (canonical). The milter protocol
+        // carries folds as bare LF (smfi_addheader(3): the MTA adds the CR).
+        const wire_value = header_fold.toWire(conn.allocator, sign_result.value()) catch
+            return signInternalError("building the DKIM-Signature header");
+        defer conn.allocator.free(wire_value);
 
-    publishEvent(ctx, conn.allocator, "sign", "pass", sign_params.domain, sign_params.selector);
+        const hdr_payload = responses.insertHeader(
+            conn.allocator,
+            0,
+            "DKIM-Signature",
+            wire_value,
+            conn.negotiated_protocol.header_leading_space,
+        ) catch return signInternalError("building the DKIM-Signature header");
+        defer conn.allocator.free(hdr_payload);
+
+        // A swallowed failure here delivered the message unsigned and then
+        // published "sign pass" for it (audit X-10). The signature is QUEUED,
+        // not written: the worker flushes it with the final action.
+        conn.sendPacket(hdr_payload) catch
+            return signInternalError("queueing the DKIM-Signature header");
+
+        publishEvent(ctx, conn.allocator, "sign", "pass", sign_params.domain, sign_params.selector);
+    }
 
     return @intFromEnum(responses.Code.accept);
 }
