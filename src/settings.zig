@@ -91,6 +91,9 @@ pub const DkimConfig = struct {
     max_key_records: u8,
     /// Signature-validation deadline in milliseconds; zero disables it.
     max_evaluation_ms: i64,
+    /// When true, all matching KeyTable rows sign (RFC 6376 Section 4).
+    /// When false, only the first matching row signs (pre-0.7 behavior).
+    multi_sign: bool,
 };
 
 /// Known configuration keys; anything else refuses startup. A key no table
@@ -102,7 +105,7 @@ const known_global_keys: []const []const u8 = &(config_mod.base_global_keys ++ [
     "DnsTimeout",     "DnsRetries",      "DnsCacheSize",     "DnsNegativeTTL",
     "ZmqEndpoint",    "ZmqTopic",        "StripAuthResults", "Mode",
     "SignedHeaders",  "OverSignHeaders", "BodyLengthTag",    "MaxKeyRecords",
-    "MinimumKeyBits",
+    "MinimumKeyBits", "MultiSign",
 });
 const known_listener_keys = [_][]const u8{ "Socket", "Mode", "SigningTable", "KeyTable", "Domain", "Selector", "KeyFile" };
 
@@ -229,6 +232,13 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
     // claiming our authserv-id can be genuine on arrival (RFC 8601 §5).
     const strip_auth_results = global.getBool("StripAuthResults", false);
 
+    // When true, every KeyTable row with a usable key for the signing entry
+    // produces a DKIM-Signature header (RFC 6376 Section 4 multi-sign). When
+    // false, only the first matching row signs -- the pre-0.7 behavior.
+    // Defaults to false for backward compatibility with existing deployments
+    // that may have latent breakage in KeyTable rows 2..n.
+    const multi_sign = global.getBool("MultiSign", false);
+
     // Caps on attacker-controlled message content (audit X-4, D-4).
     const limits = connection_mod.Limits.fromSection(global);
 
@@ -273,6 +283,7 @@ pub fn parseDkimConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dki
         .body_length_policy = body_length_policy,
         .max_key_records = max_key_records,
         .max_evaluation_ms = max_evaluation_ms,
+        .multi_sign = multi_sign,
     };
 }
 

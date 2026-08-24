@@ -208,6 +208,18 @@ SignedHeaders   = from:to:subject:date:message-id
 Socket          = inet:8891@127.0.0.1
 Mode            = verify
 
+# --- Multi-sign (RFC 6376 Section 4) ---
+#
+# When yes, every matching KeyTable row with a usable key produces a
+# DKIM-Signature header. During key rotation both old and new selectors
+# sign, so receivers verify whichever matches their cached DNS record.
+# When no (default), only the first matching KeyTable row signs.
+#
+# Set to yes only when you have confirmed that all KeyTable rows for each
+# signing entry reference valid, loadable keys. Rows that were previously
+# invisible (because only the first row was used) will now attempt to sign.
+# MultiSign = no
+
 # --- Sign outbound mail (multi-domain via SigningTable/KeyTable) ---
 # Bound to loopback deliberately: only the local MTA submits to the signing
 # socket, and anything that can reach it can have mail signed by this host.

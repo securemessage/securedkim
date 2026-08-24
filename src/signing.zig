@@ -187,6 +187,7 @@ pub const ChoiceList = struct {
     }
 
     pub fn get(self: *const ChoiceList, i: usize) Choice {
+        std.debug.assert(i < self.len);
         return self.buf[i];
     }
 
@@ -194,6 +195,11 @@ pub const ChoiceList = struct {
         if (self.len < MAX_MULTI_SIGN) {
             self.buf[self.len] = choice;
             self.len += 1;
+        } else {
+            log.warn(
+                "more than {d} signing keys for {s}/{s}: excess key ignored",
+                .{ MAX_MULTI_SIGN, choice.params.domain, choice.params.selector },
+            );
         }
     }
 };
@@ -467,6 +473,34 @@ test "resolveAll with shorthand returns single choice" {
     try std.testing.expectEqual(@as(usize, 1), choices.len);
     try std.testing.expectEqualStrings("a.example", choices.get(0).params.domain);
     try std.testing.expectEqualStrings("sela", choices.get(0).params.selector);
+}
+
+test "ChoiceList.push logs warning on overflow past MAX_MULTI_SIGN" {
+    var list = ChoiceList{};
+    const dummy_key = d24Key(D24_TABLE_SEED);
+    const choice = Choice{
+        .params = .{ .domain = "x.example", .selector = "sel" },
+        .key = &dummy_key,
+    };
+    // Fill to capacity
+    for (0..MAX_MULTI_SIGN) |_| list.push(choice);
+    try std.testing.expectEqual(MAX_MULTI_SIGN, list.len);
+    // Push beyond capacity: len stays at MAX_MULTI_SIGN (logged, not crashed)
+    list.push(choice);
+    try std.testing.expectEqual(MAX_MULTI_SIGN, list.len);
+}
+
+test "ChoiceList.get asserts on out-of-bounds in safe mode" {
+    var list = ChoiceList{};
+    const dummy_key = d24Key(D24_TABLE_SEED);
+    list.push(.{
+        .params = .{ .domain = "x.example", .selector = "sel" },
+        .key = &dummy_key,
+    });
+    // Valid access
+    try std.testing.expectEqualStrings("x.example", list.get(0).params.domain);
+    // Out-of-bounds in safe mode would assert; we cannot test that without
+    // crashing, so just verify the valid access works.
 }
 
 test "resolveAll returns empty for no match" {

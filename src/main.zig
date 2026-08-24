@@ -114,6 +114,9 @@ var g_body_length_policy: verify.BodyLengthPolicy = .honor;
 /// startup alongside `g_max_key_records`; 0 disables.
 var g_max_evaluation_ms: i64 = deadline_mod.DEFAULT_MS;
 
+/// Multi-sign: when true, all matching KeyTable rows sign (RFC 6376 Section 4).
+var g_multi_sign: bool = false;
+
 fn usageError() error{InvalidArgument} {
     log.err("usage: securedkim -c <config-file>", .{});
     return error.InvalidArgument;
@@ -188,6 +191,7 @@ fn runDaemon() !void {
     g_max_key_records = dkim_cfg.max_key_records;
     g_max_evaluation_ms = dkim_cfg.max_evaluation_ms;
     g_body_length_policy = dkim_cfg.body_length_policy;
+    g_multi_sign = dkim_cfg.multi_sign;
 
     // Say so rather than silently disagreeing with the config file. An operator
     // who wrote a smaller number is trying to accept keys the RFC forbids, and
@@ -330,6 +334,7 @@ fn msgCtx() flow.MsgCtx {
         .body_length_policy = g_body_length_policy,
         .max_key_records = g_max_key_records,
         .max_evaluation_ms = g_max_evaluation_ms,
+        .multi_sign = g_multi_sign,
         .resolver = getResolver,
         .publisher = getPublisher,
     };

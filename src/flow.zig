@@ -42,6 +42,8 @@ pub const MsgCtx = struct {
     max_key_records: u8,
     /// Signature-validation deadline in milliseconds; zero disables it.
     max_evaluation_ms: i64,
+    /// When true, all matching KeyTable rows sign (RFC 6376 Section 4).
+    multi_sign: bool,
     resolver: *const fn () *dns_mod.Resolver,
     publisher: *const fn () *zmq.Publisher,
 };
@@ -267,10 +269,21 @@ fn doSign(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     // if a SIGHUP lands midway.
     const assets = ctx.signing_rcu.get() orelse return @intFromEnum(responses.Code.@"continue");
 
-    // Resolve all matching signing keys. RFC 6376 Section 4 allows multiple
-    // DKIM-Signature headers; during key rotation both old and new selectors
-    // sign so receivers verify whichever matches their cached DNS record.
-    const choices = signing.resolveAll(assets, domain, mail_from);
+    // Resolve signing keys. When MultiSign is enabled (RFC 6376 Section 4),
+    // all matching KeyTable rows sign; during key rotation both old and new
+    // selectors sign so receivers verify whichever matches their DNS cache.
+    // When MultiSign is off (default, pre-0.7 behavior), only the first
+    // matching key signs.
+    const choices = if (ctx.multi_sign)
+        signing.resolveAll(assets, domain, mail_from)
+    else blk: {
+        var single = signing.ChoiceList{};
+        if (signing.resolve(assets, domain, mail_from)) |c| {
+            single.buf[0] = c;
+            single.len = 1;
+        }
+        break :blk single;
+    };
     if (choices.len == 0) return @intFromEnum(responses.Code.@"continue");
 
     // Build the header list that will be signed. Shared across all signatures
@@ -301,7 +314,11 @@ fn doSign(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     }
 
     // Compute body hash once. All choices share the same canonicalization
-    // (it is a global setting, not per-key), so the body hash is identical.
+    // (it is a global setting, not per-key) and the same digest algorithm
+    // (SHA-256 -- the only algorithm supported for signing; RFC 8463 also
+    // mandates SHA-256 for Ed25519, so RSA-SHA256 and Ed25519-SHA256
+    // genuinely share a bh= value). The body hash is therefore identical
+    // across all choices.
     const body_data = conn.getBody() orelse return signInternalError("the accumulated body is unavailable");
     const body_hash = sign_mod.computeBodyHash(
         conn.allocator,
@@ -309,8 +326,21 @@ fn doSign(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
         choices.get(0).params.canonicalization.body,
     ) catch return signInternalError("computing the body hash");
 
-    // Sign with each matching key and prepend a DKIM-Signature header for each.
-    for (choices.slice()) |choice| {
+    // Sign with each matching key and prepend a DKIM-Signature header for
+    // each. Multi-sign is inherently partial-tolerant: RFC 6376 Section 4
+    // is explicit that a verifier just needs ONE signature to validate.
+    // One bad key must not sink a message that has a good signature, so
+    // failures log + continue rather than returning an error. Only when
+    // no signature at all could be produced does the message defer.
+    //
+    // Each SMFIR_INSHEADER at index 0 pushes earlier signatures down, so
+    // the last choice ends up topmost. Reverse iteration keeps the first
+    // keytable row as the topmost header for readability.
+    var signed: usize = 0;
+    var idx: usize = choices.len;
+    while (idx > 0) {
+        idx -= 1;
+        const choice = choices.get(idx);
         const sign_params = choice.params;
         const sign_key = choice.key;
 
@@ -320,7 +350,15 @@ fn doSign(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
             sign_key,
             header_strings.items,
             body_hash,
-        ) catch return signInternalError("signing the message");
+        ) catch |err| {
+            log.err("signing failed for {f}/{f}: {}", .{
+                escape.logField(sign_params.domain),
+                escape.logField(sign_params.selector),
+                err,
+            });
+            publishEvent(ctx, conn.allocator, "sign", "fail", sign_params.domain, sign_params.selector);
+            continue;
+        };
         defer sign_result.deinit();
 
         // Prepend DKIM-Signature via milter SMFIR_INSHEADER at index 0.
@@ -332,10 +370,25 @@ fn doSign(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
         // are the bytes `signMessage` canonicalized, and under `c=simple` the
         // signed and transmitted bytes must agree octet for octet.
         //
-        // The signed value folds with CRLF (canonical). The milter protocol
-        // carries folds as bare LF (smfi_addheader(3): the MTA adds the CR).
-        const wire_value = header_fold.toWire(conn.allocator, sign_result.value()) catch
-            return signInternalError("building the DKIM-Signature header");
+        // Passing `false` and leaving the space inside the value agrees only
+        // while the MTA grants `SMFIP_HDR_LEADSPC`. One that declines it puts
+        // a space in front of the one already there, and every `c=simple`
+        // signature this daemon produced would fail everywhere, silently, with
+        // the daemon reporting `sign pass`.
+        //
+        // The signed value folds with CRLF -- the canonical form the hash
+        // covers. The milter protocol carries folds as bare LF
+        // (smfi_addheader(3): the MTA adds the CR), and sending CRLF lets the
+        // MTA double every fold into a blank line, ending the header block
+        // early for every downstream parser.
+        const wire_value = header_fold.toWire(conn.allocator, sign_result.value()) catch {
+            log.err("signing failed for {f}/{f}: building DKIM-Signature header", .{
+                escape.logField(sign_params.domain),
+                escape.logField(sign_params.selector),
+            });
+            publishEvent(ctx, conn.allocator, "sign", "fail", sign_params.domain, sign_params.selector);
+            continue;
+        };
         defer conn.allocator.free(wire_value);
 
         const hdr_payload = responses.insertHeader(
@@ -344,17 +397,46 @@ fn doSign(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
             "DKIM-Signature",
             wire_value,
             conn.negotiated_protocol.header_leading_space,
-        ) catch return signInternalError("building the DKIM-Signature header");
+        ) catch {
+            log.err("signing failed for {f}/{f}: building header payload", .{
+                escape.logField(sign_params.domain),
+                escape.logField(sign_params.selector),
+            });
+            publishEvent(ctx, conn.allocator, "sign", "fail", sign_params.domain, sign_params.selector);
+            continue;
+        };
         defer conn.allocator.free(hdr_payload);
 
         // A swallowed failure here delivered the message unsigned and then
-        // published "sign pass" for it (audit X-10). The signature is QUEUED,
-        // not written: the worker flushes it with the final action.
-        conn.sendPacket(hdr_payload) catch
-            return signInternalError("queueing the DKIM-Signature header");
+        // published "sign pass" for it, so both the recipient and our own
+        // event stream were misinformed at once (audit X-10).
+        //
+        // The signature is QUEUED here, not written: the worker flushes it
+        // with the final action, in one packet. What that changes for X-10
+        // is only the remaining failure mode -- a flush that fails after this
+        // point closes the connection, so the MTA defers the message rather
+        // than delivering it unsigned, while the event below has already said
+        // "pass". The event stream can therefore over-report a signature on a
+        // connection that died; the mail cannot go out unsigned, which is the
+        // half X-10 was about.
+        conn.sendPacket(hdr_payload) catch {
+            log.err("signing failed for {f}/{f}: queueing DKIM-Signature header", .{
+                escape.logField(sign_params.domain),
+                escape.logField(sign_params.selector),
+            });
+            publishEvent(ctx, conn.allocator, "sign", "fail", sign_params.domain, sign_params.selector);
+            continue;
+        };
 
+        // Per-signature event: downstream consumers counting messages-signed
+        // will see N events during a rotation window. This is intentional --
+        // each signature is an independent signing assertion.
         publishEvent(ctx, conn.allocator, "sign", "pass", sign_params.domain, sign_params.selector);
+        signed += 1;
     }
+
+    // At least one signature or the message doesn't go out unsigned.
+    if (signed == 0) return signInternalError("no signature could be produced");
 
     return @intFromEnum(responses.Code.accept);
 }
