@@ -1,6 +1,6 @@
 .{
     .name = .securedkim,
-    .version = "0.6.9",
+    .version = "0.7.0",
     .fingerprint = 0x68f617bb6d17df1a,
     .minimum_zig_version = "0.15.0",
     .paths = .{
