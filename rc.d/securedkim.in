@@ -20,4 +20,6 @@ pidfile="${securedkim_pidfile}"
 command="%%PREFIX%%/bin/securedkim"
 command_args="-c ${securedkim_config}"
 
+extra_commands="reload"
+
 run_rc_command "$1"
